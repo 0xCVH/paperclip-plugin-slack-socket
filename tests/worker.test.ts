@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { startRuntime } from "../src/worker.js";
+import plugin, { startRuntime } from "../src/worker.js";
 import { JOB_KEYS, SLASH_COMMAND, TOOL_NAMES } from "../src/constants.js";
 import { FakeGateway, makeCtx } from "./helpers.js";
 
@@ -52,5 +52,21 @@ describe("startRuntime", () => {
     });
     expect(ctx.issues.createComment).toHaveBeenCalled();
     expect(ctx.agents.sessions.sendMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("onValidateConfig", () => {
+  it("returns ok:false with per-field errors for missing required fields, without throwing", async () => {
+    const result = await plugin.definition.onValidateConfig?.({});
+    expect(result?.ok).toBe(false);
+    expect(result?.errors).toEqual(
+      expect.arrayContaining([
+        "slackBotTokenRef is required",
+        "slackAppTokenRef is required",
+        "companyId is required",
+        "defaultAgentId is required",
+        "defaultChannelId is required",
+      ]),
+    );
   });
 });

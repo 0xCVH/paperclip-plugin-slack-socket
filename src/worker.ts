@@ -107,7 +107,14 @@ const plugin = definePlugin({
     }
     if (!lastCtx || errors.length > 0) return { ok: errors.length === 0, errors };
 
-    const { WebClient } = await import("@slack/web-api");
+    let WebClient: typeof import("@slack/web-api").WebClient;
+    try {
+      ({ WebClient } = await import("@slack/web-api"));
+    } catch (err) {
+      errors.push(`Validation unavailable: ${String(err)}`);
+      return { ok: false, errors };
+    }
+
     try {
       const botToken = await lastCtx.secrets.resolve(cfg.slackBotTokenRef);
       const auth = await new WebClient(botToken).auth.test();

@@ -124,9 +124,15 @@ export class BoltGateway implements SlackGateway {
     receiver?.client?.on?.("connected", () => { this.connected = true; });
     receiver?.client?.on?.("disconnected", () => { this.connected = false; });
     await this.app.start();
-    this.connected = true;
-    const auth = await this.app.client.auth.test();
-    this.botId = (auth as { user_id?: string }).user_id;
+    try {
+      const auth = await this.app.client.auth.test();
+      this.botId = (auth as { user_id?: string }).user_id;
+      this.connected = true;
+    } catch (err) {
+      await this.app.stop().catch(() => {});
+      this.connected = false;
+      throw err;
+    }
   }
 
   async stop(): Promise<void> {
