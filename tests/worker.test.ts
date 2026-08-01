@@ -266,6 +266,112 @@ describe("applyConfig", () => {
     );
   });
 
+  it("claims the company synchronously so two concurrent applyConfig calls for DIFFERENT companies never both bind — the loser is refused before its own secrets even resolve", async () => {
+    // Regression test for the race: applyConfig used to only assign
+    // boundCompanyId near the end, after two `await`s (secrets.resolve x2,
+    // gateway.start()). That let two overlapping calls for different
+    // companies both pass the `boundCompanyId` mismatch guard while it was
+    // still null, and both proceed to bind/start a gateway.
+    //
+    // Company A's bot-token secret resolution is held open with a manually
+    // controlled promise so A is guaranteed to still be in flight (stuck
+    // before its claim would historically have happened) when company B's
+    // call is made. Against the pre-fix code this test fails: B is able to
+    // race ahead of A, bind, and fully start its own gateway before A ever
+    // resumes — confirmed by running this test against the pre-fix
+    // implementation (boundCompanyId assigned only at the very end).
+    const { applyConfig } = await loadWorker();
+    const { ctx } = makeCtx();
+
+    let releaseA: (token: string) => void = () => {};
+    const heldBotTokenA = new Promise<string>((resolve) => {
+      releaseA = resolve;
+    });
+    let resolveCallCount = 0;
+    (ctx.secrets.resolve as any).mockImplementation(async (ref: string) => {
+      resolveCallCount += 1;
+      // Only the very first secrets.resolve call (company A's bot token) is
+      // held open; every other call (A's app token, and both of B's) resolves
+      // immediately, so B is free to race ahead while A is still stuck.
+      if (resolveCallCount === 1) return heldBotTokenA;
+      return `secret-${ref}`;
+    });
+
+    const gatewayA = new FakeGateway();
+    const gatewayB = new FakeGateway();
+
+    const pA = applyConfig(ctx, cfg({ companyId: "co-1" }), () => gatewayA);
+    // Started while A is still suspended on its held-open secret resolution —
+    // this is the overlap the fix must close.
+    const pB = applyConfig(ctx, cfg({ companyId: "co-2" }), () => gatewayB);
+
+    const healthB = await pB;
+    // The loser must be refused for tenancy — and, crucially, must never
+    // have started a gateway for its company.
+    expect(healthB.status).toBe("degraded");
+    expect(healthB.message).toContain("co-1");
+    expect(healthB.message).toContain("co-2");
+    expect(gatewayB.started).toBe(false);
+    expect(ctx.logger.error).toHaveBeenCalledWith(
+      expect.stringContaining("cross-tenant"),
+      expect.objectContaining({ boundCompanyId: "co-1", incomingCompanyId: "co-2" }),
+    );
+
+    releaseA("secret-ref-bot");
+    const healthA = await pA;
+    expect(healthA.status).toBe("ok");
+    expect(gatewayA.started).toBe(true);
+  });
+
+  it("a missing-fields failure on the first bind leaves boundCompanyId unclaimed so a later valid config for a DIFFERENT company can bind", async () => {
+    const { applyConfig } = await loadWorker();
+    const { ctx } = makeCtx();
+
+    const gatewayA = new FakeGateway();
+    const healthA = await applyConfig(ctx, cfg({ companyId: "co-1", slackBotTokenRef: "" }), () => gatewayA);
+    expect(healthA.status).toBe("degraded");
+    expect(gatewayA.started).toBe(false);
+
+    const gatewayB = new FakeGateway();
+    const healthB = await applyConfig(ctx, cfg({ companyId: "co-2" }), () => gatewayB);
+    expect(healthB.status).toBe("ok");
+    expect(gatewayB.started).toBe(true);
+  });
+
+  it("a secret-resolution failure on the first bind leaves boundCompanyId unclaimed so a later valid config for a DIFFERENT company can bind", async () => {
+    const { applyConfig } = await loadWorker();
+    const { ctx } = makeCtx();
+
+    (ctx.secrets.resolve as any).mockRejectedValueOnce(new Error("secrets disabled"));
+    const gatewayA = new FakeGateway();
+    const healthA = await applyConfig(ctx, cfg({ companyId: "co-1" }), () => gatewayA);
+    expect(healthA.status).toBe("degraded");
+    expect(gatewayA.started).toBe(false);
+
+    const gatewayB = new FakeGateway();
+    const healthB = await applyConfig(ctx, cfg({ companyId: "co-2" }), () => gatewayB);
+    expect(healthB.status).toBe("ok");
+    expect(gatewayB.started).toBe(true);
+  });
+
+  it("a gateway.start() failure on the first bind leaves boundCompanyId unclaimed so a later valid config for a DIFFERENT company can bind", async () => {
+    const { applyConfig } = await loadWorker();
+    const { ctx } = makeCtx();
+
+    const gatewayA = new FakeGateway();
+    gatewayA.start = async () => {
+      throw new Error("socket connect failed");
+    };
+    await expect(applyConfig(ctx, cfg({ companyId: "co-1" }), () => gatewayA)).rejects.toThrow(
+      "socket connect failed",
+    );
+
+    const gatewayB = new FakeGateway();
+    const healthB = await applyConfig(ctx, cfg({ companyId: "co-2" }), () => gatewayB);
+    expect(healthB.status).toBe("ok");
+    expect(gatewayB.started).toBe(true);
+  });
+
   it("never calls ctx.config.get during normal operation (helpers.ts intentionally doesn't mock it)", async () => {
     const { applyConfig } = await loadWorker();
     const { ctx } = makeCtx();
@@ -329,6 +435,31 @@ describe("plugin.definition.onConfigChanged (the real host-facing hook)", () => 
     // was created and the first one is still running.
     expect(boltGatewayInstances).toHaveLength(1);
     expect(boltGatewayInstances[0]!.started).toBe(true);
+  });
+
+  it("does not let a stale tenant conflict mask a newer same-company failure", async () => {
+    // Regression test: onHealth checks tenantConflict first, and it used to
+    // be cleared only on a *successful* apply. So a cross-tenant refusal
+    // followed by a same-company config that itself fails validation would
+    // still report the stale cross-tenant message instead of the new
+    // failure — even though the cross-tenant refusal is old news and the
+    // validation failure is what the operator needs to see right now.
+    const { default: plugin } = await loadWorker();
+    const { ctx } = makeCtx();
+    await plugin.definition.setup(ctx);
+    await plugin.definition.onConfigChanged?.(cfg());
+    await plugin.definition.onConfigChanged?.(cfg({ companyId: "co-2" }));
+    await expect(plugin.definition.onHealth?.()).resolves.toMatchObject({
+      status: "degraded",
+      message: expect.stringContaining("co-2"),
+    });
+
+    // A same-company (co-1) config that itself fails validation.
+    await plugin.definition.onConfigChanged?.(cfg({ slackBotTokenRef: "" }));
+    const health = await plugin.definition.onHealth?.();
+    expect(health?.status).toBe("degraded");
+    expect(health?.message).toMatch(/missing/i);
+    expect(health?.message).not.toContain("co-2");
   });
 
   it("clears the tenant conflict once a matching-company config re-applies", async () => {

@@ -141,6 +141,11 @@ function ensureCompanyModules(ctx: PluginContext, companyId: string): Approvals 
  * can never tear down company A's socket or leak company A's notifications
  * into company B's workspace.
  *
+ * The binding itself is claimed synchronously (before any `await`), not
+ * after the async validation/setup work completes — see the "claim-then-
+ * verify" comment inline below for why: without it, two overlapping calls
+ * for different companies can both observe an unclaimed process and race.
+ *
  * This is the seam worker tests use to drive the full lifecycle with a
  * `FakeGateway`, without a real Bolt App. `onConfigChanged` (the real,
  * host-facing hook) and `startRuntime` (kept for tests) are both thin
@@ -168,6 +173,34 @@ export async function applyConfig(
     return { status: "degraded", message };
   }
 
+  // Claim-then-verify: the SDK's RPC dispatcher does not serialize
+  // overlapping `configChanged` calls, so two calls for DIFFERENT companies
+  // can both reach the mismatch guard above while `boundCompanyId` is still
+  // null and both pass it. To close that race, claim the binding
+  // synchronously right here — no `await` has happened yet in this call, so
+  // this line is guaranteed to run before any other in-flight call can
+  // observe or mutate `boundCompanyId`. Whichever call's synchronous prefix
+  // (mismatch guard + this claim) runs first wins the binding; every other
+  // concurrent call for a different company will now fail the mismatch
+  // guard above instead of racing through the awaits below.
+  //
+  // `didClaim` tracks whether *this* call performed the claim (as opposed
+  // to finding the company already bound, i.e. a same-company
+  // reconfiguration). Only the call that actually claimed the binding is
+  // allowed to roll it back on failure below — a reconfiguration must never
+  // null out a binding it didn't create, which could otherwise let a
+  // concurrent different-company call sneak in while this one is still
+  // failing.
+  const didClaim = boundCompanyId === null;
+  if (didClaim) boundCompanyId = cfg.companyId;
+
+  // Fix: clear any stale cross-tenant conflict as soon as we know this call
+  // is not being refused for tenancy (i.e. it's for the bound company) —
+  // otherwise a later failure for the bound company (missing fields, bad
+  // secrets, etc.) would still be masked by an older cross-tenant refusal
+  // message in onHealth.
+  tenantConflict = null;
+
   const missing = REQUIRED_FIELDS.filter((field) => !cfg[field]);
   if (missing.length > 0) {
     health = liveConfig
@@ -177,6 +210,7 @@ export async function applyConfig(
         }
       : { status: "degraded", message: `Slack Socket plugin not configured: missing ${missing.join(", ")}` };
     ctx.logger.warn("Slack Socket plugin not configured; runtime disabled", { missing });
+    if (didClaim) boundCompanyId = null;
     return health;
   }
 
@@ -194,6 +228,7 @@ export async function applyConfig(
         }
       : { status: "degraded", message: "Failed to resolve Slack token secrets; check the secret references" };
     ctx.logger.error("Slack token secret resolution failed", { err: errString(err) });
+    if (didClaim) boundCompanyId = null;
     return health;
   }
 
@@ -238,9 +273,20 @@ export async function applyConfig(
   gateway.onCommand(SLASH_COMMAND, (cmd) => commands.handleCommand(cmd));
 
   currentGateway = gateway;
-  await gateway.start();
-  boundCompanyId = cfg.companyId;
-  tenantConflict = null;
+  try {
+    await gateway.start();
+  } catch (err) {
+    // Roll back the claim (if we made one) so a later, valid config for a
+    // different company isn't permanently blocked by this failed bind.
+    // Note liveConfig/currentGateway have already been committed above by
+    // this point — that half of "leave things intact on failure" only
+    // applies to the validation failures above, before teardown began.
+    if (didClaim) boundCompanyId = null;
+    throw err;
+  }
+  // `boundCompanyId` is already set (either freshly claimed above, or
+  // pre-existing for a same-company reconfiguration) — no further
+  // assignment needed here.
   health = { status: "ok" };
   ctx.logger.info("Slack Socket Mode connected");
   return health;
