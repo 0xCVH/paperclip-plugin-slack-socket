@@ -40,6 +40,23 @@ function splitIntoChunks(text: string, size: number): string[] {
   return chunks;
 }
 
+// Raw adapter stdout (streamed only when streamPartialReplies is enabled)
+// can carry agent-runtime housekeeping lines like:
+//   [paperclip] ACPX session "acpx:v2:…" does not match the current
+//   agent/cwd/mode/runtime identity; starting fresh in "…"
+// These aren't part of the reply and shouldn't show up in a Slack thread.
+// This does NOT and cannot filter model chain-of-thought/reasoning that may
+// also be present in raw stdout — that's exactly why final-reply-only is the
+// default and streaming is an explicit opt-in.
+const RUNTIME_NOTICE_LINE = /^\s*\[paperclip\]\s/;
+
+export function filterRuntimeNoticeLines(text: string): string {
+  return text
+    .split("\n")
+    .filter((line) => !RUNTIME_NOTICE_LINE.test(line))
+    .join("\n");
+}
+
 export function createChat(deps: ChatDeps): Chat {
   const { ctx, gateway, getConfig } = deps;
   const updateIntervalMs = deps.updateIntervalMs ?? 1000;
@@ -141,8 +158,10 @@ export function createChat(deps: ChatDeps): Chat {
       timer = setTimeout(() => {
         timer = null;
         // Convert Markdown -> Slack mrkdwn before truncation so the 3900
-        // char limit applies to the text Slack will actually render.
-        if (buffer) pushUpdate(markdownToMrkdwn(buffer));
+        // char limit applies to the text Slack will actually render. Drop
+        // agent-runtime notice lines from the raw stdout being streamed —
+        // see filterRuntimeNoticeLines.
+        if (buffer) pushUpdate(markdownToMrkdwn(filterRuntimeNoticeLines(buffer)));
       }, updateIntervalMs);
     };
 
@@ -153,8 +172,16 @@ export function createChat(deps: ChatDeps): Chat {
           onEvent: (event) => {
             const e = event as SessionEventLike;
             if (e.eventType === "chunk" && e.stream === "stdout" && e.message) {
+              // Always accumulate: the `done` event's `message` is the SDK's
+              // documented canonical final reply, but if it's ever null we
+              // fall back to this buffer (see the `done` branch below).
               buffer += e.message;
-              scheduleUpdate();
+              // Raw chunks are unfiltered adapter stdout with no guarantee
+              // about content — they can carry agent-runtime notices and
+              // even the model's internal reasoning. Only push them live to
+              // Slack when the operator has explicitly opted in; the
+              // default is to wait for the canonical final reply.
+              if (cfg.streamPartialReplies) scheduleUpdate();
             } else if (e.eventType === "done") {
               clearPendingTimer();
               // Convert before finalizeMessage's split/truncate so the

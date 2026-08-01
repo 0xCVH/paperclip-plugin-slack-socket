@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createChat } from "../src/chat.js";
+import { createChat, filterRuntimeNoticeLines } from "../src/chat.js";
 import { STATE_KEYS } from "../src/constants.js";
 import { FakeGateway, makeCtx, TEST_CONFIG } from "./helpers.js";
 
@@ -114,7 +114,9 @@ describe("chat", () => {
     const chat = createChat({
       ctx: bundle.ctx,
       gateway,
-      getConfig: async () => TEST_CONFIG,
+      // Opt into streaming: this test is exercising the chunk-driven
+      // debounce timer, which only schedules updates when enabled.
+      getConfig: async () => ({ ...TEST_CONFIG, streamPartialReplies: true }),
       updateIntervalMs: 5,
     });
     (bundle.ctx.agents.sessions.sendMessage as any).mockImplementationOnce(
@@ -205,5 +207,98 @@ describe("chat", () => {
       chat.handleMessage(dm("second", "700.2", "700.1")),
     ]);
     expect(ctx.agents.sessions.create).toHaveBeenCalledTimes(1);
+  });
+
+  describe("streamPartialReplies (default false)", () => {
+    it("posts no chat.update for chunk events by default — only the final done reply is posted", async () => {
+      const { gateway, chat } = setup();
+      // The default sendMessage mock (see helpers.ts) emits a "Hello" chunk
+      // event followed by a "Hello there!" done event.
+      await chat.handleMessage(dm("hi", "150.1"));
+      expect(gateway.updates.length).toBe(1);
+      expect(gateway.updates[0]!.text).toBe("Hello there!");
+    });
+
+    it("falls back to the accumulated chunk buffer when done.message is null (unchanged from prior behavior)", async () => {
+      const { ctx, gateway, chat } = setup();
+      (ctx.agents.sessions.sendMessage as any).mockImplementationOnce(
+        async (_sessionId: string, _companyId: string, opts: { onEvent?: (e: unknown) => void }) => {
+          opts.onEvent?.({
+            sessionId: "sess-1", runId: "run-1", seq: 1,
+            eventType: "chunk", stream: "stdout", message: "partial-one ", payload: null,
+          });
+          opts.onEvent?.({
+            sessionId: "sess-1", runId: "run-1", seq: 2,
+            eventType: "chunk", stream: "stdout", message: "partial-two", payload: null,
+          });
+          opts.onEvent?.({
+            sessionId: "sess-1", runId: "run-1", seq: 3,
+            eventType: "done", stream: null, message: null, payload: null,
+          });
+          return { runId: "run-1" };
+        },
+      );
+
+      await chat.handleMessage(dm("hi", "160.1"));
+
+      // Still no intermediate chat.update pushed from the chunks — the
+      // buffer is only surfaced once, as the done fallback.
+      expect(gateway.updates.length).toBe(1);
+      expect(gateway.updates[0]!.text).toBe("partial-one partial-two");
+    });
+
+    it("streams partial updates when opted in, filtering [paperclip] runtime-notice lines out of the streamed text", async () => {
+      const { ctx, gateway, chat } = setup({ streamPartialReplies: true });
+      (ctx.agents.sessions.sendMessage as any).mockImplementationOnce(
+        async (_sessionId: string, _companyId: string, opts: { onEvent?: (e: unknown) => void }) => {
+          opts.onEvent?.({
+            sessionId: "sess-1", runId: "run-1", seq: 1,
+            eventType: "chunk", stream: "stdout",
+            message:
+              '[paperclip] ACPX session "acpx:v2:abc" does not match the current agent/cwd/mode/runtime identity; starting fresh in "xyz"\nWorking on it now...',
+            payload: null,
+          });
+          // Let the debounce timer fire before the done event arrives, so
+          // an intermediate chat.update is actually observable.
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          opts.onEvent?.({
+            sessionId: "sess-1", runId: "run-1", seq: 2,
+            eventType: "done", stream: null, message: "All done!", payload: null,
+          });
+          return { runId: "run-1" };
+        },
+      );
+
+      await chat.handleMessage(dm("hi", "1000.1"));
+
+      const intermediate = gateway.updates.find((u) => u.text.includes("Working on it now"));
+      expect(intermediate).toBeTruthy();
+      expect(intermediate!.text).not.toContain("[paperclip]");
+      expect(gateway.updates.at(-1)!.text).toBe("All done!");
+    });
+  });
+});
+
+describe("filterRuntimeNoticeLines", () => {
+  it("drops [paperclip] runtime-notice lines and keeps everything else, including indented notices", () => {
+    const input = [
+      '[paperclip] ACPX session "acpx:v2:foo" does not match the current agent/cwd/mode/runtime identity; starting fresh in "bar"',
+      "Actual reply line one",
+      "  [paperclip] indented notice too",
+      "Actual reply line two",
+    ].join("\n");
+    expect(filterRuntimeNoticeLines(input)).toBe(
+      ["Actual reply line one", "Actual reply line two"].join("\n"),
+    );
+  });
+
+  it("leaves text with no runtime-notice lines unchanged", () => {
+    const input = "Just a normal reply\nwith multiple lines";
+    expect(filterRuntimeNoticeLines(input)).toBe(input);
+  });
+
+  it("does not touch lines that merely mention [paperclip] mid-line", () => {
+    const input = "This is about the [paperclip] plugin, not a runtime notice";
+    expect(filterRuntimeNoticeLines(input)).toBe(input);
   });
 });

@@ -25,6 +25,7 @@ export interface SlackSocketConfig {
   approvalsChannelId: string;
   paperclipBaseUrl: string;
   sessionIdleHours: number;
+  streamPartialReplies: boolean;
 }
 
 export interface SessionEntry {

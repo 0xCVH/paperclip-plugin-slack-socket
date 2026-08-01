@@ -139,6 +139,13 @@ const manifest: PaperclipPluginManifestV1 = {
         description: "Close agent sessions idle longer than this many hours.",
         default: DEFAULT_CONFIG.sessionIdleHours,
       },
+      streamPartialReplies: {
+        type: "boolean",
+        title: "Stream partial replies",
+        description:
+          "When off (default), only the agent's final reply is posted to Slack. When on, raw adapter output is streamed live into the thread as it arrives — for some adapters (e.g. claude_local) this includes agent-runtime notices and the model's internal reasoning/deliberation, not just the final answer, so anyone in the thread can see it.",
+        default: DEFAULT_CONFIG.streamPartialReplies,
+      },
     },
     required: ["slackBotTokenRef", "slackAppTokenRef", "companyId", "defaultAgentId", "defaultChannelId"],
   },
