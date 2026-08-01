@@ -1,13 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { createApprovals } from "../src/approvals.js";
 import { ACTION_IDS } from "../src/constants.js";
-import { loadConfig } from "../src/config.js";
-import { FakeGateway, makeCtx } from "./helpers.js";
+import { FakeGateway, makeCtx, TEST_CONFIG } from "./helpers.js";
 
 function setup(configOverrides = {}) {
   const bundle = makeCtx(configOverrides);
   const gateway = new FakeGateway();
-  const approvals = createApprovals({ ctx: bundle.ctx, gateway, getConfig: () => loadConfig(bundle.ctx) });
+  const approvals = createApprovals({
+    ctx: bundle.ctx,
+    gateway,
+    getConfig: async () => ({ ...TEST_CONFIG, ...configOverrides }),
+  });
   return { ...bundle, gateway, approvals };
 }
 
@@ -71,7 +74,7 @@ describe("approvals", () => {
   it("resolves paperclipApiKeyRef and sends it as a Bearer Authorization header when configured", async () => {
     const { ctx, approvals } = setup({ paperclipApiKeyRef: "board-key-ref" });
     await approvals.handleAction(approveAction);
-    expect(ctx.secrets.resolve).toHaveBeenCalledWith("board-key-ref");
+    expect(ctx.secrets.resolve).toHaveBeenCalledWith("board-key-ref", { companyId: "co-1" });
     const call = (ctx.http.fetch as any).mock.calls[0];
     expect(call[1].headers).toMatchObject({ Authorization: "Bearer secret-board-key-ref" });
   });

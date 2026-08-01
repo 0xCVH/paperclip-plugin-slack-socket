@@ -76,7 +76,7 @@ export function createApprovals({ ctx, gateway, getConfig }: ApprovalDeps): Appr
       let authHeaders: Record<string, string> = {};
       if (cfg.paperclipApiKeyRef) {
         try {
-          const apiKey = await ctx.secrets.resolve(cfg.paperclipApiKeyRef);
+          const apiKey = await ctx.secrets.resolve(cfg.paperclipApiKeyRef, { companyId: cfg.companyId });
           authHeaders = { Authorization: `Bearer ${apiKey}` };
         } catch (err) {
           ctx.logger.warn("Approval decision via Slack failed: could not resolve the Paperclip board API key", {

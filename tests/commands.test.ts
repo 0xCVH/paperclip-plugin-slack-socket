@@ -1,12 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { createCommands } from "../src/commands.js";
-import { loadConfig } from "../src/config.js";
-import { FakeGateway, makeCtx } from "./helpers.js";
+import { FakeGateway, makeCtx, TEST_CONFIG } from "./helpers.js";
 
 function setup() {
   const bundle = makeCtx();
   const gateway = new FakeGateway();
-  const commands = createCommands({ ctx: bundle.ctx, gateway, getConfig: () => loadConfig(bundle.ctx) });
+  const commands = createCommands({ ctx: bundle.ctx, gateway, getConfig: async () => TEST_CONFIG });
   return { ...bundle, gateway, commands };
 }
 

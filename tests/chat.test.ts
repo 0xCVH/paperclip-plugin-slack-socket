@@ -1,8 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createChat } from "../src/chat.js";
 import { STATE_KEYS } from "../src/constants.js";
-import { loadConfig } from "../src/config.js";
-import { FakeGateway, makeCtx } from "./helpers.js";
+import { FakeGateway, makeCtx, TEST_CONFIG } from "./helpers.js";
 
 function setup(configOverrides = {}) {
   const bundle = makeCtx(configOverrides);
@@ -10,7 +9,7 @@ function setup(configOverrides = {}) {
   const chat = createChat({
     ctx: bundle.ctx,
     gateway,
-    getConfig: () => loadConfig(bundle.ctx),
+    getConfig: async () => ({ ...TEST_CONFIG, ...configOverrides }),
     updateIntervalMs: 0,
   });
   return { ...bundle, gateway, chat };
@@ -101,7 +100,7 @@ describe("chat", () => {
     const chat = createChat({
       ctx: bundle.ctx,
       gateway,
-      getConfig: () => loadConfig(bundle.ctx),
+      getConfig: async () => TEST_CONFIG,
       updateIntervalMs: 5,
     });
     (bundle.ctx.agents.sessions.sendMessage as any).mockImplementationOnce(

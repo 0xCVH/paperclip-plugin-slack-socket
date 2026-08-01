@@ -1,13 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { registerNotifications } from "../src/notifications.js";
-import { loadConfig } from "../src/config.js";
 import { STATE_KEYS } from "../src/constants.js";
-import { FakeGateway, makeCtx } from "./helpers.js";
+import { FakeGateway, makeCtx, TEST_CONFIG } from "./helpers.js";
 
 function setup(configOverrides = {}) {
   const bundle = makeCtx(configOverrides);
   const gateway = new FakeGateway();
-  registerNotifications({ ctx: bundle.ctx, gateway, getConfig: () => loadConfig(bundle.ctx) });
+  registerNotifications({
+    ctx: bundle.ctx,
+    gateway,
+    getConfig: async () => ({ ...TEST_CONFIG, ...configOverrides }),
+  });
   return { ...bundle, gateway };
 }
 

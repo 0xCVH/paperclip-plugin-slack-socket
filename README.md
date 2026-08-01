@@ -67,6 +67,8 @@ That's it on the Slack side — the manifest already enables Socket Mode, declar
 4. Press **Test Connection**. This calls Slack's `auth.test` with the bot token (verifies it's valid) and `apps.connections.open` with the app token (verifies it has `connections:write` and Socket Mode can be established). Fix any reported error before saving — a missing or malformed token, or a token missing the `connections:write` scope, are the most common failures here.
 5. Save. The plugin resolves both secrets, opens the Socket Mode connection, and registers the `ask_human` tool and the `*/15 * * * *` cleanup job (which closes agent sessions idle beyond `sessionIdleHours` and expires unanswered `ask_human` questions past their `timeoutMinutes`, default 1440).
 
+Config is applied live — Paperclip pushes the updated config to the running plugin on every save, so there's no worker restart to wait for. The plugin always resolves the two Slack secrets, and everything scoped by company (agent sessions, issues, approvals), against the **Company ID** configured in step 3 above; it doesn't infer company scope from anything else, so make sure that field points at the company you intend the bot to act on behalf of.
+
 ## Usage
 
 - **DM the bot** from the Apps section of Slack's sidebar to start a private conversation with the default agent.
