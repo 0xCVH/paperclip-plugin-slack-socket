@@ -528,10 +528,10 @@ describe("onValidateConfig", () => {
   });
 });
 
-describe("describeSecretError", () => {
+describe("describeHostError", () => {
   it("explains the save-first ordering when the host denies company context", async () => {
-    const { describeSecretError } = await import("../src/worker.js");
-    const message = describeSecretError(
+    const { describeHostError } = await import("../src/host-errors.js");
+    const message = describeHostError(
       new Error('Plugin "abc" is not allowed to perform "secrets.resolve": company context is required'),
     );
     expect(message).toContain("Save first");
@@ -539,12 +539,25 @@ describe("describeSecretError", () => {
   });
 
   it("passes other errors through unchanged", async () => {
-    const { describeSecretError } = await import("../src/worker.js");
-    expect(describeSecretError(new Error("secret not found"))).toContain("secret not found");
+    const { describeHostError } = await import("../src/host-errors.js");
+    expect(describeHostError(new Error("secret not found"))).toContain("secret not found");
   });
 
   it("redacts tokens in passed-through errors", async () => {
-    const { describeSecretError } = await import("../src/worker.js");
-    expect(describeSecretError(new Error("bad token xoxb-123-abc"))).not.toContain("xoxb-123-abc");
+    const { describeHostError } = await import("../src/host-errors.js");
+    expect(describeHostError(new Error("bad token xoxb-123-abc"))).not.toContain("xoxb-123-abc");
+  });
+});
+
+describe("describeHostError — background authorization", () => {
+  it("explains that a first-time configuration needs a worker restart", async () => {
+    const { describeHostError } = await import("../src/host-errors.js");
+    const message = describeHostError(
+      new Error(
+        'Plugin "abc" is not allowed to perform "agents.sessions.create": the worker referenced a missing, expired, or unknown invocation scope',
+      ),
+    );
+    expect(message).toContain("Disable and re-enable");
+    expect(message).not.toContain("invocation scope");
   });
 });

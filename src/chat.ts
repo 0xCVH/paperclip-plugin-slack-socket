@@ -2,6 +2,7 @@ import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { STATE_KEYS, stateScope } from "./constants.js";
 import { markdownToMrkdwn } from "./mrkdwn.js";
 import { errString } from "./redact.js";
+import { describeHostError } from "./host-errors.js";
 import { updateIndex } from "./state-index.js";
 import type { InboundMessage, SessionEntry, SlackGateway, SlackSocketConfig } from "./types.js";
 
@@ -187,7 +188,7 @@ export function createChat(deps: ChatDeps): Chat {
       const entry = await getOrCreateSession(cfg, msg.channel, threadTs);
       await streamReply(cfg, entry, msg.channel, threadTs, prompt);
     } catch (err) {
-      const reason = errString(err);
+      const reason = describeHostError(err);
       ctx.logger.error("Slack chat failed", { err: reason, channel: msg.channel });
       await gateway
         .postMessage({

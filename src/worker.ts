@@ -16,6 +16,7 @@ import { createEventDeduper } from "./event-dedup.js";
 import { createGatewayProxy } from "./gateway-proxy.js";
 import { registerNotifications } from "./notifications.js";
 import { errString } from "./redact.js";
+import { describeHostError } from "./host-errors.js";
 import type { SlackGateway, SlackSocketConfig } from "./types.js";
 
 export type GatewayFactory = (opts: { botToken: string; appToken: string }) => SlackGateway;
@@ -24,27 +25,6 @@ type Health = PluginHealthDiagnostics & { message?: string };
 
 const REQUIRED_FIELDS = ["slackBotTokenRef", "slackAppTokenRef", "companyId", "defaultAgentId"] as const;
 
-/**
- * Turn a secret-resolution failure into something an operator can act on.
- *
- * Paperclip authorizes a plugin's secret access per *configured* company: the
- * host seeds that authorization from the plugin's saved config rows. Until the
- * configuration has been saved once, no company is authorized, so a Test
- * Connection run before the first Save always fails with "company context is
- * required" — which reads like a plugin bug but is really a "save first"
- * ordering constraint.
- */
-export function describeSecretError(err: unknown): string {
-  const message = errString(err);
-  if (message.includes("company context is required")) {
-    return (
-      "the secret could not be resolved yet. Paperclip grants a plugin access to " +
-      "secrets per configured company, and this configuration has not been saved " +
-      "yet — click Save first, then run Test Connection again."
-    );
-  }
-  return message;
-}
 
 // Modules that need no company scope: built once in setup(), against the
 // gateway proxy, before any config has arrived.
@@ -391,14 +371,14 @@ const plugin = definePlugin({
       const auth = await new WebClient(botToken).auth.test();
       if (!auth.ok) errors.push("Slack auth.test failed for the bot token");
     } catch (err) {
-      errors.push(`Bot token check failed: ${describeSecretError(err)}`);
+      errors.push(`Bot token check failed: ${describeHostError(err)}`);
     }
     try {
       const appToken = await lastCtx.secrets.resolve(cfg.slackAppTokenRef, { companyId: cfg.companyId });
       const conn = await new WebClient(appToken).apps.connections.open();
       if (!conn.ok) errors.push("apps.connections.open failed for the app token (needs connections:write)");
     } catch (err) {
-      errors.push(`App token check failed: ${describeSecretError(err)}`);
+      errors.push(`App token check failed: ${describeHostError(err)}`);
     }
     return { ok: errors.length === 0, errors };
   },
