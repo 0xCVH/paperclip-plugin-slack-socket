@@ -527,3 +527,24 @@ describe("onValidateConfig", () => {
     expect(ctx.secrets.resolve).toHaveBeenCalledWith("ref-app", { companyId: "co-validate" });
   });
 });
+
+describe("describeSecretError", () => {
+  it("explains the save-first ordering when the host denies company context", async () => {
+    const { describeSecretError } = await import("../src/worker.js");
+    const message = describeSecretError(
+      new Error('Plugin "abc" is not allowed to perform "secrets.resolve": company context is required'),
+    );
+    expect(message).toContain("Save first");
+    expect(message).not.toContain("company context is required");
+  });
+
+  it("passes other errors through unchanged", async () => {
+    const { describeSecretError } = await import("../src/worker.js");
+    expect(describeSecretError(new Error("secret not found"))).toContain("secret not found");
+  });
+
+  it("redacts tokens in passed-through errors", async () => {
+    const { describeSecretError } = await import("../src/worker.js");
+    expect(describeSecretError(new Error("bad token xoxb-123-abc"))).not.toContain("xoxb-123-abc");
+  });
+});
