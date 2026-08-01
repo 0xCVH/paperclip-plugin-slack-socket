@@ -1,6 +1,6 @@
 {
   "name": "paperclip-plugin-slack-socket",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Slack Socket Mode plugin for Paperclip: agent chat, notifications, approvals, ask-human tool. No public URL required.",
   "main": "./dist/index.js",
@@ -20,10 +20,15 @@
   "devDependencies": {
     "@paperclipai/plugin-sdk": "2026.722.0",
     "@types/node": "^25.5.2",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
     "typescript": "^5.7.0",
     "vitest": "^3.2.6"
   },
-  "files": ["dist/", "slack-app-manifest.json"],
+  "files": [
+    "dist/",
+    "slack-app-manifest.json"
+  ],
   "paperclipPlugin": {
     "manifest": "./dist/manifest.js",
     "worker": "./dist/worker.js"

@@ -41,19 +41,25 @@ const manifest: PaperclipPluginManifestV1 = {
     type: "object",
     properties: {
       slackBotTokenRef: {
-        type: "string",
+        // The host's secret picker stores a `{ type: "secret_ref", secretId,
+        // version }` object, and ctx.secrets.resolve() fails closed on plain
+        // UUID strings — so the object is the shape that actually works at
+        // runtime. The string branch keeps the form's raw-input path valid.
+        // The host validates the binding itself; constraining it further here
+        // would reject valid shapes (e.g. a numeric `version` selector).
+        type: ["string", "object"],
         format: "secret-ref",
         title: "Slack Bot Token (secret reference)",
         description:
-          "Secret UUID holding your Slack Bot OAuth token (xoxb-…). Create the secret in Settings → Secrets, then paste its UUID here.",
+          "Secret holding your Slack Bot OAuth token (xoxb-…). Create the secret in Settings → Secrets, then select it with the secret picker here.",
         default: DEFAULT_CONFIG.slackBotTokenRef,
       },
       slackAppTokenRef: {
-        type: "string",
+        type: ["string", "object"],
         format: "secret-ref",
         title: "Slack App-Level Token (secret reference)",
         description:
-          "Secret UUID holding your Slack App-Level token (xapp-…) with the connections:write scope.",
+          "Secret holding your Slack App-Level token (xapp-…) with the connections:write scope. Select it with the secret picker.",
         default: DEFAULT_CONFIG.slackAppTokenRef,
       },
       companyId: {
@@ -120,7 +126,7 @@ const manifest: PaperclipPluginManifestV1 = {
         default: DEFAULT_CONFIG.paperclipBaseUrl,
       },
       paperclipApiKeyRef: {
-        type: "string",
+        type: ["string", "object"],
         format: "secret-ref",
         title: "Paperclip Board API Key (secret reference)",
         description:
