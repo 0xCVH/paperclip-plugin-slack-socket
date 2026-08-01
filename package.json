@@ -28,5 +28,14 @@
     "manifest": "./dist/manifest.js",
     "worker": "./dist/worker.js"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/0xCVH/paperclip-plugin-slack-socket.git"
+  },
+  "bugs": {
+    "url": "https://github.com/0xCVH/paperclip-plugin-slack-socket/issues"
+  },
+  "homepage": "https://github.com/0xCVH/paperclip-plugin-slack-socket#readme",
+  "author": "0xCVH",
   "license": "MIT"
 }
