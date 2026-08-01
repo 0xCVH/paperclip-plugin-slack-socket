@@ -5,6 +5,7 @@ import {
   JOB_KEYS,
   PLUGIN_ID,
   PLUGIN_VERSION,
+  POST_MESSAGE_TOOL_DECLARATION,
 } from "./constants.js";
 
 const manifest: PaperclipPluginManifestV1 = {
@@ -216,7 +217,7 @@ const manifest: PaperclipPluginManifestV1 = {
       schedule: "*/15 * * * *",
     },
   ],
-  tools: [ASK_HUMAN_TOOL_DECLARATION],
+  tools: [ASK_HUMAN_TOOL_DECLARATION, POST_MESSAGE_TOOL_DECLARATION],
 };
 
 export default manifest;

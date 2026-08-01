@@ -19,9 +19,9 @@ describe("manifest", () => {
     );
   });
 
-  it("declares the cleanup job and the ask_human tool", () => {
+  it("declares the cleanup job and both agent tools", () => {
     expect(manifest.jobs?.map((j) => j.jobKey)).toEqual([JOB_KEYS.cleanup]);
-    expect(manifest.tools?.map((t) => t.name)).toEqual([TOOL_NAMES.askHuman]);
+    expect(manifest.tools?.map((t) => t.name)).toEqual([TOOL_NAMES.askHuman, TOOL_NAMES.postMessage]);
   });
 
   it("requires tokens, company, agent, and default channel in config", () => {

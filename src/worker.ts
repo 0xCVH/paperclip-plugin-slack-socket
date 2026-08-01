@@ -16,6 +16,7 @@ import { DEFAULT_CONFIG, JOB_KEYS, SLASH_COMMAND } from "./constants.js";
 import { createEventDeduper } from "./event-dedup.js";
 import { createGatewayProxy } from "./gateway-proxy.js";
 import { registerNotifications } from "./notifications.js";
+import { createPostMessage, type PostMessage } from "./post-message.js";
 import { errString } from "./redact.js";
 import { describeHostError } from "./host-errors.js";
 import type { SlackGateway, SlackSocketConfig } from "./types.js";
@@ -33,6 +34,7 @@ interface CoreModules {
   chat: Chat;
   askHuman: AskHuman;
   commands: Commands;
+  postMessage: PostMessage;
   gatewayProxy: SlackGateway;
 }
 
@@ -191,9 +193,15 @@ function ensureCoreModules(ctx: PluginContext): CoreModules {
   const chat = createChat({ ctx, gateway: gatewayProxy, getConfig });
   const askHuman = createAskHuman({ ctx, gateway: gatewayProxy });
   const commands = createCommands({ ctx, gateway: gatewayProxy, getConfig });
+  // Both tools register here, from setup()'s clean context, against the
+  // gateway proxy — the real gateway doesn't exist until a config arrives.
+  // Registration therefore cannot be gated on config: slack_post_message
+  // enforces its switches per call instead (see checkPostTarget).
+  const postMessage = createPostMessage({ ctx, gateway: gatewayProxy, getConfig });
   askHuman.registerTool();
+  postMessage.registerTool();
 
-  coreModules = { chat, askHuman, commands, gatewayProxy };
+  coreModules = { chat, askHuman, commands, postMessage, gatewayProxy };
   return coreModules;
 }
 

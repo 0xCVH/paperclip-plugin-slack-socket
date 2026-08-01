@@ -15,6 +15,7 @@ export const JOB_KEYS = {
 
 export const TOOL_NAMES = {
   askHuman: "ask_human",
+  postMessage: "slack_post_message",
 } as const;
 
 export const SLASH_COMMAND = "/paperclip";
@@ -55,6 +56,28 @@ export const ASK_HUMAN_TOOL_DECLARATION: PluginToolDeclaration = {
       },
     },
     required: ["question", "target", "mode", "issueId"],
+  },
+};
+
+export const POST_MESSAGE_TOOL_DECLARATION: PluginToolDeclaration = {
+  name: TOOL_NAMES.postMessage,
+  displayName: "Post a Slack message",
+  description:
+    "Post a message to a Slack channel, or DM a Slack user. Only the channels and users the operator has allowlisted in this plugin's settings can be targeted — any other target is refused. One-way: replies are not routed back to you, so use ask_human when you need an answer.",
+  parametersSchema: {
+    type: "object",
+    properties: {
+      target: {
+        type: "string",
+        description: "Slack channel ID (C…/G…) to post in, or Slack user ID (U…/W…) to DM.",
+      },
+      text: { type: "string", description: "Message body, in Markdown." },
+      threadTs: {
+        type: "string",
+        description: "Optional ts of an existing message; posts this message as a reply beneath it.",
+      },
+    },
+    required: ["target", "text"],
   },
 };
 

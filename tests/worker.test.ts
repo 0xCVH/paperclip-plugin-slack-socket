@@ -142,7 +142,10 @@ describe("applyConfig", () => {
     expect(gateway.started).toBe(true);
     // Tool registration happens in ensureModules, which applyConfig also
     // triggers (idempotently) so this seam works standalone in tests too.
-    expect((ctx.tools.register as any).mock.calls[0][0]).toBe(TOOL_NAMES.askHuman);
+    expect((ctx.tools.register as any).mock.calls.map((c: unknown[]) => c[0])).toEqual([
+      TOOL_NAMES.askHuman,
+      TOOL_NAMES.postMessage,
+    ]);
     // end-to-end through the wiring: a slash command reaches the commands module
     await gateway.emitCommand({ command: SLASH_COMMAND, text: "help", user: "U1", channel: "C1" });
     expect(gateway.ephemerals).toHaveLength(1);
