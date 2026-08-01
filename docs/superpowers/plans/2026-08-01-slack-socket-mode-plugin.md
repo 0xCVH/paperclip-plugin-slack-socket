@@ -14,7 +14,7 @@
 
 - Package name `paperclip-plugin-slack-socket`; plugin id `cvh.slack-socket`; version `0.1.0`.
 - ESM only (`"type": "module"`); all relative imports use `.js` extensions (NodeNext).
-- Manifest declares **zero webhooks**. Capabilities exactly: `companies.read`, `issues.read`, `issues.create`, `issue.comments.create`, `issues.wakeup`, `agents.read`, `agent.sessions.create`, `agent.sessions.send`, `agent.sessions.close`, `agent.tools.register`, `approvals.read`, `approvals.respond`, `events.subscribe`, `plugin.state.read`, `plugin.state.write`, `secrets.read-ref`, `instance.settings.register`, `activity.log.write`, `metrics.write`, `jobs.schedule`.
+- Manifest declares **zero webhooks**. Capabilities exactly: `companies.read`, `issues.read`, `issues.create`, `issue.comments.create`, `issues.wakeup`, `agents.read`, `agent.sessions.create`, `agent.sessions.send`, `agent.sessions.close`, `agent.tools.register`, `http.outbound`, `events.subscribe`, `plugin.state.read`, `plugin.state.write`, `secrets.read-ref`, `instance.settings.register`, `activity.log.write`, `metrics.write`, `jobs.schedule`. (The published SDK `2026.722.0` has no `approvals.*` capabilities or `ctx.approvals` client — approvals are decided via the Paperclip REST API through `ctx.http.fetch`, the reference plugin's proven pattern.)
 - Secrets only via Paperclip secret refs (`ctx.secrets.resolve`); never log or echo tokens.
 - All Slack input is untrusted: validate tool params; privileged actions only via button interactions with the acting Slack user recorded.
 - Node built-ins only plus declared deps; SDK is a **peerDependency** (also a devDependency for tests), Bolt/web-api are runtime **dependencies**.
@@ -425,8 +425,8 @@ export function makeCtx(configOverrides: Partial<SlackSocketConfig> = {}): MockC
       createComment: vi.fn().mockResolvedValue({ id: "comment-1" }),
       requestWakeup: vi.fn().mockResolvedValue({ requested: true }),
     },
-    approvals: {
-      decide: vi.fn().mockResolvedValue({ applied: true }),
+    http: {
+      fetch: vi.fn().mockResolvedValue({ status: 200, json: async () => ({}) }),
     },
     tools: { register: vi.fn() },
     jobs: { register: vi.fn() },
@@ -1216,7 +1216,7 @@ git commit -m "feat: issue and agent-failure notifications with toggles and chan
 - Test: `tests/approvals.test.ts`
 
 **Interfaces:**
-- Consumes: `formatApprovalCreated`, `formatApprovalDecided` (Task 3); `ACTION_IDS` (Task 1); `ctx.approvals.decide`, `ctx.activity.log`, `ctx.metrics.write`.
+- Consumes: `formatApprovalCreated`, `formatApprovalDecided` (Task 3); `ACTION_IDS` (Task 1); `ctx.http.fetch` (REST decide — `POST {paperclipBaseUrl}/api/approvals/:id/approve|reject`), `ctx.activity.log`, `ctx.metrics.write`.
 - Produces: `createApprovals(deps: { ctx; gateway; getConfig }): Approvals` where `Approvals = { handleAction(action: InboundAction): Promise<void> }`; subscribes `approval.created` internally. Task 10 wires `gateway.onAction(/^approval_(approve|reject)$/, approvals.handleAction)`.
 
 - [ ] **Step 1: Write the failing tests `tests/approvals.test.ts`**
@@ -1252,32 +1252,33 @@ describe("approvals", () => {
     expect(JSON.stringify(gateway.posts[0]!.blocks)).toContain(ACTION_IDS.approvalApprove);
   });
 
-  it("decides the approval and updates the message on approve", async () => {
+  it("decides the approval via REST and updates the message on approve", async () => {
     const { ctx, gateway, approvals } = setup();
     await approvals.handleAction(approveAction);
-    expect(ctx.approvals.decide).toHaveBeenCalledWith(
-      "app-1",
-      expect.objectContaining({ action: "approve", decisionNote: expect.stringContaining("sam") }),
-      "co-1",
+    expect(ctx.http.fetch).toHaveBeenCalledWith(
+      "https://pc.example/api/approvals/app-1/approve",
+      expect.objectContaining({
+        method: "POST",
+        body: expect.stringContaining("slack:U9"),
+      }),
     );
     expect(gateway.updates[0]!.ts).toBe("77.1");
     expect(gateway.updates[0]!.text).toContain("Approved");
     expect(ctx.activity.log).toHaveBeenCalled();
   });
 
-  it("maps the reject action id to a reject decision", async () => {
+  it("maps the reject action id to the reject endpoint", async () => {
     const { ctx, approvals } = setup();
     await approvals.handleAction({ ...approveAction, actionId: ACTION_IDS.approvalReject });
-    expect(ctx.approvals.decide).toHaveBeenCalledWith(
-      "app-1",
-      expect.objectContaining({ action: "reject" }),
-      "co-1",
+    expect(ctx.http.fetch).toHaveBeenCalledWith(
+      "https://pc.example/api/approvals/app-1/reject",
+      expect.anything(),
     );
   });
 
-  it("posts an ephemeral failure note when decide throws", async () => {
+  it("posts an ephemeral failure note when the REST call fails", async () => {
     const { ctx, gateway, approvals } = setup();
-    (ctx.approvals.decide as any).mockRejectedValueOnce(new Error("already decided"));
+    (ctx.http.fetch as any).mockResolvedValueOnce({ status: 500, json: async () => ({}) });
     await approvals.handleAction(approveAction);
     expect(gateway.updates).toHaveLength(0);
     expect(gateway.ephemerals[0]!.user).toBe("U9");
@@ -1331,11 +1332,17 @@ export function createApprovals({ ctx, gateway, getConfig }: ApprovalDeps): Appr
       const decision = action.actionId === ACTION_IDS.approvalApprove ? "approve" : "reject";
       const approvalId = action.value;
       try {
-        await ctx.approvals.decide(
-          approvalId,
-          { action: decision, decisionNote: `Decided via Slack by ${action.userName} (slack:${action.user})` },
-          cfg.companyId,
+        const response = await ctx.http.fetch(
+          `${cfg.paperclipBaseUrl}/api/approvals/${encodeURIComponent(approvalId)}/${decision}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ decidedByUserId: `slack:${action.user}` }),
+          },
         );
+        if (response.status < 200 || response.status >= 300) {
+          throw new Error(`Approval ${decision} returned HTTP ${response.status}`);
+        }
         await gateway.updateMessage({
           channel: action.channel,
           ts: action.messageTs,
@@ -1929,7 +1936,7 @@ describe("manifest", () => {
       [
         "companies.read", "issues.read", "issues.create", "issue.comments.create", "issues.wakeup",
         "agents.read", "agent.sessions.create", "agent.sessions.send", "agent.sessions.close",
-        "agent.tools.register", "approvals.read", "approvals.respond", "events.subscribe",
+        "agent.tools.register", "http.outbound", "events.subscribe",
         "plugin.state.read", "plugin.state.write", "secrets.read-ref", "instance.settings.register",
         "activity.log.write", "metrics.write", "jobs.schedule",
       ].sort(),
@@ -1987,8 +1994,7 @@ const manifest: PaperclipPluginManifestV1 = {
     "agent.sessions.send",
     "agent.sessions.close",
     "agent.tools.register",
-    "approvals.read",
-    "approvals.respond",
+    "http.outbound",
     "events.subscribe",
     "plugin.state.read",
     "plugin.state.write",

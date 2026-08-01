@@ -83,11 +83,13 @@ without a network.
 Subscriptions: `issue.created`, `issue.updated` (transition to done),
 `agent.run.failed`, `approval.created`. Each type has an enable toggle and an
 optional channel override in settings, falling back to `defaultChannelId`.
-Approval messages include Approve/Reject buttons; a click calls the SDK's
-first-class approvals client (`ctx.approvals.decide(approvalId, { action,
-decisionNote }, companyId)` — capabilities `approvals.read` +
-`approvals.respond`), updates the Slack message inline, and records the acting
-Slack user in the decision note and activity log.
+Approval messages include Approve/Reject buttons; a click calls the Paperclip
+REST API (`POST {paperclipBaseUrl}/api/approvals/:id/approve|reject` via
+`ctx.http` with `decidedByUserId: "slack:<user>"` in the body — the pattern the
+reference plugin uses against released hosts), updates the Slack message
+inline, and records the acting Slack user in the activity log. (The SDK's
+`ctx.approvals.decide` client exists only on paperclip main, not in the
+published SDK `2026.722.0` — revisit when it ships.)
 
 ### `slack_ask_human` tool
 
@@ -134,13 +136,15 @@ configured company and replies ephemerally with a link.
 `companies.read`, `issues.read`, `issues.create`,
 `issue.comments.create`, `issues.wakeup`, `agents.read`,
 `agent.sessions.create`, `agent.sessions.send`, `agent.sessions.close`,
-`agent.tools.register`, `approvals.read`, `approvals.respond`,
+`agent.tools.register`, `http.outbound`,
 `events.subscribe`, `plugin.state.read`, `plugin.state.write`,
 `secrets.read-ref`, `instance.settings.register`,
 `activity.log.write`, `metrics.write`, `jobs.schedule`.
 
-(`http.outbound` is not needed: all Slack traffic goes through Bolt's own
-clients, and approvals use `ctx.approvals` instead of REST.)
+(`http.outbound` covers only the approval REST calls; all Slack traffic goes
+through Bolt's own clients. The published SDK `2026.722.0` has no
+`approvals.read`/`approvals.respond` capabilities — they exist only on
+paperclip main.)
 
 (Least-privilege: only capabilities the flows above actually use.)
 
