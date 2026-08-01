@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { buildChatPrompt, createChat, filterRuntimeNoticeLines } from "../src/chat.js";
-import { DEFAULT_CHAT_PROMPT_PREAMBLE, STATE_KEYS } from "../src/constants.js";
+import { buildChatPrompt, createChat, extractReply, filterRuntimeNoticeLines } from "../src/chat.js";
+import { DEFAULT_CHAT_PROMPT_PREAMBLE, REPLY_CLOSE_TAG, REPLY_OPEN_TAG, STATE_KEYS } from "../src/constants.js";
 import { FakeGateway, makeCtx, TEST_CONFIG } from "./helpers.js";
 
 function setup(configOverrides = {}) {
@@ -211,6 +211,47 @@ describe("chat", () => {
     expect(ctx.agents.sessions.create).toHaveBeenCalledTimes(1);
   });
 
+  describe("extractReply integration", () => {
+    it("posts only the tagged reply when the done message contains narration before the tags", async () => {
+      const { ctx, gateway, chat } = setup();
+      const narration = "Let me think about this before I answer.\n\nOkay, here goes.";
+      const answer = "Hey! What's up?";
+      (ctx.agents.sessions.sendMessage as any).mockImplementationOnce(
+        async (_sessionId: string, _companyId: string, opts: { onEvent?: (e: unknown) => void }) => {
+          opts.onEvent?.({
+            sessionId: "sess-1", runId: "run-1", seq: 1,
+            eventType: "done", stream: null,
+            message: `${narration}${REPLY_OPEN_TAG}${answer}${REPLY_CLOSE_TAG}`, payload: null,
+          });
+          return { runId: "run-1" };
+        },
+      );
+
+      await chat.handleMessage(dm("sup", "1100.1"));
+
+      expect(gateway.updates.at(-1)!.text).toBe(answer);
+      expect(gateway.updates.at(-1)!.text).not.toContain(narration);
+    });
+
+    it("posts the full text unchanged when the done message has no tags (no regression)", async () => {
+      const { ctx, gateway, chat } = setup();
+      const fullText = "Just a plain reply, no tags involved at all.";
+      (ctx.agents.sessions.sendMessage as any).mockImplementationOnce(
+        async (_sessionId: string, _companyId: string, opts: { onEvent?: (e: unknown) => void }) => {
+          opts.onEvent?.({
+            sessionId: "sess-1", runId: "run-1", seq: 1,
+            eventType: "done", stream: null, message: fullText, payload: null,
+          });
+          return { runId: "run-1" };
+        },
+      );
+
+      await chat.handleMessage(dm("hi", "1100.2"));
+
+      expect(gateway.updates.at(-1)!.text).toBe(fullText);
+    });
+  });
+
   describe("streamPartialReplies (default false)", () => {
     it("posts no chat.update for chunk events by default — only the final done reply is posted", async () => {
       const { gateway, chat } = setup();
@@ -340,6 +381,53 @@ describe("filterRuntimeNoticeLines", () => {
   it("does not touch lines that merely mention [paperclip] mid-line", () => {
     const input = "This is about the [paperclip] plugin, not a runtime notice";
     expect(filterRuntimeNoticeLines(input)).toBe(input);
+  });
+});
+
+describe("extractReply", () => {
+  it("returns the content of a single tag pair, trimmed", () => {
+    expect(extractReply(`${REPLY_OPEN_TAG}Hey there!${REPLY_CLOSE_TAG}`)).toBe("Hey there!");
+    expect(extractReply(`  ${REPLY_OPEN_TAG}  Hey there!  ${REPLY_CLOSE_TAG}  `)).toBe("Hey there!");
+  });
+
+  it("preserves newlines and markdown inside the tagged content", () => {
+    const inner = "Here's a list:\n- one\n- two\n\n**bold** and a [link](https://x.example)";
+    expect(extractReply(`${REPLY_OPEN_TAG}${inner}${REPLY_CLOSE_TAG}`)).toBe(inner);
+  });
+
+  it("when the model echoes the instruction (two pairs), the last pair wins", () => {
+    const input =
+      `The instructions said to wrap my reply like ${REPLY_OPEN_TAG}this${REPLY_CLOSE_TAG}, got it.\n\n` +
+      `${REPLY_OPEN_TAG}Hey! What's up?${REPLY_CLOSE_TAG}`;
+    expect(extractReply(input)).toBe("Hey! What's up?");
+  });
+
+  it("with an unclosed opening tag, returns everything after the last opening tag", () => {
+    const input = `Some narration first.\n${REPLY_OPEN_TAG}\nHey there, the actual reply.`;
+    expect(extractReply(input)).toBe("Hey there, the actual reply.");
+  });
+
+  it("with no tags at all, returns the input unchanged (trimmed)", () => {
+    expect(extractReply("Just a plain reply, no tags.")).toBe("Just a plain reply, no tags.");
+    expect(extractReply("  padded plain reply  ")).toBe("padded plain reply");
+  });
+
+  it("falls back to the input when the tagged content is empty after trimming", () => {
+    const input = `Narration outside the tags.${REPLY_OPEN_TAG}   ${REPLY_CLOSE_TAG}`;
+    expect(extractReply(input)).toBe(input.trim());
+  });
+
+  it("extracts exactly the wrapped sentence from the real observed narrate-then-answer output", () => {
+    const narration =
+      'Let me understand the context:\n\n' +
+      "1. I'm a Paperclip agent (Chief of staff for Noditos)\n" +
+      '2. I received a wake from a Slack chat message that just says "sup"\n' +
+      '...\n' +
+      'The key instruction is: "You are replying to a person in a Slack thread..."\n\n' +
+      'So I should just respond to "sup" in a natural, conversational way.';
+    const answer = "Hey! What's up? How can I help you today";
+    const input = `${narration}${REPLY_OPEN_TAG}${answer}${REPLY_CLOSE_TAG}`;
+    expect(extractReply(input)).toBe(answer);
   });
 });
 

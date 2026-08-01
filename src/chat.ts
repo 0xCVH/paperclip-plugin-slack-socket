@@ -1,5 +1,5 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import { STATE_KEYS, stateScope } from "./constants.js";
+import { REPLY_CLOSE_TAG, REPLY_OPEN_TAG, STATE_KEYS, stateScope } from "./constants.js";
 import { markdownToMrkdwn } from "./mrkdwn.js";
 import { errString } from "./redact.js";
 import { describeHostError } from "./host-errors.js";
@@ -55,6 +55,46 @@ export function filterRuntimeNoticeLines(text: string): string {
     .split("\n")
     .filter((line) => !RUNTIME_NOTICE_LINE.test(line))
     .join("\n");
+}
+
+// Pulls the agent's actual reply out of the <slack_reply>/</slack_reply>
+// tags requested by DEFAULT_CHAT_PROMPT_PREAMBLE. A prompt instruction not
+// to narrate isn't enough on its own — some adapters narrate *about* the
+// instruction ("The key instruction is: '...' So I should just respond
+// naturally.") and then jam the real answer directly onto the end with no
+// separator, which makes line/paragraph heuristics unsafe. An explicit
+// delimiter sidesteps that entirely: we don't guess where narration ends,
+// we look for the marker the agent was told to use.
+//
+// - If one or more complete tag pairs are present, the LAST one wins (a
+//   model may echo the instruction, tags and all, before its real reply).
+// - If there's an opening tag with no matching close, everything after the
+//   LAST opening tag is used (the agent started the tag but got cut off,
+//   or streaming truncated the close).
+// - Otherwise (no tags at all), the input is returned unchanged — this is
+//   the fallback for agents/adapters that don't follow the tag instruction,
+//   and it preserves the plugin's pre-0.6.0 behavior exactly.
+// - If the extracted content would be empty, that's not a usable reply, so
+//   fall back to the input unchanged rather than posting nothing.
+export function extractReply(text: string): string {
+  const closeIdx = text.lastIndexOf(REPLY_CLOSE_TAG);
+  if (closeIdx !== -1) {
+    const openIdx = text.lastIndexOf(REPLY_OPEN_TAG, closeIdx);
+    if (openIdx !== -1) {
+      const content = text.slice(openIdx + REPLY_OPEN_TAG.length, closeIdx).trim();
+      if (content) return content;
+      return text.trim();
+    }
+  }
+
+  const openIdx = text.lastIndexOf(REPLY_OPEN_TAG);
+  if (openIdx !== -1) {
+    const content = text.slice(openIdx + REPLY_OPEN_TAG.length).trim();
+    if (content) return content;
+    return text.trim();
+  }
+
+  return text.trim();
 }
 
 // Frames a Slack turn as a conversation rather than autonomous work — see
@@ -198,9 +238,12 @@ export function createChat(deps: ChatDeps): Chat {
               if (cfg.streamPartialReplies) scheduleUpdate();
             } else if (e.eventType === "done") {
               clearPendingTimer();
-              // Convert before finalizeMessage's split/truncate so the
-              // 3900-char limit is applied to the mrkdwn-converted text.
-              finalizeMessage(markdownToMrkdwn(e.message ?? (buffer || "_(no reply)_")));
+              // Extract the tagged reply (see extractReply) before
+              // converting/splitting, so narration outside <slack_reply>
+              // tags never reaches Slack. Convert before finalizeMessage's
+              // split/truncate so the 3900-char limit is applied to the
+              // mrkdwn-converted text.
+              finalizeMessage(markdownToMrkdwn(extractReply(e.message ?? (buffer || "_(no reply)_"))));
               resolve();
             } else if (e.eventType === "error") {
               clearPendingTimer();

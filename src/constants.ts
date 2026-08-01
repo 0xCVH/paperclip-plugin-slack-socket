@@ -2,7 +2,7 @@ import type { PluginToolDeclaration, ScopeKey } from "@paperclipai/plugin-sdk";
 import type { SlackSocketConfig } from "./types.js";
 
 export const PLUGIN_ID = "cvh.slack-socket";
-export const PLUGIN_VERSION = "0.5.0";
+export const PLUGIN_VERSION = "0.6.0";
 
 export const ACTION_IDS = {
   approvalApprove: "approval_approve",
@@ -58,14 +58,28 @@ export const ASK_HUMAN_TOOL_DECLARATION: PluginToolDeclaration = {
   },
 };
 
+// The tags an agent is instructed to wrap its actual reply in (see
+// DEFAULT_CHAT_PROMPT_PREAMBLE below and chat.ts's extractReply). A prompt
+// instruction alone ("don't narrate") isn't reliable — some adapters
+// (e.g. claude_local) narrate about the instruction itself before
+// answering, with no separator between the narration and the real reply.
+// An explicit delimiter lets us extract the reply mechanically instead of
+// guessing from line/paragraph heuristics, which real output has shown are
+// unsafe (the narration can run directly into the answer with no boundary).
+export const REPLY_OPEN_TAG = "<slack_reply>";
+export const REPLY_CLOSE_TAG = "</slack_reply>";
+
 // Prepended to every Slack chat message sent to the agent (see chat.ts's
 // buildChatPrompt) to frame the turn as a conversation rather than
 // autonomous work. Paperclip's heartbeat scaffolding frames every wake as
 // autonomous work execution by default, which otherwise pushes agents into
 // narrating their reasoning ("the wake payload shows reason: …") instead of
-// just replying. Set to "" in config to send the user's message verbatim.
+// just replying. It also instructs the agent to wrap its actual reply in
+// <slack_reply>/</slack_reply> tags — see extractReply in chat.ts, which
+// pulls only that content out and falls back to the full text when the
+// tags are absent. Set to "" in config to send the user's message verbatim.
 export const DEFAULT_CHAT_PROMPT_PREAMBLE =
-  "You are replying to a person in a Slack thread. Answer them directly and conversationally, in your own voice. Do not narrate your reasoning, restate the wake payload or execution contract, or list what you should do — just reply. Keep it concise and readable as a chat message.";
+  `You are replying to a person in a Slack thread. Answer them directly and conversationally, in your own voice, and keep it concise and readable as a chat message. Put your entire reply between ${REPLY_OPEN_TAG} and ${REPLY_CLOSE_TAG}, and put nothing else inside those tags — no reasoning, no restating the wake payload or execution contract, no notes about what you're about to do. Any thinking must go outside the tags; only what's inside them will be shown to the person.`;
 
 export const DEFAULT_CONFIG: SlackSocketConfig = {
   slackBotTokenRef: "",
