@@ -169,6 +169,11 @@ export function createChat(deps: ChatDeps): Chat {
       ctx.agents.sessions
         .sendMessage(entry.sessionId, cfg.companyId, {
           prompt,
+          // The host surfaces this as the wake `reason`. Without it the agent
+          // is woken with "reason: unknown" and has to guess whether this is
+          // autonomous work or a conversation turn — which pushes some agents
+          // into narrating that deliberation instead of just replying.
+          reason: "slack_chat_message",
           onEvent: (event) => {
             const e = event as SessionEventLike;
             if (e.eventType === "chunk" && e.stream === "stdout" && e.message) {

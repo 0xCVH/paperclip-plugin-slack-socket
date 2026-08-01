@@ -302,3 +302,21 @@ describe("filterRuntimeNoticeLines", () => {
     expect(filterRuntimeNoticeLines(input)).toBe(input);
   });
 });
+
+describe("wake reason", () => {
+  it("tells the agent this is a Slack chat turn rather than waking it with no reason", async () => {
+    const bundle = makeCtx();
+    const gateway = new FakeGateway();
+    const chat = createChat({
+      ctx: bundle.ctx,
+      gateway,
+      getConfig: async () => ({ ...TEST_CONFIG }),
+      updateIntervalMs: 0,
+    });
+    await chat.handleMessage({
+      channel: "D1", channelType: "im", user: "U1", text: "sup", ts: "900.1",
+    });
+    const call = (bundle.ctx.agents.sessions.sendMessage as any).mock.calls[0];
+    expect(call[2].reason).toBe("slack_chat_message");
+  });
+});
