@@ -24,10 +24,11 @@ type Health = PluginHealthDiagnostics & { message?: string };
 
 const REQUIRED_FIELDS = ["slackBotTokenRef", "slackAppTokenRef", "companyId", "defaultAgentId"] as const;
 
-interface Modules {
+// Modules that need no company scope: built once in setup(), against the
+// gateway proxy, before any config has arrived.
+interface CoreModules {
   chat: Chat;
   askHuman: AskHuman;
-  approvals: Approvals;
   commands: Commands;
   gatewayProxy: SlackGateway;
 }
@@ -46,15 +47,34 @@ let health: Health = { status: "degraded", message: "Waiting for configuration" 
 let liveConfig: SlackSocketConfig | null = null;
 let currentGateway: SlackGateway | null = null;
 let lastCtx: PluginContext | null = null;
-let modules: Modules | null = null;
+let coreModules: CoreModules | null = null;
+let approvals: Approvals | null = null;
+
+// This plugin binds to exactly one company for the lifetime of the worker
+// process: the first company whose config successfully applies. The host
+// runs one worker process per installed plugin, shared by every company
+// that configures it, and drops the RPC-level companyId — the only company
+// identifier available is the operator-typed `companyId` field inside the
+// config object itself. Without this guard, a second company's config would
+// tear down the first company's Slack socket and start posting company A's
+// notifications into company B's workspace.
+let boundCompanyId: string | null = null;
+// Non-null when a mismatched-company config has been refused; surfaced via
+// onHealth so the conflict is visible without digging through logs. Cleared
+// whenever a config for the bound company applies successfully.
+let tenantConflict: string | null = null;
+// Guards ctx.events.on(...) subscriptions (in registerNotifications and
+// createApprovals) so they're only wired up once, on the first successful
+// bind — that's the earliest point a companyId is known to filter them by.
+let eventsSubscribed = false;
 
 /** The most recently applied config, or DEFAULT_CONFIG before any has arrived. */
 export function getLiveConfig(): SlackSocketConfig {
   return liveConfig ?? DEFAULT_CONFIG;
 }
 
-// Registration that must happen exactly once per worker process: ctx.events
-// subscriptions, the ask_human tool registration, and (from setup()) the
+// Registration that must happen exactly once per worker process regardless
+// of company: the ask_human tool registration and (from setup()) the
 // cleanup job. All of it is wired against a gateway *proxy* (see
 // gateway-proxy.ts) because the real gateway doesn't exist yet — `setup()`
 // runs once, before any config has arrived, and registration must complete
@@ -62,29 +82,64 @@ export function getLiveConfig(): SlackSocketConfig {
 // particular a single, stable `askHuman` instance for both the tool and
 // the socket event paths — be built once and simply start working once a
 // real gateway shows up.
-function ensureModules(ctx: PluginContext): Modules {
-  if (modules) return modules;
+function ensureCoreModules(ctx: PluginContext): CoreModules {
+  if (coreModules) return coreModules;
   const gatewayProxy = createGatewayProxy(() => currentGateway, ctx.logger);
   const getConfig = async (): Promise<SlackSocketConfig> => getLiveConfig();
 
   const chat = createChat({ ctx, gateway: gatewayProxy, getConfig });
   const askHuman = createAskHuman({ ctx, gateway: gatewayProxy });
-  const approvals = createApprovals({ ctx, gateway: gatewayProxy, getConfig });
   const commands = createCommands({ ctx, gateway: gatewayProxy, getConfig });
-  registerNotifications({ ctx, gateway: gatewayProxy, getConfig });
   askHuman.registerTool();
 
-  modules = { chat, askHuman, approvals, commands, gatewayProxy };
-  return modules;
+  coreModules = { chat, askHuman, commands, gatewayProxy };
+  return coreModules;
+}
+
+// Registration that must happen exactly once per worker process *and* is
+// scoped to the single company this worker is bound to: the `ctx.events.on`
+// subscriptions in notifications.ts and approvals.ts. These can only be
+// wired once a companyId is known, so — unlike `ensureCoreModules` — this
+// runs from the first successful `applyConfig` bind rather than from
+// `setup()`. Guarded by `eventsSubscribed` so a later same-company
+// reconfiguration never double-subscribes.
+function ensureCompanyModules(ctx: PluginContext, companyId: string): Approvals {
+  const { gatewayProxy } = ensureCoreModules(ctx);
+  const getConfig = async (): Promise<SlackSocketConfig> => getLiveConfig();
+  if (!eventsSubscribed) {
+    eventsSubscribed = true;
+    registerNotifications({ ctx, gateway: gatewayProxy, getConfig, companyId });
+    approvals = createApprovals({ ctx, gateway: gatewayProxy, getConfig, companyId });
+  }
+  // Set on the same first-bind path that flips `eventsSubscribed`, so it is
+  // always non-null here.
+  return approvals!;
 }
 
 /**
- * Apply a fully-merged config: tear down any existing gateway, validate the
- * required fields, resolve the Slack secrets scoped to `cfg.companyId`
- * (required outside an invocation — this is the fix for the bug where
- * `secrets.resolve` failed with "company context is required"), stand up a
- * new gateway via the injected `makeGateway` factory, and wire the socket
- * handlers to the modules built by `ensureModules`.
+ * Apply a fully-merged config: validate the required fields, resolve the
+ * Slack secrets scoped to `cfg.companyId` (required outside an invocation —
+ * this is the fix for the bug where `secrets.resolve` failed with "company
+ * context is required"), and only then — once validation has fully
+ * succeeded — tear down any existing gateway, commit `cfg` as the live
+ * config, stand up a new gateway via the injected `makeGateway` factory, and
+ * wire the socket handlers to the modules built by `ensureCoreModules` /
+ * `ensureCompanyModules`.
+ *
+ * Validating before tearing down matters because this worker process is
+ * shared by every company that has this plugin installed: a bad config
+ * (typo'd secret ref, revoked token, etc.) must never take down a
+ * previously-working connection. On failure the previous `liveConfig` and
+ * `currentGateway` are left completely untouched.
+ *
+ * This also enforces single-tenant binding: the host runs one worker
+ * process per installed plugin, shared by every company that configures it,
+ * and drops the RPC-level companyId, so the operator-typed `companyId`
+ * field inside the config is the only company identifier available. The
+ * first config to successfully apply binds this process to that company for
+ * its lifetime; a config for any other company is refused outright so it
+ * can never tear down company A's socket or leak company A's notifications
+ * into company B's workspace.
  *
  * This is the seam worker tests use to drive the full lifecycle with a
  * `FakeGateway`, without a real Bolt App. `onConfigChanged` (the real,
@@ -96,17 +151,31 @@ export async function applyConfig(
   cfg: SlackSocketConfig,
   makeGateway: GatewayFactory,
 ): Promise<Health> {
-  liveConfig = cfg;
-  const { chat, askHuman, approvals, commands } = ensureModules(ctx);
-
-  if (currentGateway) {
-    await currentGateway.stop().catch(() => {});
-    currentGateway = null;
+  if (boundCompanyId && cfg.companyId !== boundCompanyId) {
+    const message =
+      `Refusing configuration for company "${cfg.companyId}": this plugin process is already bound to ` +
+      `company "${boundCompanyId}". The Slack Socket plugin is single-tenant — one Slack workspace ` +
+      `connection is supported per installed plugin process — so this config was ignored; the existing ` +
+      `connection for "${boundCompanyId}" is unaffected.`;
+    tenantConflict = message;
+    ctx.logger.error("Slack Socket plugin: refusing cross-tenant config change", {
+      boundCompanyId,
+      incomingCompanyId: cfg.companyId,
+    });
+    // Per contract: leave `health` untouched (it still reflects the bound
+    // company's actual gateway/connection state); this is only the return
+    // value for direct callers of applyConfig.
+    return { status: "degraded", message };
   }
 
   const missing = REQUIRED_FIELDS.filter((field) => !cfg[field]);
   if (missing.length > 0) {
-    health = { status: "degraded", message: `Slack Socket plugin not configured: missing ${missing.join(", ")}` };
+    health = liveConfig
+      ? {
+          status: "degraded",
+          message: `New Slack Socket configuration rejected (missing ${missing.join(", ")}); the previous configuration is still active`,
+        }
+      : { status: "degraded", message: `Slack Socket plugin not configured: missing ${missing.join(", ")}` };
     ctx.logger.warn("Slack Socket plugin not configured; runtime disabled", { missing });
     return health;
   }
@@ -117,10 +186,28 @@ export async function applyConfig(
     botToken = await ctx.secrets.resolve(cfg.slackBotTokenRef, { companyId: cfg.companyId });
     appToken = await ctx.secrets.resolve(cfg.slackAppTokenRef, { companyId: cfg.companyId });
   } catch (err) {
-    health = { status: "degraded", message: "Failed to resolve Slack token secrets; check the secret references" };
+    health = liveConfig
+      ? {
+          status: "degraded",
+          message:
+            "New Slack Socket configuration rejected: failed to resolve Slack token secrets; the previous configuration is still active",
+        }
+      : { status: "degraded", message: "Failed to resolve Slack token secrets; check the secret references" };
     ctx.logger.error("Slack token secret resolution failed", { err: errString(err) });
     return health;
   }
+
+  // Validation succeeded: safe to commit. Build/reuse the company-scoped
+  // modules (subscribing ctx.events on the first successful bind only),
+  // tear down the previous gateway, and commit the new config.
+  const { chat, askHuman, commands } = ensureCoreModules(ctx);
+  const approvals = ensureCompanyModules(ctx, cfg.companyId);
+
+  if (currentGateway) {
+    await currentGateway.stop().catch(() => {});
+    currentGateway = null;
+  }
+  liveConfig = cfg;
 
   const gateway = makeGateway({ botToken, appToken });
 
@@ -152,6 +239,8 @@ export async function applyConfig(
 
   currentGateway = gateway;
   await gateway.start();
+  boundCompanyId = cfg.companyId;
+  tenantConflict = null;
   health = { status: "ok" };
   ctx.logger.info("Slack Socket Mode connected");
   return health;
@@ -169,10 +258,10 @@ export async function startRuntime(
 const plugin = definePlugin({
   async setup(ctx) {
     lastCtx = ctx;
-    ensureModules(ctx);
+    ensureCoreModules(ctx);
     ctx.jobs.register(JOB_KEYS.cleanup, async () => {
       if (!currentGateway) return;
-      const { gatewayProxy } = ensureModules(ctx);
+      const { gatewayProxy } = ensureCoreModules(ctx);
       await runCleanup(ctx, gatewayProxy, getLiveConfig());
     });
   },
@@ -193,6 +282,7 @@ const plugin = definePlugin({
   },
 
   async onHealth() {
+    if (tenantConflict) return { status: "degraded", message: tenantConflict };
     if (!liveConfig) return { status: "degraded", message: "Waiting for configuration" };
     if (health.status !== "ok") return health;
     if (currentGateway && !currentGateway.isConnected()) {

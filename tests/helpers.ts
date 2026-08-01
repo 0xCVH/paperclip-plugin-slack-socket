@@ -45,11 +45,22 @@ export function makeCtx(configOverrides: Partial<SlackSocketConfig> = {}): MockC
       }),
     },
     events: {
-      on: vi.fn((name: string, handler: (event: unknown) => Promise<void>) => {
-        const list = eventHandlers.get(name) ?? [];
-        list.push(handler);
-        eventHandlers.set(name, list);
-      }),
+      // Mirrors the SDK's two overloads: `on(name, handler)` and
+      // `on(name, filter, handler)`. Tests assert on the filter argument via
+      // `(ctx.events.on as any).mock.calls`, so this mock records calls with
+      // whatever arity was actually used rather than normalizing it away.
+      on: vi.fn(
+        (
+          name: string,
+          filterOrHandler: Record<string, unknown> | ((event: unknown) => Promise<void>),
+          maybeHandler?: (event: unknown) => Promise<void>,
+        ) => {
+          const handler = typeof filterOrHandler === "function" ? filterOrHandler : maybeHandler!;
+          const list = eventHandlers.get(name) ?? [];
+          list.push(handler);
+          eventHandlers.set(name, list);
+        },
+      ),
     },
     agents: {
       sessions: {
@@ -88,7 +99,11 @@ export function makeCtx(configOverrides: Partial<SlackSocketConfig> = {}): MockC
     tools: { register: vi.fn() },
     jobs: { register: vi.fn() },
     secrets: { resolve: vi.fn(async (ref: string) => `secret-${ref}`) },
-    config: { get: vi.fn(async () => ({ ...TEST_CONFIG, ...configOverrides })) },
+    // Deliberately no `config.get` mock: this plugin is "proactive" and
+    // never calls it (see config.ts) — outside a host-issued invocation
+    // there's no way for `config.get()` to resolve company scope. Omitted
+    // rather than stubbed so a regression that starts calling it fails
+    // loudly instead of silently succeeding against a mock.
   };
 
   return {

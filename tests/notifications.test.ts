@@ -10,11 +10,22 @@ function setup(configOverrides = {}) {
     ctx: bundle.ctx,
     gateway,
     getConfig: async () => ({ ...TEST_CONFIG, ...configOverrides }),
+    companyId: TEST_CONFIG.companyId,
   });
   return { ...bundle, gateway };
 }
 
 describe("notifications", () => {
+  it("subscribes to all three event types filtered to the configured companyId", async () => {
+    const { ctx } = setup();
+    const calls = (ctx.events.on as any).mock.calls as Array<[string, unknown, unknown]>;
+    const names = calls.map(([name]) => name);
+    expect(names).toEqual(expect.arrayContaining(["issue.created", "issue.updated", "agent.run.failed"]));
+    for (const [, filter] of calls) {
+      expect(filter).toEqual({ companyId: TEST_CONFIG.companyId });
+    }
+  });
+
   it("posts issue.created to the default channel", async () => {
     const { gateway, emitEvent } = setup();
     await emitEvent("issue.created", { entityId: "iss-1", payload: { title: "T", status: "todo" } });

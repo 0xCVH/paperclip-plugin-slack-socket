@@ -8,14 +8,21 @@ export interface ApprovalDeps {
   ctx: PluginContext;
   gateway: SlackGateway;
   getConfig: () => Promise<SlackSocketConfig>;
+  /**
+   * The single company this worker process is bound to — see the matching
+   * comment on `NotificationDeps.companyId` in notifications.ts. The
+   * `approval.created` subscription must be filtered to this company so a
+   * shared worker process never reacts to another company's approvals.
+   */
+  companyId: string;
 }
 
 export interface Approvals {
   handleAction(action: InboundAction): Promise<void>;
 }
 
-export function createApprovals({ ctx, gateway, getConfig }: ApprovalDeps): Approvals {
-  ctx.events.on("approval.created", async (event) => {
+export function createApprovals({ ctx, gateway, getConfig, companyId }: ApprovalDeps): Approvals {
+  ctx.events.on("approval.created", { companyId }, async (event) => {
     const e = event as { entityId?: string; payload: unknown };
     const cfg = await getConfig();
     if (!cfg.notifyOnApprovalCreated || !e.entityId) return;

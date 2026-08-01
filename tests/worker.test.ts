@@ -183,7 +183,7 @@ describe("applyConfig", () => {
     expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledTimes(1);
   });
 
-  it("a second applyConfig call stops the old gateway and starts a new one", async () => {
+  it("a second applyConfig call for the SAME company stops the old gateway and starts a new one", async () => {
     const { applyConfig } = await loadWorker();
     const { ctx } = makeCtx();
     const gatewayA = new FakeGateway();
@@ -196,7 +196,77 @@ describe("applyConfig", () => {
     expect(health.status).toBe("ok");
   });
 
-  it("never calls ctx.config.get during normal operation", async () => {
+  it("subscribes ctx.events on the first bind only — a same-company reconfiguration does not double-subscribe", async () => {
+    const { applyConfig } = await loadWorker();
+    const { ctx } = makeCtx();
+    await applyConfig(ctx, cfg(), () => new FakeGateway());
+    const callsAfterFirst = (ctx.events.on as any).mock.calls.length;
+    expect(callsAfterFirst).toBeGreaterThan(0); // issue.created/issue.updated/agent.run.failed/approval.created
+    await applyConfig(ctx, cfg({ defaultChannelId: "C-OTHER" }), () => new FakeGateway());
+    expect((ctx.events.on as any).mock.calls.length).toBe(callsAfterFirst);
+  });
+
+  it("an invalid second config leaves the first gateway running and getLiveConfig() returning the first config", async () => {
+    const { applyConfig, getLiveConfig } = await loadWorker();
+    const { ctx } = makeCtx();
+    const gatewayA = new FakeGateway();
+    const firstCfg = cfg();
+    await applyConfig(ctx, firstCfg, () => gatewayA);
+    expect(gatewayA.started).toBe(true);
+
+    const gatewayB = new FakeGateway();
+    const health = await applyConfig(ctx, cfg({ slackBotTokenRef: "" }), () => gatewayB);
+
+    expect(health.status).toBe("degraded");
+    expect(health.message).toMatch(/previous configuration is still active/i);
+    expect(gatewayA.started).toBe(true);
+    expect(gatewayB.started).toBe(false);
+    expect(getLiveConfig()).toEqual(firstCfg);
+  });
+
+  it("a secret-resolution failure on a second config likewise leaves the first gateway running and the config unchanged", async () => {
+    const { applyConfig, getLiveConfig } = await loadWorker();
+    const { ctx } = makeCtx();
+    const gatewayA = new FakeGateway();
+    const firstCfg = cfg();
+    await applyConfig(ctx, firstCfg, () => gatewayA);
+    expect(gatewayA.started).toBe(true);
+
+    (ctx.secrets.resolve as any).mockRejectedValueOnce(new Error("secrets disabled"));
+    const gatewayB = new FakeGateway();
+    const health = await applyConfig(ctx, cfg({ defaultChannelId: "C-OTHER" }), () => gatewayB);
+
+    expect(health.status).toBe("degraded");
+    expect(health.message).toMatch(/previous configuration is still active/i);
+    expect(gatewayA.started).toBe(true);
+    expect(gatewayB.started).toBe(false);
+    expect(getLiveConfig()).toEqual(firstCfg);
+  });
+
+  it("refuses a config for a different company, leaves the first gateway running, and logs an error naming both company ids", async () => {
+    const { applyConfig, getLiveConfig } = await loadWorker();
+    const { ctx } = makeCtx();
+    const gatewayA = new FakeGateway();
+    const firstCfg = cfg();
+    await applyConfig(ctx, firstCfg, () => gatewayA);
+    expect(gatewayA.started).toBe(true);
+
+    const gatewayB = new FakeGateway();
+    const health = await applyConfig(ctx, cfg({ companyId: "co-2" }), () => gatewayB);
+
+    expect(health.status).toBe("degraded");
+    expect(health.message).toContain("co-1");
+    expect(health.message).toContain("co-2");
+    expect(gatewayA.started).toBe(true);
+    expect(gatewayB.started).toBe(false);
+    expect(getLiveConfig()).toEqual(firstCfg);
+    expect(ctx.logger.error).toHaveBeenCalledWith(
+      expect.stringContaining("cross-tenant"),
+      expect.objectContaining({ boundCompanyId: "co-1", incomingCompanyId: "co-2" }),
+    );
+  });
+
+  it("never calls ctx.config.get during normal operation (helpers.ts intentionally doesn't mock it)", async () => {
     const { applyConfig } = await loadWorker();
     const { ctx } = makeCtx();
     const gateway = new FakeGateway();
@@ -204,7 +274,9 @@ describe("applyConfig", () => {
     const ts = (Date.now() / 1000).toFixed(6);
     await gateway.emitMessage({ channel: "D1", channelType: "im", user: "U1", text: "hi", ts });
     await gateway.emitCommand({ command: SLASH_COMMAND, text: "help", user: "U1", channel: "C1" });
-    expect(ctx.config.get).not.toHaveBeenCalled();
+    // No mock exists for ctx.config.get (see helpers.ts) — if any code path
+    // started calling it, it would throw here rather than pass silently.
+    expect((ctx as unknown as { config?: unknown }).config).toBeUndefined();
   });
 });
 
@@ -239,6 +311,36 @@ describe("plugin.definition.onConfigChanged (the real host-facing hook)", () => 
     const health = await plugin.definition.onHealth?.();
     expect(health?.status).toBe("degraded");
     expect(health?.message).toMatch(/waiting for configuration/i);
+  });
+
+  it("reports degraded health naming the conflict after a mismatched-company config is refused, while the bound company's gateway keeps running", async () => {
+    const { default: plugin } = await loadWorker();
+    const { ctx } = makeCtx();
+    await plugin.definition.setup(ctx);
+    await plugin.definition.onConfigChanged?.(cfg());
+    await expect(plugin.definition.onHealth?.()).resolves.toEqual({ status: "ok" });
+
+    await plugin.definition.onConfigChanged?.(cfg({ companyId: "co-2" }));
+    const health = await plugin.definition.onHealth?.();
+    expect(health?.status).toBe("degraded");
+    expect(health?.message).toContain("co-1");
+    expect(health?.message).toContain("co-2");
+    // The originally-bound company's gateway is untouched: no new BoltGateway
+    // was created and the first one is still running.
+    expect(boltGatewayInstances).toHaveLength(1);
+    expect(boltGatewayInstances[0]!.started).toBe(true);
+  });
+
+  it("clears the tenant conflict once a matching-company config re-applies", async () => {
+    const { default: plugin } = await loadWorker();
+    const { ctx } = makeCtx();
+    await plugin.definition.setup(ctx);
+    await plugin.definition.onConfigChanged?.(cfg());
+    await plugin.definition.onConfigChanged?.(cfg({ companyId: "co-2" }));
+    await expect(plugin.definition.onHealth?.()).resolves.toMatchObject({ status: "degraded" });
+
+    await plugin.definition.onConfigChanged?.(cfg({ defaultChannelId: "C-OTHER" }));
+    await expect(plugin.definition.onHealth?.()).resolves.toEqual({ status: "ok" });
   });
 });
 

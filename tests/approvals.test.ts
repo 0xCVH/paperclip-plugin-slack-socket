@@ -10,6 +10,7 @@ function setup(configOverrides = {}) {
     ctx: bundle.ctx,
     gateway,
     getConfig: async () => ({ ...TEST_CONFIG, ...configOverrides }),
+    companyId: TEST_CONFIG.companyId,
   });
   return { ...bundle, gateway, approvals };
 }
@@ -24,6 +25,15 @@ const approveAction = {
 };
 
 describe("approvals", () => {
+  it("subscribes to approval.created filtered to the configured companyId", async () => {
+    const { ctx } = setup();
+    expect(ctx.events.on).toHaveBeenCalledWith(
+      "approval.created",
+      { companyId: TEST_CONFIG.companyId },
+      expect.any(Function),
+    );
+  });
+
   it("posts approval.created with buttons to the approvals channel", async () => {
     const { ctx, gateway, emitEvent } = setup({ approvalsChannelId: "C-APPR" });
     await emitEvent("approval.created", { entityId: "app-1", payload: { title: "Deploy?" } });

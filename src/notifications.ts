@@ -9,6 +9,14 @@ export interface NotificationDeps {
   ctx: PluginContext;
   gateway: SlackGateway;
   getConfig: () => Promise<SlackSocketConfig>;
+  /**
+   * The single company this worker process is bound to. The host runs one
+   * worker per installed plugin shared across every company that configures
+   * it, so every `ctx.events.on` subscription must be filtered server-side
+   * to this company — otherwise this process would receive (and act on)
+   * every other company's events too.
+   */
+  companyId: string;
 }
 
 interface EventLike {
@@ -18,7 +26,7 @@ interface EventLike {
 
 type NotificationType = "issue_created" | "issue_done" | "agent_run_failed";
 
-export function registerNotifications({ ctx, gateway, getConfig }: NotificationDeps): void {
+export function registerNotifications({ ctx, gateway, getConfig, companyId }: NotificationDeps): void {
   const post = async (
     channel: string,
     content: SlackContent,
@@ -36,7 +44,7 @@ export function registerNotifications({ ctx, gateway, getConfig }: NotificationD
     }
   };
 
-  ctx.events.on("issue.created", async (event) => {
+  ctx.events.on("issue.created", { companyId }, async (event) => {
     const e = event as EventLike;
     const cfg = await getConfig();
     if (!cfg.notifyOnIssueCreated) return;
@@ -62,7 +70,7 @@ export function registerNotifications({ ctx, gateway, getConfig }: NotificationD
     }
   });
 
-  ctx.events.on("issue.updated", async (event) => {
+  ctx.events.on("issue.updated", { companyId }, async (event) => {
     const e = event as EventLike;
     const cfg = await getConfig();
     if (!cfg.notifyOnIssueDone) return;
@@ -87,7 +95,7 @@ export function registerNotifications({ ctx, gateway, getConfig }: NotificationD
     }
   });
 
-  ctx.events.on("agent.run.failed", async (event) => {
+  ctx.events.on("agent.run.failed", { companyId }, async (event) => {
     const e = event as EventLike;
     const cfg = await getConfig();
     if (!cfg.notifyOnAgentRunFailed) return;
