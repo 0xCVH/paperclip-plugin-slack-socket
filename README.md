@@ -1,0 +1,66 @@
+# paperclip-plugin-slack-socket
+
+A Paperclip plugin that connects Slack to Paperclip over [Socket Mode](https://api.slack.com/apis/socket-mode) — Paperclip opens an outbound WebSocket connection to Slack, so no public URL, reverse proxy, or inbound webhook endpoint is required. Install it, paste in two Slack tokens and a handful of IDs, and your Paperclip agents are reachable from Slack.
+
+## What it is
+
+This plugin lets people talk to Paperclip agents from Slack and lets Paperclip push updates back into Slack, all over a single Socket Mode connection. Concretely it provides:
+
+- **Agent chat** — DM the bot, or `@mention` it in a channel it has been invited to, to start a conversation with your configured default agent. Replies stream into the thread as the agent produces them. Replying inside that thread continues the same agent session without needing to mention the bot again.
+- **Notifications** — Paperclip posts to Slack when an issue is created, when an issue is marked done, and when an agent run fails, each independently toggleable, with an optional per-category channel override (falling back to a default channel).
+- **Approvals with buttons** — when Paperclip requests an approval, the plugin posts a message with Approve/Reject buttons; clicking one calls the Paperclip REST API to decide the approval and updates the Slack message in place to show the outcome.
+- **The `ask_human` tool** — agents can pause and ask a human a question in Slack, either via an emoji reaction or a threaded text reply. The response is recorded as a comment on a Paperclip issue and wakes the issue's agent back up.
+- **`/paperclip issue <title>`** — a slash command that creates a Paperclip issue from Slack and replies with a link, visible only to the person who ran it.
+
+## Slack setup
+
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) and click **Create New App**.
+2. Choose **From an app manifest**, pick the workspace you want to install into, and paste the contents of [`slack-app-manifest.json`](./slack-app-manifest.json) from this repo when prompted. Review and create the app.
+3. On the app's **Install App** page, click **Install to Workspace**, approve the requested scopes, and then copy the **Bot User OAuth Token** (starts with `xoxb-`) — you'll need it in Paperclip.
+4. Go to **Basic Information** → **App-Level Tokens** and click **Generate Token and Scopes**. Give it a name, add the `connections:write` scope, and generate it. Copy the resulting **App-Level Token** (starts with `xapp-`) — this is what lets Socket Mode open its connection.
+
+That's it on the Slack side — the manifest already enables Socket Mode, declares the bot events (`app_mention`, `message.channels`, `message.groups`, `message.im`, `reaction_added`), interactivity (for the approval buttons), and the `/paperclip` slash command, and requests the minimum bot scopes the plugin needs (`app_mentions:read`, `chat:write`, `channels:history`, `groups:history`, `im:history`, `im:read`, `im:write`, `reactions:read`, `users:read`, `commands`).
+
+## Paperclip setup
+
+1. In Paperclip, go to **Settings → Secrets** and create two secrets: one holding the Bot User OAuth Token (`xoxb-…`) and one holding the App-Level Token (`xapp-…`). Note the UUID Paperclip assigns to each — the plugin only ever references secrets by UUID, never by raw value.
+2. Install the plugin package `paperclip-plugin-slack-socket` into your Paperclip instance (plugin id `cvh.slack-socket`).
+3. Open the plugin's instance settings and fill in:
+   - **Slack Bot Token (secret reference)** — the UUID of the bot token secret from step 1.
+   - **Slack App-Level Token (secret reference)** — the UUID of the app token secret from step 1.
+   - **Company ID** — the Paperclip company UUID used for sessions, issues, and approvals.
+   - **Default Agent ID** — the agent that handles DM and @mention conversations.
+   - **Default Slack Channel ID** — the fallback channel for notifications (e.g. `C01ABC2DEF3`).
+   
+   These five fields are required. Optionally set per-category notification toggles (`notifyOnIssueCreated`, `notifyOnIssueDone`, `notifyOnAgentRunFailed`, `notifyOnApprovalCreated`, all on by default), per-category channel overrides (`issuesChannelId`, `errorsChannelId`, `approvalsChannelId` — each falls back to the default channel when unset), a `paperclipBaseUrl` used to build dashboard links, and `sessionIdleHours` (default 24) controlling how long an idle chat session stays open before the cleanup job closes it.
+4. Press **Test Connection**. This calls Slack's `auth.test` with the bot token (verifies it's valid) and `apps.connections.open` with the app token (verifies it has `connections:write` and Socket Mode can be established). Fix any reported error before saving — a missing or malformed token, or a token missing the `connections:write` scope, are the most common failures here.
+5. Save. The plugin resolves both secrets, opens the Socket Mode connection, and registers the `ask_human` tool and the `*/15 * * * *` cleanup job (which closes agent sessions idle beyond `sessionIdleHours` and expires unanswered `ask_human` questions past their `timeoutMinutes`, default 1440).
+
+## Usage
+
+- **DM the bot** from the Apps section of Slack's sidebar to start a private conversation with the default agent.
+- **In a channel**, first `/invite @paperclip` (the bot only sees channel messages after being invited), then `@mention` it to start a thread-scoped conversation.
+- **Reply in the thread** to continue the same agent session — no need to `@mention` the bot again once a thread has an active session.
+- Run **`/paperclip issue <title>`** anywhere to create a Paperclip issue; the confirmation with a link is ephemeral (only you see it). `/paperclip help` shows usage.
+- Agents can call the **`ask_human`** tool mid-run to ask a person a question in Slack (by channel or by DMing a user), either waiting for an emoji reaction (`mode: "reaction"`) or a threaded text reply (`mode: "answer"`); the response is attached to the issue as a comment and the issue is woken up.
+
+**Note:** multi-person group DMs (mpim) are treated the same as channels — the bot only responds in an mpim thread that already has an active session; it does not start new sessions there the way it does in a 1:1 DM. Starting a conversation in an mpim isn't currently supported.
+
+## Manual smoke test checklist
+
+After installing and configuring the plugin, walk through this checklist end-to-end in a real Slack workspace:
+
+1. Plugin health shows **OK** after configuring the required fields and pressing Test Connection.
+2. DM the bot "hello" → a streamed agent reply appears in the thread.
+3. `@mention` the bot in a channel it has been invited to → it replies in a thread.
+4. Reply again in that same thread without mentioning the bot → the conversation continues in the same agent session.
+5. Create an issue in Paperclip → a Slack notification appears in the configured (or default) channel.
+6. Create an approval in Paperclip → Approve/Reject buttons appear in Slack; clicking **Approve** updates the message in place to show it was approved.
+7. Have an agent call `ask_human` with `mode: "reaction"` → react to the posted question with an emoji → a comment recording the response lands on the referenced Paperclip issue.
+8. Run `/paperclip issue Test` → an ephemeral message with a link to the new issue appears.
+
+## Security notes
+
+- **Zero inbound HTTP surface.** Socket Mode means Paperclip connects out to Slack; there is no webhook endpoint, no public URL, and nothing for an attacker to send unsolicited requests to.
+- **Tokens live only in Paperclip Secrets.** The plugin config stores secret UUIDs, never raw token values; the bot and app tokens are resolved from Paperclip's secret store at runtime and are never logged.
+- **No allowlisting yet.** Any workspace member who can DM the bot can converse with the configured default agent, and anyone who can `@mention` it in a channel it's been invited to can do the same. There is currently no per-user or per-channel allowlist — restricting who can talk to the bot is a matter of who is in the workspace and which channels it's invited to. Tighter access control (e.g. an allowlist of Slack user or channel IDs) is future work.

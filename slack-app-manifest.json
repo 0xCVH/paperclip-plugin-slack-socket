@@ -1,0 +1,54 @@
+{
+  "display_information": {
+    "name": "Paperclip",
+    "description": "Chat with your Paperclip agents from Slack",
+    "background_color": "#1f2430"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "paperclip",
+      "always_online": true
+    },
+    "slash_commands": [
+      {
+        "command": "/paperclip",
+        "description": "Paperclip commands",
+        "usage_hint": "issue <title> | help",
+        "should_escape": false
+      }
+    ]
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "app_mentions:read",
+        "chat:write",
+        "channels:history",
+        "groups:history",
+        "im:history",
+        "im:read",
+        "im:write",
+        "reactions:read",
+        "users:read",
+        "commands"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "bot_events": [
+        "app_mention",
+        "message.channels",
+        "message.groups",
+        "message.im",
+        "reaction_added"
+      ]
+    },
+    "interactivity": {
+      "is_enabled": true
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": true,
+    "token_rotation_enabled": false
+  }
+}
