@@ -1,8 +1,18 @@
 // Shared types for the Slack Socket Mode plugin.
 
+import type { EnvSecretRefBinding } from "@paperclipai/plugin-sdk";
+
+// `ctx.secrets.resolve` accepts either the shared `secret_ref` object shape
+// from plugin config, or (per the SDK's documented legacy path) a plain
+// string. Our config fields that hold a secret reference are typed this way
+// and passed through to `resolve` completely opaquely — we must never
+// inspect, reshape, or assume a string UUID here.
+export type SecretRef = string | EnvSecretRefBinding;
+
 export interface SlackSocketConfig {
-  slackBotTokenRef: string;
-  slackAppTokenRef: string;
+  slackBotTokenRef: SecretRef;
+  slackAppTokenRef: SecretRef;
+  paperclipApiKeyRef: SecretRef;
   companyId: string;
   defaultAgentId: string;
   defaultChannelId: string;

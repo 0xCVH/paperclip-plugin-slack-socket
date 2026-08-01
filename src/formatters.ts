@@ -16,12 +16,22 @@ function str(payload: Payload, key: string): string {
   return typeof value === "string" ? value : "";
 }
 
+/**
+ * Escapes Slack mrkdwn's three special characters in a string that comes
+ * from plugin/event payload data or a Slack user profile — i.e. anything we
+ * didn't author ourselves. Must NOT be applied to our own literal markup
+ * (section/context text templates, emoji codes, link syntax we construct).
+ * See https://api.slack.com/reference/surfaces/formatting#escaping
+ */
+export function escapeMrkdwn(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 export function formatIssueCreated(payload: Payload, issueId: string, baseUrl: string): SlackContent {
-  const title = str(payload, "title") || issueId;
-  const meta = [
-    `Status: ${str(payload, "status") || "todo"}`,
-    str(payload, "priority") ? `Priority: ${str(payload, "priority")}` : "",
-  ].filter(Boolean).join(" · ");
+  const title = escapeMrkdwn(str(payload, "title") || issueId);
+  const status = escapeMrkdwn(str(payload, "status") || "todo");
+  const priority = escapeMrkdwn(str(payload, "priority"));
+  const meta = [`Status: ${status}`, priority ? `Priority: ${priority}` : ""].filter(Boolean).join(" · ");
   return {
     text: `New issue created: ${title}`,
     blocks: [
@@ -32,7 +42,7 @@ export function formatIssueCreated(payload: Payload, issueId: string, baseUrl: s
 }
 
 export function formatIssueDone(payload: Payload, issueId: string, baseUrl: string): SlackContent {
-  const title = str(payload, "title") || issueId;
+  const title = escapeMrkdwn(str(payload, "title") || issueId);
   return {
     text: `Issue completed: ${title}`,
     blocks: [section(`:white_check_mark: *Issue completed*\n<${baseUrl}/issues/${issueId}|${title}>`)],
@@ -40,8 +50,8 @@ export function formatIssueDone(payload: Payload, issueId: string, baseUrl: stri
 }
 
 export function formatAgentRunFailed(payload: Payload): SlackContent {
-  const error = str(payload, "error") || str(payload, "message") || "Unknown error";
-  const agentName = str(payload, "agentName") || str(payload, "agentId");
+  const error = escapeMrkdwn(str(payload, "error") || str(payload, "message") || "Unknown error");
+  const agentName = escapeMrkdwn(str(payload, "agentName") || str(payload, "agentId"));
   return {
     text: `Agent run failed${agentName ? ` (${agentName})` : ""}`,
     blocks: [
@@ -52,7 +62,7 @@ export function formatAgentRunFailed(payload: Payload): SlackContent {
 }
 
 export function formatApprovalCreated(approvalId: string, payload: Payload, baseUrl: string): SlackContent {
-  const title = str(payload, "title") || str(payload, "description") || approvalId;
+  const title = escapeMrkdwn(str(payload, "title") || str(payload, "description") || approvalId);
   return {
     text: `Approval requested: ${title}`,
     blocks: [
@@ -90,38 +100,44 @@ export function formatApprovalDecided(
   decision: "approve" | "reject",
   deciderName: string,
 ): SlackContent {
+  const name = escapeMrkdwn(deciderName);
   const label = decision === "approve" ? ":white_check_mark: Approved" : ":no_entry: Rejected";
-  const text = `${label} by ${deciderName} (approval ${approvalId})`;
+  const text = `${label} by ${name} (approval ${approvalId})`;
   return { text, blocks: [section(text)] };
 }
 
 export function formatQuestion(question: string, mode: QuestionMode): SlackContent {
+  const q = escapeMrkdwn(question);
   const hint =
     mode === "reaction"
       ? "React to this message with an emoji to answer. Your reaction will be recorded on the issue."
       : "Reply in this thread to answer. Your reply will be recorded on the issue.";
   return {
-    text: `Question from a Paperclip agent: ${question}`,
-    blocks: [section(`:question: *A Paperclip agent asks:*\n${question}`), context(hint)],
+    text: `Question from a Paperclip agent: ${q}`,
+    blocks: [section(`:question: *A Paperclip agent asks:*\n${q}`), context(hint)],
   };
 }
 
 export function formatQuestionResolved(question: string, response: string, responderName: string): SlackContent {
-  const text = `Answered by ${responderName}: ${response}`;
+  const q = escapeMrkdwn(question);
+  const resp = escapeMrkdwn(response);
+  const name = escapeMrkdwn(responderName);
+  const text = `Answered by ${name}: ${resp}`;
   return {
     text,
     blocks: [
-      section(`:question: ~${question}~`),
-      section(`:speech_balloon: *${responderName}* answered: ${response}`),
+      section(`:question: ~${q}~`),
+      section(`:speech_balloon: *${name}* answered: ${resp}`),
       context("Recorded on the issue."),
     ],
   };
 }
 
 export function formatQuestionExpired(question: string): SlackContent {
-  const text = `Question expired without a response: ${question}`;
+  const q = escapeMrkdwn(question);
+  const text = `Question expired without a response: ${q}`;
   return {
     text,
-    blocks: [section(`:hourglass: ~${question}~`), context("Expired without a response.")],
+    blocks: [section(`:hourglass: ~${q}~`), context("Expired without a response.")],
   };
 }

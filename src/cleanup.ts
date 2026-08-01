@@ -56,7 +56,12 @@ export async function runCleanup(
           ...formatQuestionExpired(pending.question),
         });
       } catch (err) {
-        ctx.logger.warn("Failed to expire question", { err: String(err) });
+        ctx.logger.warn("Failed to expire question", {
+          err: String(err),
+          issueId: pending.issueId,
+          channel: pending.channel,
+          ts: pending.ts,
+        });
       }
       await ctx.state.delete(stateScope(key));
       removedQuestions.push(key);

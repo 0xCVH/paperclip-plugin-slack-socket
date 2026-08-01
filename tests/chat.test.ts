@@ -139,6 +139,34 @@ describe("chat", () => {
     expect(ctx.agents.sessions.create).not.toHaveBeenCalled();
   });
 
+  it("splits a long final reply: placeholder gets the first chunk, the remainder posts as additional thread messages", async () => {
+    const { ctx, gateway, chat } = setup();
+    const longText = "a".repeat(9000);
+    (ctx.agents.sessions.sendMessage as any).mockImplementationOnce(
+      async (_sessionId: string, _companyId: string, opts: { onEvent?: (e: unknown) => void }) => {
+        opts.onEvent?.({
+          sessionId: "sess-1", runId: "run-1", seq: 1,
+          eventType: "done", stream: null, message: longText, payload: null,
+        });
+        return { runId: "run-1" };
+      },
+    );
+
+    await chat.handleMessage(dm("hi", "800.1"));
+
+    const placeholderTs = gateway.posts[0]!.ts;
+    const placeholderUpdate = gateway.updates.find((u) => u.ts === placeholderTs);
+    expect(placeholderUpdate!.text.length).toBe(3900);
+    expect(placeholderUpdate!.text).toBe(longText.slice(0, 3900));
+
+    const extraPosts = gateway.posts.slice(1);
+    expect(extraPosts.length).toBe(2); // 9000 chars = 3900 + 3900 + 1200
+    for (const post of extraPosts) expect(post.threadTs).toBe("800.1");
+
+    const rejoined = placeholderUpdate!.text + extraPosts.map((p) => p.text).join("");
+    expect(rejoined).toBe(longText);
+  });
+
   it("creates only one session when two first messages race in the same thread", async () => {
     const { ctx, chat } = setup();
     await Promise.all([

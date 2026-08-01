@@ -105,7 +105,10 @@ const plugin = definePlugin({
     for (const field of [...REQUIRED_FIELDS, "defaultChannelId"] as const) {
       if (!cfg[field]) errors.push(`${field} is required`);
     }
-    if (!lastCtx || errors.length > 0) return { ok: errors.length === 0, errors };
+    if (errors.length > 0) return { ok: false, errors };
+    if (!lastCtx) {
+      return { ok: false, errors: ["Validation unavailable: plugin context not initialized"] };
+    }
 
     let WebClient: typeof import("@slack/web-api").WebClient;
     try {

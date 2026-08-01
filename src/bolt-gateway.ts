@@ -118,21 +118,21 @@ export class BoltGateway implements SlackGateway {
   }
 
   async start(): Promise<void> {
+    // Verify the bot token (and capture the bot's user id) before opening
+    // the socket at all. auth.test is a plain HTTP call against
+    // `this.app.client`, which doesn't require the socket to be started.
+    // Doing this first means a bad token fails fast with no socket to unwind.
+    const auth = await this.app.client.auth.test();
+    this.botId = (auth as { user_id?: string }).user_id;
+
     const receiver = (this.app as unknown as {
       receiver?: { client?: { on?: (event: string, fn: () => void) => void } };
     }).receiver;
     receiver?.client?.on?.("connected", () => { this.connected = true; });
     receiver?.client?.on?.("disconnected", () => { this.connected = false; });
+
     await this.app.start();
-    try {
-      const auth = await this.app.client.auth.test();
-      this.botId = (auth as { user_id?: string }).user_id;
-      this.connected = true;
-    } catch (err) {
-      await this.app.stop().catch(() => {});
-      this.connected = false;
-      throw err;
-    }
+    this.connected = true;
   }
 
   async stop(): Promise<void> {

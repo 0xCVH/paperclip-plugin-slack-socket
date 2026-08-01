@@ -10,8 +10,8 @@ describe("manifest", () => {
   it("declares the exact least-privilege capability set", () => {
     expect([...manifest.capabilities].sort()).toEqual(
       [
-        "companies.read", "issues.read", "issues.create", "issue.comments.create", "issues.wakeup",
-        "agents.read", "agent.sessions.create", "agent.sessions.send", "agent.sessions.close",
+        "issues.create", "issue.comments.create", "issues.wakeup",
+        "agent.sessions.create", "agent.sessions.send", "agent.sessions.close",
         "agent.tools.register", "http.outbound", "events.subscribe",
         "plugin.state.read", "plugin.state.write", "secrets.read-ref", "instance.settings.register",
         "activity.log.write", "metrics.write", "jobs.schedule",
@@ -29,5 +29,14 @@ describe("manifest", () => {
     expect(schema.required).toEqual([
       "slackBotTokenRef", "slackAppTokenRef", "companyId", "defaultAgentId", "defaultChannelId",
     ]);
+  });
+
+  it("declares the optional Paperclip board API key secret ref, not required", () => {
+    const schema = manifest.instanceConfigSchema as {
+      required?: string[];
+      properties: Record<string, { format?: string; default?: unknown }>;
+    };
+    expect(schema.properties.paperclipApiKeyRef).toMatchObject({ format: "secret-ref", default: "" });
+    expect(schema.required).not.toContain("paperclipApiKeyRef");
   });
 });

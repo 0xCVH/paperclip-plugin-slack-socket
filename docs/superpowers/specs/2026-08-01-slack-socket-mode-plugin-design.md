@@ -85,10 +85,15 @@ Subscriptions: `issue.created`, `issue.updated` (transition to done),
 optional channel override in settings, falling back to `defaultChannelId`.
 Approval messages include Approve/Reject buttons; a click calls the Paperclip
 REST API (`POST {paperclipBaseUrl}/api/approvals/:id/approve|reject` via
-`ctx.http` with `decidedByUserId: "slack:<user>"` in the body — the pattern the
-reference plugin uses against released hosts), updates the Slack message
-inline, and records the acting Slack user in the activity log. (The SDK's
-`ctx.approvals.decide` client exists only on paperclip main, not in the
+`ctx.http` with `decisionNote: "Decided via Slack by <userName> (slack:<user>)"`
+in the body — the server ignores `decidedByUserId` in the body and instead
+uses the authenticated actor, but does record `decisionNote`), updates the
+Slack message inline, and records the acting Slack user in the activity log.
+That endpoint requires a "board" actor: in `local_trusted` deployment mode
+every request is implicitly board and no header is needed, but in
+`authenticated` mode the plugin must send `Authorization: Bearer <board API
+key>`, resolved from the optional `paperclipApiKeyRef` config field. (The
+SDK's `ctx.approvals.decide` client exists only on paperclip main, not in the
 published SDK `2026.722.0` — revisit when it ships.)
 
 ### `slack_ask_human` tool
@@ -125,7 +130,8 @@ configured company and replies ephemerally with a link.
 | `defaultChannelId` | fallback notification channel, required |
 | `notifyOnIssueCreated` / `notifyOnIssueDone` / `notifyOnAgentRunFailed` / `notifyOnApprovalCreated` | booleans |
 | `issuesChannelId` / `errorsChannelId` / `approvalsChannelId` | optional per-type overrides |
-| `paperclipBaseUrl` | dashboard links + approvals REST |
+| `paperclipBaseUrl` | dashboard links + approvals REST (load-bearing for both) |
+| `paperclipApiKeyRef` | optional secret-ref; board API key for approval decisions in `authenticated` deployments (not needed in `local_trusted`) |
 | `sessionIdleHours` | default 24 |
 
 `onValidateConfig` (Test Connection): resolves both secrets and calls Slack
@@ -133,13 +139,16 @@ configured company and replies ephemerally with a link.
 
 ### Capabilities (manifest)
 
-`companies.read`, `issues.read`, `issues.create`,
-`issue.comments.create`, `issues.wakeup`, `agents.read`,
+`issues.create`, `issue.comments.create`, `issues.wakeup`,
 `agent.sessions.create`, `agent.sessions.send`, `agent.sessions.close`,
 `agent.tools.register`, `http.outbound`,
 `events.subscribe`, `plugin.state.read`, `plugin.state.write`,
 `secrets.read-ref`, `instance.settings.register`,
 `activity.log.write`, `metrics.write`, `jobs.schedule`.
+
+(`companies.read`, `issues.read`, and `agents.read` were dropped in the final
+review pass: no code path calls `ctx.companies`, `ctx.issues.list`/`.get`, or
+`ctx.agents.list`/`.get` — sessions are addressed by id, not looked up.)
 
 (`http.outbound` covers only the approval REST calls; all Slack traffic goes
 through Bolt's own clients. The published SDK `2026.722.0` has no

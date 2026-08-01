@@ -74,7 +74,10 @@ export function createAskHuman({ ctx, gateway }: AskHumanDeps): AskHuman {
           }
           let posted: { channel: string; ts: string };
           try {
-            const channel = target.startsWith("U") ? await gateway.openDm(target) : target;
+            // "U" is a regular user id; Enterprise Grid's cross-workspace
+            // "connected" users get a "W" id instead. Both DM.
+            const channel =
+              target.startsWith("U") || target.startsWith("W") ? await gateway.openDm(target) : target;
             posted = await gateway.postMessage({ channel, ...formatQuestion(question, mode) });
           } catch (err) {
             return { error: `Failed to post question to Slack: ${String(err)}` };

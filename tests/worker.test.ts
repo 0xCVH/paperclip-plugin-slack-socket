@@ -69,4 +69,20 @@ describe("onValidateConfig", () => {
       ]),
     );
   });
+
+  it("returns ok:false (not ok:true) when all required fields are present but the plugin context was never initialized", async () => {
+    // No plugin.setup() call has happened in this test file, so the
+    // module-level plugin context is still null. All required fields are
+    // present, so the loop above finds no errors — but validation genuinely
+    // could not run, and must not be reported as a pass.
+    const result = await plugin.definition.onValidateConfig?.({
+      slackBotTokenRef: "ref-bot",
+      slackAppTokenRef: "ref-app",
+      companyId: "co-1",
+      defaultAgentId: "agent-1",
+      defaultChannelId: "C-DEFAULT",
+    });
+    expect(result?.ok).toBe(false);
+    expect(result?.errors).toEqual(["Validation unavailable: plugin context not initialized"]);
+  });
 });

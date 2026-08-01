@@ -22,6 +22,21 @@ interface SessionEventLike {
   message: string | null;
 }
 
+// Slack's chat.update rejects payloads with roughly >4000-character text.
+// Stay comfortably under that for both the rolling streamed update and each
+// chunk of an overlong final reply.
+const MAX_MESSAGE_LENGTH = 3900;
+
+function truncateForStreaming(text: string): string {
+  return text.length > MAX_MESSAGE_LENGTH ? `${text.slice(0, MAX_MESSAGE_LENGTH)}…` : text;
+}
+
+function splitIntoChunks(text: string, size: number): string[] {
+  const chunks: string[] = [];
+  for (let i = 0; i < text.length; i += size) chunks.push(text.slice(i, i + size));
+  return chunks;
+}
+
 export function createChat(deps: ChatDeps): Chat {
   const { ctx, gateway, getConfig } = deps;
   const updateIntervalMs = deps.updateIntervalMs ?? 1000;
@@ -88,8 +103,26 @@ export function createChat(deps: ChatDeps): Chat {
     let updateChain: Promise<void> = Promise.resolve();
 
     const pushUpdate = (text: string): void => {
+      const truncated = truncateForStreaming(text);
       updateChain = updateChain
-        .then(() => gateway.updateMessage({ channel: placeholder.channel, ts: placeholder.ts, text }))
+        .then(() => gateway.updateMessage({ channel: placeholder.channel, ts: placeholder.ts, text: truncated }))
+        .catch((err) => ctx.logger.warn("Slack chat.update failed", { err: String(err) }));
+    };
+
+    // Final reply: update the placeholder with the first MAX_MESSAGE_LENGTH
+    // chars and, if the reply is longer than that, post the remainder as
+    // additional messages in the same thread rather than silently truncating.
+    const finalizeMessage = (text: string): void => {
+      const chunks = splitIntoChunks(text, MAX_MESSAGE_LENGTH);
+      const first = chunks[0] ?? (text || "_(no reply)_");
+      const rest = chunks.slice(1);
+      updateChain = updateChain
+        .then(() => gateway.updateMessage({ channel: placeholder.channel, ts: placeholder.ts, text: first }))
+        .then(async () => {
+          for (const extra of rest) {
+            await gateway.postMessage({ channel: placeholder.channel, threadTs, text: extra });
+          }
+        })
         .catch((err) => ctx.logger.warn("Slack chat.update failed", { err: String(err) }));
     };
 
@@ -119,7 +152,7 @@ export function createChat(deps: ChatDeps): Chat {
               scheduleUpdate();
             } else if (e.eventType === "done") {
               clearPendingTimer();
-              pushUpdate(e.message ?? (buffer || "_(no reply)_"));
+              finalizeMessage(e.message ?? (buffer || "_(no reply)_"));
               resolve();
             } else if (e.eventType === "error") {
               clearPendingTimer();

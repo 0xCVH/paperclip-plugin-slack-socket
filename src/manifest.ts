@@ -17,12 +17,9 @@ const manifest: PaperclipPluginManifestV1 = {
   author: "cvh",
   categories: ["connector", "automation"],
   capabilities: [
-    "companies.read",
-    "issues.read",
     "issues.create",
     "issue.comments.create",
     "issues.wakeup",
-    "agents.read",
     "agent.sessions.create",
     "agent.sessions.send",
     "agent.sessions.close",
@@ -118,8 +115,17 @@ const manifest: PaperclipPluginManifestV1 = {
       paperclipBaseUrl: {
         type: "string",
         title: "Paperclip Base URL",
-        description: "Base URL of your Paperclip instance, used for dashboard links.",
+        description:
+          "Base URL of your Paperclip instance. Load-bearing: used both to build dashboard links and as the target of the approval decision REST calls (POST {paperclipBaseUrl}/api/approvals/:id/approve|reject).",
         default: DEFAULT_CONFIG.paperclipBaseUrl,
+      },
+      paperclipApiKeyRef: {
+        type: "string",
+        format: "secret-ref",
+        title: "Paperclip Board API Key (secret reference)",
+        description:
+          "Secret reference holding a Paperclip API key for a board-role user, sent as an Authorization: Bearer header on approval decision requests. Leave empty for local_trusted deployments, where every request is implicitly authenticated as board and no header is needed. Required for authenticated deployments so approval decisions (Approve/Reject button clicks) authenticate as a board user.",
+        default: DEFAULT_CONFIG.paperclipApiKeyRef,
       },
       sessionIdleHours: {
         type: "number",

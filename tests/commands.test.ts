@@ -41,4 +41,19 @@ describe("commands", () => {
     await commands.handleCommand(cmd("issue X"));
     expect(gateway.ephemerals[0]!.text).toContain("Failed");
   });
+
+  it("does not report a false failure when the issue was created but the success ephemeral fails (e.g. bot not in channel)", async () => {
+    const { ctx, gateway, commands } = setup();
+    gateway.postEphemeral = async () => {
+      throw new Error("not_in_channel");
+    };
+    await commands.handleCommand(cmd("issue Fix the login flow"));
+    expect(ctx.issues.create).toHaveBeenCalled();
+    // No "Failed" ephemeral was posted for what was actually a successful creation.
+    expect(gateway.ephemerals).toHaveLength(0);
+    expect(ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("confirmation"),
+      expect.objectContaining({ issueId: "issue-1" }),
+    );
+  });
 });

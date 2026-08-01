@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  escapeMrkdwn,
   formatAgentRunFailed,
   formatApprovalCreated,
   formatApprovalDecided,
@@ -57,5 +58,34 @@ describe("formatters", () => {
   it("question resolved and expired reference the question", () => {
     expect(formatQuestionResolved("Ship it?", ":+1:", "Sam").text).toContain("Sam");
     expect(formatQuestionExpired("Ship it?").text.toLowerCase()).toContain("expired");
+  });
+
+  it("escapeMrkdwn escapes &, <, > and nothing else", () => {
+    expect(escapeMrkdwn("a & b < c > d")).toBe("a &amp; b &lt; c &gt; d");
+    expect(escapeMrkdwn("plain text")).toBe("plain text");
+  });
+
+  it("escapes a hostile title so it can't inject a fake link label", () => {
+    const hostile = "<https://evil.example|x>";
+    const out = formatIssueCreated({ title: hostile }, "iss-1", BASE);
+    const json = JSON.stringify(out.blocks);
+    // The raw hostile string must never appear verbatim — its "<" would open
+    // a second, attacker-controlled link inside our link's label position.
+    expect(json).not.toContain(hostile);
+    expect(json).toContain("&lt;https://evil.example|x&gt;");
+    expect(out.text).toContain("&lt;https://evil.example|x&gt;");
+  });
+
+  it("plain titles are unaffected by escaping", () => {
+    const out = formatIssueCreated({ title: "Fix login", status: "todo" }, "iss-1", BASE);
+    expect(out.text).toBe("New issue created: Fix login");
+  });
+
+  it("escapes question, response, and responder name in a resolved answer", () => {
+    const out = formatQuestionResolved("Ship <it>?", "yes & go", "Sam <Admin>");
+    const json = JSON.stringify(out.blocks);
+    expect(json).toContain("Ship &lt;it&gt;?");
+    expect(json).toContain("yes &amp; go");
+    expect(json).toContain("Sam &lt;Admin&gt;");
   });
 });

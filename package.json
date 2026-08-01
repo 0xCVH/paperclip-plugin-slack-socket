@@ -6,7 +6,7 @@
   "main": "./dist/index.js",
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
     "test": "vitest run",
     "prepublishOnly": "npm run build"
   },
@@ -23,7 +23,7 @@
     "typescript": "^5.7.0",
     "vitest": "^3.2.6"
   },
-  "files": ["dist/"],
+  "files": ["dist/", "slack-app-manifest.json"],
   "paperclipPlugin": {
     "manifest": "./dist/manifest.js",
     "worker": "./dist/worker.js"
