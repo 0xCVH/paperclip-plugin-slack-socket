@@ -25,6 +25,10 @@ export function createChat(deps: ChatDeps): Chat {
   const { ctx, gateway, getConfig } = deps;
   const updateIntervalMs = deps.updateIntervalMs ?? 1000;
 
+  // Guards against two concurrent "first messages" in the same thread both
+  // passing the "no existing session" check and creating duplicate sessions.
+  const inFlightSessions = new Map<string, Promise<SessionEntry>>();
+
   function stripMention(text: string): string {
     const botId = gateway.botUserId();
     return (botId ? text.replaceAll(`<@${botId}>`, "") : text).trim();
@@ -36,27 +40,39 @@ export function createChat(deps: ChatDeps): Chat {
     threadTs: string,
   ): Promise<SessionEntry> {
     const key = STATE_KEYS.session(channel, threadTs);
-    const existing = (await ctx.state.get(stateScope(key))) as SessionEntry | null;
-    if (existing) {
-      const updated = { ...existing, lastActivityAt: new Date().toISOString() };
-      await ctx.state.set(stateScope(key), updated);
-      return updated;
+    const inFlight = inFlightSessions.get(key);
+    if (inFlight) return inFlight;
+
+    const promise = (async (): Promise<SessionEntry> => {
+      const existing = (await ctx.state.get(stateScope(key))) as SessionEntry | null;
+      if (existing) {
+        const updated = { ...existing, lastActivityAt: new Date().toISOString() };
+        await ctx.state.set(stateScope(key), updated);
+        return updated;
+      }
+      const session = await ctx.agents.sessions.create(cfg.defaultAgentId, cfg.companyId, {
+        reason: "slack-thread",
+      });
+      const entry: SessionEntry = {
+        sessionId: session.sessionId,
+        channel,
+        threadTs,
+        lastActivityAt: new Date().toISOString(),
+      };
+      await ctx.state.set(stateScope(key), entry);
+      const index = ((await ctx.state.get(stateScope(STATE_KEYS.sessionIndex))) as string[] | null) ?? [];
+      if (!index.includes(key)) {
+        await ctx.state.set(stateScope(STATE_KEYS.sessionIndex), [...index, key]);
+      }
+      return entry;
+    })();
+
+    inFlightSessions.set(key, promise);
+    try {
+      return await promise;
+    } finally {
+      inFlightSessions.delete(key);
     }
-    const session = await ctx.agents.sessions.create(cfg.defaultAgentId, cfg.companyId, {
-      reason: "slack-thread",
-    });
-    const entry: SessionEntry = {
-      sessionId: session.sessionId,
-      channel,
-      threadTs,
-      lastActivityAt: new Date().toISOString(),
-    };
-    await ctx.state.set(stateScope(key), entry);
-    const index = ((await ctx.state.get(stateScope(STATE_KEYS.sessionIndex))) as string[] | null) ?? [];
-    if (!index.includes(key)) {
-      await ctx.state.set(stateScope(STATE_KEYS.sessionIndex), [...index, key]);
-    }
-    return entry;
   }
 
   async function streamReply(
@@ -77,6 +93,13 @@ export function createChat(deps: ChatDeps): Chat {
         .catch((err) => ctx.logger.warn("Slack chat.update failed", { err: String(err) }));
     };
 
+    const clearPendingTimer = (): void => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+
     const scheduleUpdate = (): void => {
       if (timer) return;
       timer = setTimeout(() => {
@@ -95,17 +118,20 @@ export function createChat(deps: ChatDeps): Chat {
               buffer += e.message;
               scheduleUpdate();
             } else if (e.eventType === "done") {
-              if (timer) { clearTimeout(timer); timer = null; }
+              clearPendingTimer();
               pushUpdate(e.message ?? (buffer || "_(no reply)_"));
               resolve();
             } else if (e.eventType === "error") {
-              if (timer) { clearTimeout(timer); timer = null; }
+              clearPendingTimer();
               pushUpdate(`:warning: Agent error: ${e.message ?? "unknown error"}`);
               resolve();
             }
           },
         })
         .catch((err) => {
+          // Clear any pending chunk-scheduled update so it can't fire later
+          // and overwrite this error message with a stale partial buffer.
+          clearPendingTimer();
           pushUpdate(`:warning: Failed to reach the agent: ${String(err)}`);
           resolve();
         });
@@ -114,11 +140,11 @@ export function createChat(deps: ChatDeps): Chat {
   }
 
   async function converse(msg: InboundMessage): Promise<void> {
-    const cfg = await getConfig();
     const threadTs = msg.threadTs ?? msg.ts;
-    const prompt = stripMention(msg.text);
-    if (!prompt) return;
     try {
+      const cfg = await getConfig();
+      const prompt = stripMention(msg.text);
+      if (!prompt) return;
       const entry = await getOrCreateSession(cfg, msg.channel, threadTs);
       await streamReply(cfg, entry, msg.channel, threadTs, prompt);
     } catch (err) {
@@ -145,8 +171,12 @@ export function createChat(deps: ChatDeps): Chat {
         return;
       }
       if (!msg.threadTs) return;
-      const entry = await ctx.state.get(stateScope(STATE_KEYS.session(msg.channel, msg.threadTs)));
-      if (entry) await converse(msg);
+      try {
+        const entry = await ctx.state.get(stateScope(STATE_KEYS.session(msg.channel, msg.threadTs)));
+        if (entry) await converse(msg);
+      } catch (err) {
+        ctx.logger.error("Slack handleMessage routing failed", { err: String(err), channel: msg.channel });
+      }
     },
   };
 }

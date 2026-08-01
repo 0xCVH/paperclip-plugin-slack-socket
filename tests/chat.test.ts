@@ -80,4 +80,71 @@ describe("chat", () => {
     await chat.handleMessage(dm("hi", "100.1"));
     expect(gateway.posts.at(-1)!.text).toContain("something went wrong");
   });
+
+  it("posts an apology (and does not throw) when getConfig rejects", async () => {
+    const bundle = makeCtx();
+    const gateway = new FakeGateway();
+    const chat = createChat({
+      ctx: bundle.ctx,
+      gateway,
+      getConfig: () => Promise.reject(new Error("config store down")),
+      updateIntervalMs: 0,
+    });
+    await expect(chat.handleMessage(dm("hi", "400.1"))).resolves.toBeUndefined();
+    expect(gateway.posts.at(-1)!.text).toContain("something went wrong");
+    expect(bundle.ctx.agents.sessions.create).not.toHaveBeenCalled();
+  });
+
+  it("clears the pending debounce timer when sendMessage rejects, so it can't overwrite the error message later", async () => {
+    const bundle = makeCtx();
+    const gateway = new FakeGateway();
+    const chat = createChat({
+      ctx: bundle.ctx,
+      gateway,
+      getConfig: () => loadConfig(bundle.ctx),
+      updateIntervalMs: 5,
+    });
+    (bundle.ctx.agents.sessions.sendMessage as any).mockImplementationOnce(
+      async (_sessionId: string, _companyId: string, opts: { onEvent?: (e: unknown) => void }) => {
+        // Schedule a debounced update from a buffered chunk, then fail the
+        // outer call before that timer would fire.
+        opts.onEvent?.({
+          sessionId: "sess-1", runId: "run-1", seq: 1,
+          eventType: "chunk", stream: "stdout", message: "stale partial buffer", payload: null,
+        });
+        throw new Error("network down");
+      },
+    );
+
+    await chat.handleMessage(dm("hi", "500.1"));
+    const updateCountAfterHandle = gateway.updates.length;
+    expect(gateway.updates.at(-1)!.text).toContain("Failed to reach the agent");
+
+    // Wait past the debounce interval to prove no leaked timer fires and
+    // overwrites the error message with the stale buffered text.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(gateway.updates.length).toBe(updateCountAfterHandle);
+    expect(gateway.updates.at(-1)!.text).toContain("Failed to reach the agent");
+  });
+
+  it("does not throw when ctx.state.get rejects during handleMessage's channel-thread routing", async () => {
+    const { ctx, chat } = setup();
+    (ctx.state.get as any).mockRejectedValueOnce(new Error("state store down"));
+    await expect(
+      chat.handleMessage({
+        channel: "C1", channelType: "channel", user: "U1", text: "hi", ts: "60.1", threadTs: "60.1",
+      }),
+    ).resolves.toBeUndefined();
+    expect(ctx.logger.error).toHaveBeenCalled();
+    expect(ctx.agents.sessions.create).not.toHaveBeenCalled();
+  });
+
+  it("creates only one session when two first messages race in the same thread", async () => {
+    const { ctx, chat } = setup();
+    await Promise.all([
+      chat.handleMessage(dm("first", "700.1")),
+      chat.handleMessage(dm("second", "700.2", "700.1")),
+    ]);
+    expect(ctx.agents.sessions.create).toHaveBeenCalledTimes(1);
+  });
 });
