@@ -126,4 +126,42 @@ describe("instanceConfigSchema vs the host settings form", () => {
     expect(result.valid).toBe(false);
     expect(result.errors).toContainEqual({ field: "/sessionIdleHours", message: "must be number" });
   });
+
+  it("accepts the agent-posting fields the settings form stores", () => {
+    const result = validateInstanceConfig({
+      ...baseConfig,
+      slackBotTokenRef: SECRET_REF,
+      slackAppTokenRef: SECRET_REF,
+      agentPostMessageEnabled: true,
+      agentPostToChannelsEnabled: true,
+      agentPostChannelIds: ["C01ABC2DEF3", "C09XYZ8GHI7"],
+      agentDmEnabled: true,
+      agentDmUserIds: ["U01ABC2DEF3"],
+      agentDmAnyUser: false,
+    });
+    expect(result.errors).toEqual([]);
+    expect(result.valid).toBe(true);
+  });
+
+  it("rejects a non-array agentPostChannelIds", () => {
+    const result = validateInstanceConfig({
+      ...baseConfig,
+      slackBotTokenRef: SECRET_REF,
+      slackAppTokenRef: SECRET_REF,
+      agentPostChannelIds: "C01ABC2DEF3",
+    });
+    expect(result.valid).toBe(false);
+  });
+
+  it("defaults every agent-posting field to its safe value", () => {
+    const schema = manifest.instanceConfigSchema as {
+      properties: Record<string, { default?: unknown }>;
+    };
+    expect(schema.properties.agentPostMessageEnabled?.default).toBe(false);
+    expect(schema.properties.agentPostToChannelsEnabled?.default).toBe(false);
+    expect(schema.properties.agentPostChannelIds?.default).toEqual([]);
+    expect(schema.properties.agentDmEnabled?.default).toBe(false);
+    expect(schema.properties.agentDmUserIds?.default).toEqual([]);
+    expect(schema.properties.agentDmAnyUser?.default).toBe(false);
+  });
 });

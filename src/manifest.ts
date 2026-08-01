@@ -161,6 +161,50 @@ const manifest: PaperclipPluginManifestV1 = {
           "When empty (the default), the allowlist is disabled and any workspace member can use the bot. When non-empty, only the listed Slack user IDs (e.g. U01ABC2DEF3) can interact with it at all — everyone else is ignored silently, with no reply. Find a member's Slack user ID via their profile → \"Copy member ID\".",
         default: DEFAULT_CONFIG.allowedSlackUserIds,
       },
+      agentPostMessageEnabled: {
+        type: "boolean",
+        title: "Let agents post to Slack",
+        description:
+          "Master switch for the slack_post_message tool. When off (the default), agents cannot post to Slack at all and every call is refused, regardless of the settings below.",
+        default: DEFAULT_CONFIG.agentPostMessageEnabled,
+      },
+      agentPostToChannelsEnabled: {
+        type: "boolean",
+        title: "Allow agent posts to channels",
+        description:
+          "Allows agents to post to the channels listed below. Turn this off to suspend channel posting without clearing the list.",
+        default: DEFAULT_CONFIG.agentPostToChannelsEnabled,
+      },
+      agentPostChannelIds: {
+        type: "array",
+        items: { type: "string" },
+        title: "Agent-postable channel IDs",
+        description:
+          "Channel IDs (e.g. C01ABC2DEF3) that agents may post to. Empty means no channel may be posted to — unlike the inbound allowlist above, an empty list here authorizes nothing rather than removing the restriction. The bot must also be a member of the channel.",
+        default: DEFAULT_CONFIG.agentPostChannelIds,
+      },
+      agentDmEnabled: {
+        type: "boolean",
+        title: "Allow agent DMs",
+        description:
+          "Allows agents to send direct messages. Turn this off to suspend DMs without clearing the list below.",
+        default: DEFAULT_CONFIG.agentDmEnabled,
+      },
+      agentDmUserIds: {
+        type: "array",
+        items: { type: "string" },
+        title: "Agent-DM-able user IDs",
+        description:
+          "Slack user IDs (e.g. U01ABC2DEF3) that agents may DM. Empty means no user may be DM'd. Ignored when \"Allow agent DMs to anyone\" is on.",
+        default: DEFAULT_CONFIG.agentDmUserIds,
+      },
+      agentDmAnyUser: {
+        type: "boolean",
+        title: "Allow agent DMs to anyone",
+        description:
+          "When on, agents may DM any member of the workspace and the user list above is ignored. Still requires \"Allow agent DMs\" to be on.",
+        default: DEFAULT_CONFIG.agentDmAnyUser,
+      },
     },
     required: ["slackBotTokenRef", "slackAppTokenRef", "companyId", "defaultAgentId", "defaultChannelId"],
   },

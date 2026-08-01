@@ -28,6 +28,20 @@ export interface SlackSocketConfig {
   streamPartialReplies: boolean;
   chatPromptPreamble: string;
   allowedSlackUserIds: string[];
+  // --- Agent-initiated posting (the slack_post_message tool) ---------
+  //
+  // NOTE the inverted emptiness semantics versus `allowedSlackUserIds`
+  // above: that list is an INBOUND gate where empty means "no restriction
+  // configured, everyone may drive the bot". These two lists are OUTBOUND
+  // capability grants where empty means "nothing authorized". An outbound
+  // capability that defaulted to "no restriction" would ship the plugin
+  // able to post into every channel its bot can reach.
+  agentPostMessageEnabled: boolean;
+  agentPostToChannelsEnabled: boolean;
+  agentPostChannelIds: string[];
+  agentDmEnabled: boolean;
+  agentDmUserIds: string[];
+  agentDmAnyUser: boolean;
 }
 
 export interface SessionEntry {

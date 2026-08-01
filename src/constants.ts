@@ -100,4 +100,10 @@ export const DEFAULT_CONFIG: SlackSocketConfig = {
   streamPartialReplies: false,
   chatPromptPreamble: DEFAULT_CHAT_PROMPT_PREAMBLE,
   allowedSlackUserIds: [],
+  agentPostMessageEnabled: false,
+  agentPostToChannelsEnabled: false,
+  agentPostChannelIds: [],
+  agentDmEnabled: false,
+  agentDmUserIds: [],
+  agentDmAnyUser: false,
 };
