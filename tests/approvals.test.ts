@@ -28,32 +28,33 @@ describe("approvals", () => {
     expect(JSON.stringify(gateway.posts[0]!.blocks)).toContain(ACTION_IDS.approvalApprove);
   });
 
-  it("decides the approval and updates the message on approve", async () => {
+  it("decides the approval via REST and updates the message on approve", async () => {
     const { ctx, gateway, approvals } = setup();
     await approvals.handleAction(approveAction);
-    expect(ctx.approvals.decide).toHaveBeenCalledWith(
-      "app-1",
-      expect.objectContaining({ action: "approve", decisionNote: expect.stringContaining("sam") }),
-      "co-1",
+    expect(ctx.http.fetch).toHaveBeenCalledWith(
+      "https://pc.example/api/approvals/app-1/approve",
+      expect.objectContaining({
+        method: "POST",
+        body: expect.stringContaining("slack:U9"),
+      }),
     );
     expect(gateway.updates[0]!.ts).toBe("77.1");
     expect(gateway.updates[0]!.text).toContain("Approved");
     expect(ctx.activity.log).toHaveBeenCalled();
   });
 
-  it("maps the reject action id to a reject decision", async () => {
+  it("maps the reject action id to the reject endpoint", async () => {
     const { ctx, approvals } = setup();
     await approvals.handleAction({ ...approveAction, actionId: ACTION_IDS.approvalReject });
-    expect(ctx.approvals.decide).toHaveBeenCalledWith(
-      "app-1",
-      expect.objectContaining({ action: "reject" }),
-      "co-1",
+    expect(ctx.http.fetch).toHaveBeenCalledWith(
+      "https://pc.example/api/approvals/app-1/reject",
+      expect.anything(),
     );
   });
 
-  it("posts an ephemeral failure note when decide throws", async () => {
+  it("posts an ephemeral failure note when the REST call fails", async () => {
     const { ctx, gateway, approvals } = setup();
-    (ctx.approvals.decide as any).mockRejectedValueOnce(new Error("already decided"));
+    (ctx.http.fetch as any).mockResolvedValueOnce({ status: 500, json: async () => ({}) });
     await approvals.handleAction(approveAction);
     expect(gateway.updates).toHaveLength(0);
     expect(gateway.ephemerals[0]!.user).toBe("U9");

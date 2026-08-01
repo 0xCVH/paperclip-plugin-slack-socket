@@ -82,8 +82,8 @@ export function makeCtx(configOverrides: Partial<SlackSocketConfig> = {}): MockC
       createComment: vi.fn().mockResolvedValue({ id: "comment-1" }),
       requestWakeup: vi.fn().mockResolvedValue({ requested: true }),
     },
-    approvals: {
-      decide: vi.fn().mockResolvedValue({ applied: true }),
+    http: {
+      fetch: vi.fn().mockResolvedValue({ status: 200, json: async () => ({}) }),
     },
     tools: { register: vi.fn() },
     jobs: { register: vi.fn() },

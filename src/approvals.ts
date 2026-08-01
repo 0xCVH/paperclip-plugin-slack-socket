@@ -3,18 +3,8 @@ import { ACTION_IDS } from "./constants.js";
 import { formatApprovalCreated, formatApprovalDecided } from "./formatters.js";
 import type { InboundAction, SlackGateway, SlackSocketConfig } from "./types.js";
 
-interface ApprovalsContext extends PluginContext {
-  approvals: {
-    decide(
-      approvalId: string,
-      decision: { action: "approve" | "reject"; decisionNote: string },
-      companyId: string,
-    ): Promise<void>;
-  };
-}
-
 export interface ApprovalDeps {
-  ctx: ApprovalsContext;
+  ctx: PluginContext;
   gateway: SlackGateway;
   getConfig: () => Promise<SlackSocketConfig>;
 }
@@ -46,11 +36,17 @@ export function createApprovals({ ctx, gateway, getConfig }: ApprovalDeps): Appr
       const decision = action.actionId === ACTION_IDS.approvalApprove ? "approve" : "reject";
       const approvalId = action.value;
       try {
-        await ctx.approvals.decide(
-          approvalId,
-          { action: decision, decisionNote: `Decided via Slack by ${action.userName} (slack:${action.user})` },
-          cfg.companyId,
+        const response = await ctx.http.fetch(
+          `${cfg.paperclipBaseUrl}/api/approvals/${encodeURIComponent(approvalId)}/${decision}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ decidedByUserId: `slack:${action.user}` }),
+          },
         );
+        if (response.status < 200 || response.status >= 300) {
+          throw new Error(`Approval ${decision} returned HTTP ${response.status}`);
+        }
         await gateway.updateMessage({
           channel: action.channel,
           ts: action.messageTs,
