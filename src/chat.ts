@@ -1,5 +1,6 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { STATE_KEYS, stateScope } from "./constants.js";
+import { updateIndex } from "./state-index.js";
 import type { InboundMessage, SessionEntry, SlackGateway, SlackSocketConfig } from "./types.js";
 
 export interface ChatDeps {
@@ -60,10 +61,9 @@ export function createChat(deps: ChatDeps): Chat {
         lastActivityAt: new Date().toISOString(),
       };
       await ctx.state.set(stateScope(key), entry);
-      const index = ((await ctx.state.get(stateScope(STATE_KEYS.sessionIndex))) as string[] | null) ?? [];
-      if (!index.includes(key)) {
-        await ctx.state.set(stateScope(STATE_KEYS.sessionIndex), [...index, key]);
-      }
+      await updateIndex(ctx, STATE_KEYS.sessionIndex, (current) =>
+        current.includes(key) ? current : [...current, key],
+      );
       return entry;
     })();
 

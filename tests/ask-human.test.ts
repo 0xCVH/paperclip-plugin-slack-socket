@@ -93,4 +93,46 @@ describe("ask-human tool", () => {
     });
     expect(claimed).toBe(false);
   });
+
+  it("resolves a reaction only once when two identical reactions race for the same message", async () => {
+    const { ctx, gateway, askHuman, stateStore } = setup();
+    const key = STATE_KEYS.question("C1", "10.1");
+    stateStore.set(key, pending());
+    stateStore.set(STATE_KEYS.questionIndex, [key]);
+    const reaction = { channel: "C1", messageTs: "10.1", user: "U5", reaction: "+1" };
+    await Promise.all([askHuman.handleReaction(reaction), askHuman.handleReaction(reaction)]);
+    expect(ctx.issues.createComment).toHaveBeenCalledTimes(1);
+    expect(ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(gateway.updates).toHaveLength(1);
+  });
+
+  it("tracks concurrent asks without losing either questionIndex entry", async () => {
+    const { handler, gateway, stateStore } = setup();
+    const [first, second] = await Promise.all([
+      handler({ question: "Ship it?", target: "C1", mode: "reaction", issueId: "iss-1" }, RUN_CTX),
+      handler({ question: "Deploy now?", target: "C2", mode: "reaction", issueId: "iss-2" }, RUN_CTX),
+    ]);
+    expect(first.error).toBeUndefined();
+    expect(second.error).toBeUndefined();
+    expect(gateway.posts).toHaveLength(2);
+    const keys = gateway.posts.map((p) => STATE_KEYS.question(p.channel, p.ts));
+    const index = stateStore.get(STATE_KEYS.questionIndex) as string[];
+    expect(index).toHaveLength(2);
+    for (const key of keys) expect(index).toContain(key);
+  });
+
+  it("returns a tracking error and warns in Slack when state.set fails after a successful post", async () => {
+    const { ctx, gateway, handler } = setup();
+    (ctx.state.set as any).mockRejectedValueOnce(new Error("state store down"));
+    const result = await handler(
+      { question: "Ship it?", target: "C1", mode: "reaction", issueId: "iss-1" }, RUN_CTX,
+    );
+    expect(result.error).toMatch(/tracked/i);
+    expect(gateway.posts).toHaveLength(1);
+    const postedTs = gateway.posts[0]!.ts;
+    expect(gateway.updates).toContainEqual(
+      expect.objectContaining({ channel: "C1", ts: postedTs, text: expect.stringContaining("could not be tracked") }),
+    );
+    expect(ctx.logger.error).toHaveBeenCalled();
+  });
 });
