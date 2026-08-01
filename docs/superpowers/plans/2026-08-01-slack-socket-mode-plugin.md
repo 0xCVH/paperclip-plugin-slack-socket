@@ -49,14 +49,14 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "@slack/bolt": "^4.2.0",
-    "@slack/web-api": "^7.8.0"
+    "@slack/bolt": "^5.0.0",
+    "@slack/web-api": "^8.0.0"
   },
   "peerDependencies": {
     "@paperclipai/plugin-sdk": "*"
   },
   "devDependencies": {
-    "@paperclipai/plugin-sdk": "^2026.618.0",
+    "@paperclipai/plugin-sdk": "2026.722.0",
     "@types/node": "^25.5.2",
     "typescript": "^5.7.0",
     "vitest": "^3.2.6"
@@ -2637,4 +2637,4 @@ git commit -m "docs: Slack app manifest and setup guide"
 
 - **Spec coverage:** chat per-thread sessions + streaming (Task 4), notifications with toggles/overrides (Task 5), approvals with buttons via `ctx.approvals.decide` (Task 6), `ask_human` reaction/answer → issue comment + wakeup (Task 7), `/paperclip issue` + cleanup TTLs (Task 8), manifest with zero webhooks and least-privilege capabilities + config schema + Test Connection (Tasks 9–10), lifecycle/health/secret handling (Task 10), Slack app manifest + README + smoke test (Task 11). Identity mapping intentionally absent (spec: out of scope).
 - **Type consistency:** `SlackGateway` and module factory signatures are defined once in Task 1 and consumed verbatim in Tasks 2–10; `FakeGateway` mirrors the interface exactly.
-- **Known judgment calls:** Bolt/web-api version floors (`^4.2.0`, `^7.8.0`) and the SDK dev version (`^2026.618.0`) mirror the reference plugin's era — if `npm install` reports different latest majors, keep the majors pinned here unless compilation fails. The `receiver.client` connected/disconnected listeners in `BoltGateway.start()` are defensively optional-chained; if the receiver shape differs at runtime, health falls back to "connected after start()" which is still safe.
+- **Known judgment calls:** Versions verified against npm on 2026-08-01: Bolt `^5.0.0` and web-api `^8.0.0` are the current majors (Bolt 5's breaking changes — Node 20 floor, `respond()`/axios removal, WorkflowStep removal — do not touch any API this plugin uses). The SDK devDependency is pinned exactly to `2026.722.0` per the official docs' guidance ("the plugin runtime is in alpha… pin your `@paperclipai/plugin-sdk` version"); the peerDependency stays `*` because the host supplies its own SDK at runtime (same convention as the reference plugin). The `receiver.client` connected/disconnected listeners in `BoltGateway.start()` are defensively optional-chained; if the receiver shape differs at runtime, health falls back to "connected after start()" which is still safe.
