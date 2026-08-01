@@ -23,11 +23,11 @@ That's it on the Slack side — the manifest already enables Socket Mode, declar
 
 ## Paperclip setup
 
-1. In Paperclip, go to **Settings → Secrets** and create two secrets: one holding the Bot User OAuth Token (`xoxb-…`) and one holding the App-Level Token (`xapp-…`). Note the UUID Paperclip assigns to each — the plugin only ever references secrets by UUID, never by raw value.
+1. In Paperclip, go to **Settings → Secrets** and create two secrets: one holding the Bot User OAuth Token (`xoxb-…`) and one holding the App-Level Token (`xapp-…`). Note the secret reference Paperclip shows for each (the settings form's secret-ref fields store whatever the Secrets page provides — the plugin passes it through opaquely and never sees the raw value).
 2. Install the plugin package `paperclip-plugin-slack-socket` into your Paperclip instance (plugin id `cvh.slack-socket`).
 3. Open the plugin's instance settings and fill in:
-   - **Slack Bot Token (secret reference)** — the UUID of the bot token secret from step 1.
-   - **Slack App-Level Token (secret reference)** — the UUID of the app token secret from step 1.
+   - **Slack Bot Token (secret reference)** — the secret reference for the bot token secret from step 1.
+   - **Slack App-Level Token (secret reference)** — the secret reference for the app token secret from step 1.
    - **Company ID** — the Paperclip company UUID used for sessions, issues, and approvals.
    - **Default Agent ID** — the agent that handles DM and @mention conversations.
    - **Default Slack Channel ID** — the fallback channel for notifications (e.g. `C01ABC2DEF3`).

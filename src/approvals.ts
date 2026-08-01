@@ -34,12 +34,13 @@ export function createApprovals({ ctx, gateway, getConfig }: ApprovalDeps): Appr
     action: InboundAction,
     approvalId: string,
     decision: "approve" | "reject",
+    hint: string,
   ): Promise<void> {
     await gateway
       .postEphemeral({
         channel: action.channel,
         user: action.user,
-        text: `:x: Failed to ${decision} approval \`${approvalId}\`. It may already be decided.`,
+        text: `:x: Failed to ${decision} approval \`${approvalId}\`. ${hint}`,
       })
       .catch(() => {});
   }
@@ -79,7 +80,12 @@ export function createApprovals({ ctx, gateway, getConfig }: ApprovalDeps): Appr
             err: String(err),
             approvalId,
           });
-          await postFailureEphemeral(action, approvalId, decision);
+          await postFailureEphemeral(
+            action,
+            approvalId,
+            decision,
+            "The configured Paperclip board API key could not be resolved — check the plugin settings.",
+          );
           return;
         }
       }
@@ -114,7 +120,7 @@ export function createApprovals({ ctx, gateway, getConfig }: ApprovalDeps): Appr
         await ctx.metrics.write("slack.approvals.decided", 1, { decision });
       } catch (err) {
         ctx.logger.warn("Approval decision via Slack failed", { err: String(err), approvalId });
-        await postFailureEphemeral(action, approvalId, decision);
+        await postFailureEphemeral(action, approvalId, decision, "It may already be decided.");
       }
     },
   };
