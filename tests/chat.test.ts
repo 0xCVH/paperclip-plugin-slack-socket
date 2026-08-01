@@ -73,11 +73,25 @@ describe("chat", () => {
     expect(call[2].prompt).toBe("help me");
   });
 
-  it("posts an apology in the thread when the session fails", async () => {
+  it("posts an apology naming the reason when the session fails", async () => {
     const { ctx, gateway, chat } = setup();
     (ctx.agents.sessions.create as any).mockRejectedValueOnce(new Error("no agent"));
     await chat.handleMessage(dm("hi", "100.1"));
-    expect(gateway.posts.at(-1)!.text).toContain("something went wrong");
+    const text = gateway.posts.at(-1)!.text;
+    expect(text).toContain("something went wrong");
+    // The reason must reach the person in the thread — see chat.ts.
+    expect(text).toContain("no agent");
+  });
+
+  it("redacts tokens from the reason it posts to Slack", async () => {
+    const { ctx, gateway, chat } = setup();
+    (ctx.agents.sessions.create as any).mockRejectedValueOnce(
+      new Error("bad auth xoxb-1234-secret"),
+    );
+    await chat.handleMessage(dm("hi", "101.1"));
+    const text = gateway.posts.at(-1)!.text;
+    expect(text).not.toContain("xoxb-1234-secret");
+    expect(text).toContain("[REDACTED]");
   });
 
   it("posts an apology (and does not throw) when getConfig rejects", async () => {

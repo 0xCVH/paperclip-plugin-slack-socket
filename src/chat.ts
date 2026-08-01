@@ -187,12 +187,17 @@ export function createChat(deps: ChatDeps): Chat {
       const entry = await getOrCreateSession(cfg, msg.channel, threadTs);
       await streamReply(cfg, entry, msg.channel, threadTs, prompt);
     } catch (err) {
-      ctx.logger.error("Slack chat failed", { err: errString(err), channel: msg.channel });
+      const reason = errString(err);
+      ctx.logger.error("Slack chat failed", { err: reason, channel: msg.channel });
       await gateway
         .postMessage({
           channel: msg.channel,
           threadTs,
-          text: ":warning: Sorry — something went wrong talking to the agent. Please try again.",
+          // Surface the reason in Slack, not just in the plugin log: an
+          // operator reading the thread is usually the only person who sees
+          // this, and a bare "something went wrong" makes the plugin
+          // undiagnosable from the outside. errString() redacts tokens.
+          text: `:warning: Sorry — something went wrong talking to the agent: ${reason.slice(0, 500)}`,
         })
         .catch(() => {});
     }
