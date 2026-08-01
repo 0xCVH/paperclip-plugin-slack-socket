@@ -75,6 +75,88 @@ export function getLiveConfig(): SlackSocketConfig {
   return liveConfig ?? DEFAULT_CONFIG;
 }
 
+// --- Config apply pump ---------------------------------------------------
+//
+// Bug: Node's AsyncLocalStorage context propagates into anything created
+// inside `als.run(...)` — including sockets — and every later callback from
+// that socket keeps running in the captured store. The plugin SDK wraps
+// host->worker calls that carry a `paperclipInvocation` (e.g. `configChanged`)
+// in `invocationContextStorage.run(...)` and echoes the store's invocation id
+// on every worker->host call the plugin makes afterwards. If the Slack Bolt
+// gateway were constructed synchronously inside `onConfigChanged`, it would
+// be built inside that invocation's ALS store, and every subsequent Slack
+// event (chat message, mention, action, command) would echo the id of a
+// `configChanged` invocation the host finished long ago — the host looks it
+// up, finds nothing, and denies the call with "unknown invocation scope".
+//
+// The fix: never call `applyConfig` (and therefore never construct the
+// gateway) from inside `onConfigChanged` itself. Instead, `onConfigChanged`
+// only enqueues the merged config and returns a promise that resolves once
+// that job has been applied. A single pump loop, started once from `setup()`
+// (i.e. with a clean/no ALS store), drains the queue. Because the pump's
+// `for(;;)` loop and its `await waitForWork()` continuation were both set up
+// outside any `als.run(...)` call, they resume in a clean store even though
+// `signalPump()` is invoked synchronously from inside the `configChanged`
+// invocation's store — a `new Promise(resolve => { wakePump = resolve })`
+// does not adopt the calling context of whoever eventually calls `resolve()`,
+// it keeps the context active at its own creation site. Any gateway created
+// from within the pump's loop body therefore has no ALS store at all, exactly
+// like `setup()` itself.
+interface PendingApply {
+  cfg: SlackSocketConfig;
+  done: () => void;
+}
+let applyQueue: PendingApply[] = [];
+let wakePump: (() => void) | null = null;
+let pumpSignalled = false;
+let pumpStarted = false;
+
+function signalPump(): void {
+  pumpSignalled = true;
+  const wake = wakePump;
+  wakePump = null;
+  if (wake) wake();
+}
+
+async function waitForWork(): Promise<void> {
+  if (pumpSignalled) {
+    pumpSignalled = false;
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    wakePump = resolve;
+  });
+  pumpSignalled = false;
+}
+
+/**
+ * Starts the single, process-lifetime pump that drains `applyQueue` by
+ * calling `applyConfig`. Must be called exactly once, from `setup()`, so the
+ * pump's loop — and therefore every gateway it creates — runs with a clean
+ * ALS store rather than whatever invocation happened to be active on the
+ * host call that queued a job. Guarded by `pumpStarted` for idempotency.
+ */
+function startConfigPump(ctx: PluginContext, makeGateway: GatewayFactory): void {
+  if (pumpStarted) return;
+  pumpStarted = true;
+  void (async () => {
+    for (;;) {
+      await waitForWork();
+      while (applyQueue.length) {
+        const job = applyQueue.shift()!;
+        try {
+          await applyConfig(ctx, job.cfg, makeGateway);
+        } catch (err) {
+          ctx.logger.error("Slack config apply failed", { err: errString(err) });
+          health = { status: "degraded", message: `Slack Socket configuration failed: ${errString(err)}` };
+        } finally {
+          job.done();
+        }
+      }
+    }
+  })();
+}
+
 // Registration that must happen exactly once per worker process regardless
 // of company: the ask_human tool registration and (from setup()) the
 // cleanup job. All of it is wired against a gateway *proxy* (see
@@ -316,17 +398,20 @@ const plugin = definePlugin({
       const { gatewayProxy } = ensureCoreModules(ctx);
       await runCleanup(ctx, gatewayProxy, getLiveConfig());
     });
+    startConfigPump(ctx, (opts) => new BoltGateway({ ...opts, logger: ctx.logger }));
   },
 
+  // Never calls `applyConfig` (and therefore never constructs the gateway)
+  // directly — see the "Config apply pump" comment above `startConfigPump`
+  // for why. This just enqueues the merged config for the pump and waits for
+  // that specific job to finish, so the host's call completes only once the
+  // config has actually been applied.
   async onConfigChanged(config) {
-    if (!lastCtx) return;
-    const ctx = lastCtx;
-    try {
-      await applyConfig(ctx, mergeConfig(config), (opts) => new BoltGateway({ ...opts, logger: ctx.logger }));
-    } catch (err) {
-      health = { status: "degraded", message: `Slack Socket configuration failed: ${errString(err)}` };
-      ctx.logger.error("Slack Socket onConfigChanged failed", { err: errString(err) });
-    }
+    const cfg = mergeConfig(config);
+    await new Promise<void>((resolve) => {
+      applyQueue.push({ cfg, done: resolve });
+      signalPump();
+    });
   },
 
   async onShutdown() {
