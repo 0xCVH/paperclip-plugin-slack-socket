@@ -429,6 +429,37 @@ describe("access control (allowedSlackUserIds)", () => {
     expect(ctx.metrics.write).toHaveBeenCalledWith("slack.access.denied", 1, { surface: "message" });
   });
 
+  it("an @mention from a denied user produces no session creation and no gateway posts", async () => {
+    const { applyConfig } = await loadWorker();
+    const { ctx } = makeCtx();
+    const gateway = new FakeGateway();
+    await applyConfig(ctx, accessCfg(), () => gateway);
+    const ts = (Date.now() / 1000).toFixed(6);
+    await gateway.emitMention({
+      channel: "C1", channelType: "channel", user: "U-OTHER", text: "<@UBOT> hi", ts,
+    });
+    expect(ctx.agents.sessions.create).not.toHaveBeenCalled();
+    expect(ctx.agents.sessions.sendMessage).not.toHaveBeenCalled();
+    expect(gateway.posts).toHaveLength(0);
+    expect(ctx.logger.info).toHaveBeenCalledWith(
+      "Ignoring Slack interaction from a user not on the allowlist",
+      expect.objectContaining({ user: "U-OTHER", surface: "mention" }),
+    );
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.access.denied", 1, { surface: "mention" });
+  });
+
+  it("an allowed user's @mention is still handled normally", async () => {
+    const { applyConfig } = await loadWorker();
+    const { ctx } = makeCtx();
+    const gateway = new FakeGateway();
+    await applyConfig(ctx, accessCfg(), () => gateway);
+    const ts = (Date.now() / 1000).toFixed(6);
+    await gateway.emitMention({
+      channel: "C1", channelType: "channel", user: "U-ALLOWED", text: "<@UBOT> hi", ts,
+    });
+    expect(ctx.agents.sessions.create).toHaveBeenCalled();
+  });
+
   it("a slash command from a denied user produces no ephemeral", async () => {
     const { applyConfig } = await loadWorker();
     const { ctx } = makeCtx();
