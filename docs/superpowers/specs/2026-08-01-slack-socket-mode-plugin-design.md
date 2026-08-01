@@ -38,9 +38,11 @@ REST calls) from `mvanhorn/paperclip-plugin-slack` rather than forking it.
   reactions) arrives over the socket. The manifest declares **zero webhooks**.
 - **Tokens:** two Paperclip secret references — Bot token (`xoxb-`) and
   App-level token (`xapp-`, scope `connections:write`).
-- **Lifecycle:** `onConfigChanged` restarts the Bolt app with new settings;
-  `onShutdown` stops the socket; `onHealth` reports live socket state (and
-  secret-resolution failures) to the Paperclip health dashboard.
+- **Lifecycle:** config changes rely on the host's default behavior (no
+  `onConfigChanged` hook → the host restarts the worker, giving a clean slate
+  and avoiding double-registered event handlers); `onShutdown` stops the
+  socket; `onHealth` reports live socket state (and secret-resolution
+  failures) to the Paperclip health dashboard.
 
 ### Modules
 
@@ -81,10 +83,11 @@ without a network.
 Subscriptions: `issue.created`, `issue.updated` (transition to done),
 `agent.run.failed`, `approval.created`. Each type has an enable toggle and an
 optional channel override in settings, falling back to `defaultChannelId`.
-Approval messages include Approve/Reject buttons; a click calls the Paperclip
-REST API (`POST {paperclipBaseUrl}/api/approvals/:id/approve|reject` via
-`ctx.http`), updates the Slack message inline, and logs the acting Slack user
-ID to the activity log.
+Approval messages include Approve/Reject buttons; a click calls the SDK's
+first-class approvals client (`ctx.approvals.decide(approvalId, { action,
+decisionNote }, companyId)` — capabilities `approvals.read` +
+`approvals.respond`), updates the Slack message inline, and records the acting
+Slack user in the decision note and activity log.
 
 ### `slack_ask_human` tool
 
@@ -131,10 +134,13 @@ configured company and replies ephemerally with a link.
 `companies.read`, `issues.read`, `issues.create`,
 `issue.comments.create`, `issues.wakeup`, `agents.read`,
 `agent.sessions.create`, `agent.sessions.send`, `agent.sessions.close`,
-`agent.tools.register`,
+`agent.tools.register`, `approvals.read`, `approvals.respond`,
 `events.subscribe`, `plugin.state.read`, `plugin.state.write`,
-`http.outbound`, `secrets.read-ref`, `instance.settings.register`,
+`secrets.read-ref`, `instance.settings.register`,
 `activity.log.write`, `metrics.write`, `jobs.schedule`.
+
+(`http.outbound` is not needed: all Slack traffic goes through Bolt's own
+clients, and approvals use `ctx.approvals` instead of REST.)
 
 (Least-privilege: only capabilities the flows above actually use.)
 
