@@ -63,14 +63,18 @@ export async function startRuntime(ctx: PluginContext, makeGateway: GatewayFacto
   // message dispatch before it reaches ask-human's answer routing or chat —
   // reactions, actions, and commands are not deduped (they're not prone to
   // the same at-least-once redelivery pattern here and are already
-  // effectively idempotent or externally acked).
+  // effectively idempotent or externally acked). Keys are namespaced by
+  // event type ("mention:"/"message:") because a single channel @mention
+  // arrives as two distinct Slack events sharing the same ts (app_mention +
+  // message.channels) — without the prefix, consuming one event's key would
+  // shadow the other's and silently drop it as a "duplicate".
   const eventDeduper = createEventDeduper();
   gateway.onMention(async (msg) => {
-    if (!eventDeduper.shouldProcess(`${msg.channel}:${msg.ts}`)) return;
+    if (!eventDeduper.shouldProcess(`mention:${msg.channel}:${msg.ts}`)) return;
     await chat.handleMention(msg);
   });
   gateway.onMessage(async (msg) => {
-    if (!eventDeduper.shouldProcess(`${msg.channel}:${msg.ts}`)) return;
+    if (!eventDeduper.shouldProcess(`message:${msg.channel}:${msg.ts}`)) return;
     if (await askHuman.tryHandleAnswer(msg)) return;
     await chat.handleMessage(msg);
   });
@@ -95,7 +99,7 @@ const plugin = definePlugin({
     try {
       await startRuntime(ctx, (opts) => new BoltGateway({ ...opts, logger: ctx.logger }));
     } catch (err) {
-      health = { status: "degraded", message: `Slack Socket startup failed: ${String(err)}` };
+      health = { status: "degraded", message: `Slack Socket startup failed: ${errString(err)}` };
       ctx.logger.error("Slack Socket startup failed", { err: errString(err) });
     }
   },
@@ -127,7 +131,7 @@ const plugin = definePlugin({
     try {
       ({ WebClient } = await import("@slack/web-api"));
     } catch (err) {
-      errors.push(`Validation unavailable: ${String(err)}`);
+      errors.push(`Validation unavailable: ${errString(err)}`);
       return { ok: false, errors };
     }
 
@@ -136,14 +140,14 @@ const plugin = definePlugin({
       const auth = await new WebClient(botToken).auth.test();
       if (!auth.ok) errors.push("Slack auth.test failed for the bot token");
     } catch (err) {
-      errors.push(`Bot token check failed: ${String(err)}`);
+      errors.push(`Bot token check failed: ${errString(err)}`);
     }
     try {
       const appToken = await lastCtx.secrets.resolve(cfg.slackAppTokenRef);
       const conn = await new WebClient(appToken).apps.connections.open();
       if (!conn.ok) errors.push("apps.connections.open failed for the app token (needs connections:write)");
     } catch (err) {
-      errors.push(`App token check failed: ${String(err)}`);
+      errors.push(`App token check failed: ${errString(err)}`);
     }
     return { ok: errors.length === 0, errors };
   },

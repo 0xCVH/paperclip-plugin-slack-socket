@@ -69,6 +69,23 @@ describe("startRuntime", () => {
     await gateway.emitMessage(msg);
     expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledTimes(1);
   });
+
+  it("does not drop a channel @mention when its message.channels event (same ts) is processed first — dedup keys are namespaced per event type", async () => {
+    const { ctx } = makeCtx();
+    const gateway = new FakeGateway();
+    await startRuntime(ctx, () => gateway);
+    const ts = (Date.now() / 1000).toFixed(6);
+    const text = "<@UBOT> help me";
+    // Slack delivers both a message.channels event and an app_mention event
+    // for the same @mention, sharing the same ts. The message event is a
+    // no-op in chat.handleMessage (the app_mention event handles it), but
+    // before the dedup keys were namespaced by event type it would still
+    // consume the shared `${channel}:${ts}` key and cause the subsequent,
+    // real app_mention event to be dropped as a "duplicate".
+    await gateway.emitMessage({ channel: "C1", channelType: "channel", user: "U1", text, ts });
+    await gateway.emitMention({ channel: "C1", channelType: "channel", user: "U1", text, ts });
+    expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("onValidateConfig", () => {

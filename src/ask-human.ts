@@ -81,7 +81,7 @@ export function createAskHuman({ ctx, gateway }: AskHumanDeps): AskHuman {
               target.startsWith("U") || target.startsWith("W") ? await gateway.openDm(target) : target;
             posted = await gateway.postMessage({ channel, ...formatQuestion(question, mode) });
           } catch (err) {
-            return { error: `Failed to post question to Slack: ${String(err)}` };
+            return { error: `Failed to post question to Slack: ${errString(err)}` };
           }
 
           const key = STATE_KEYS.question(posted.channel, posted.ts);

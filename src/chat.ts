@@ -171,7 +171,7 @@ export function createChat(deps: ChatDeps): Chat {
           // Clear any pending chunk-scheduled update so it can't fire later
           // and overwrite this error message with a stale partial buffer.
           clearPendingTimer();
-          pushUpdate(`:warning: Failed to reach the agent: ${String(err)}`);
+          pushUpdate(`:warning: Failed to reach the agent: ${errString(err)}`);
           resolve();
         });
     });
