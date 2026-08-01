@@ -20,7 +20,15 @@ Paperclip installs plugins instance-wide from an npm package name or a local pat
 - **CLI** — `paperclipai plugin install <npm-package-or-absolute-path>`.
 - **REST API** — `POST /api/plugins/install` with a JSON body of `{"packageName": "...", "isLocalPath": true|false}`.
 
-This package is not yet published to npm, so today you install it from a local clone instead of by package name:
+The package is published on npm as [`paperclip-plugin-slack-socket`](https://www.npmjs.com/package/paperclip-plugin-slack-socket), so the normal install is by name through any of the three routes:
+
+```sh
+paperclipai plugin install paperclip-plugin-slack-socket
+```
+
+or enter `paperclip-plugin-slack-socket` in **Settings → Plugins → Install**, or `POST /api/plugins/install` with `{"packageName": "paperclip-plugin-slack-socket"}`.
+
+For development, you can install from a local clone instead:
 
 ```sh
 git clone https://github.com/0xCVH/paperclip-plugin-slack-socket
@@ -29,7 +37,7 @@ npm install
 npm run build
 ```
 
-Then install the **absolute path** to that clone via whichever route you prefer — UI (paste the absolute path where it asks for a package name), CLI (`paperclipai plugin install /absolute/path/to/paperclip-plugin-slack-socket`), or REST (`{"packageName": "/absolute/path/to/paperclip-plugin-slack-socket", "isLocalPath": true}`). Once this package is published to npm, `paperclip-plugin-slack-socket` will install by name through any of the three routes instead.
+then install the **absolute path** to that clone — UI (paste the absolute path where it asks for a package name), CLI (`paperclipai plugin install /absolute/path/to/paperclip-plugin-slack-socket`), or REST (`{"packageName": "/absolute/path/to/paperclip-plugin-slack-socket", "isLocalPath": true}`).
 
 Per Paperclip's plugin spec, the host running Paperclip needs a writable filesystem, `npm` available on its `PATH`, and (for npm-name installs) network access to the npm registry.
 
