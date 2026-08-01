@@ -286,7 +286,11 @@ export async function applyConfig(
   }
   // `boundCompanyId` is already set (either freshly claimed above, or
   // pre-existing for a same-company reconfiguration) — no further
-  // assignment needed here.
+  // assignment needed here. `tenantConflict` is cleared again at this tail
+  // (as well as at the top): a different-company config refused while this
+  // apply was in flight would otherwise leave onHealth() reporting a stale
+  // conflict even though this bind succeeded.
+  tenantConflict = null;
   health = { status: "ok" };
   ctx.logger.info("Slack Socket Mode connected");
   return health;
