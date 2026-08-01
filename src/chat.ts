@@ -5,6 +5,7 @@ import { errString } from "./redact.js";
 import { describeHostError } from "./host-errors.js";
 import { updateIndex } from "./state-index.js";
 import type { InboundMessage, SessionEntry, SlackGateway, SlackSocketConfig } from "./types.js";
+import { MAX_MESSAGE_LENGTH, splitIntoChunks } from "./slack-text.js";
 
 export interface ChatDeps {
   ctx: PluginContext;
@@ -25,19 +26,8 @@ interface SessionEventLike {
   message: string | null;
 }
 
-// Slack's chat.update rejects payloads with roughly >4000-character text.
-// Stay comfortably under that for both the rolling streamed update and each
-// chunk of an overlong final reply.
-const MAX_MESSAGE_LENGTH = 3900;
-
 function truncateForStreaming(text: string): string {
   return text.length > MAX_MESSAGE_LENGTH ? `${text.slice(0, MAX_MESSAGE_LENGTH)}…` : text;
-}
-
-function splitIntoChunks(text: string, size: number): string[] {
-  const chunks: string[] = [];
-  for (let i = 0; i < text.length; i += size) chunks.push(text.slice(i, i + size));
-  return chunks;
 }
 
 // Raw adapter stdout (streamed only when streamPartialReplies is enabled)
