@@ -57,6 +57,15 @@ export function filterRuntimeNoticeLines(text: string): string {
     .join("\n");
 }
 
+// Frames a Slack turn as a conversation rather than autonomous work — see
+// DEFAULT_CHAT_PROMPT_PREAMBLE in constants.ts for why this is necessary.
+// When `preamble` is empty/whitespace-only, the user's text is sent
+// verbatim with no framing, matching the plugin's pre-preamble behavior.
+export function buildChatPrompt(preamble: string, text: string): string {
+  if (!preamble.trim()) return text;
+  return `${preamble}\n\nSlack message:\n${text}`;
+}
+
 export function createChat(deps: ChatDeps): Chat {
   const { ctx, gateway, getConfig } = deps;
   const updateIntervalMs = deps.updateIntervalMs ?? 1000;
@@ -215,8 +224,9 @@ export function createChat(deps: ChatDeps): Chat {
     const threadTs = msg.threadTs ?? msg.ts;
     try {
       const cfg = await getConfig();
-      const prompt = stripMention(msg.text);
-      if (!prompt) return;
+      const text = stripMention(msg.text);
+      if (!text) return;
+      const prompt = buildChatPrompt(cfg.chatPromptPreamble, text);
       const entry = await getOrCreateSession(cfg, msg.channel, threadTs);
       await streamReply(cfg, entry, msg.channel, threadTs, prompt);
     } catch (err) {

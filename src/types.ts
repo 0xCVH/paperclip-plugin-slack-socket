@@ -26,6 +26,7 @@ export interface SlackSocketConfig {
   paperclipBaseUrl: string;
   sessionIdleHours: number;
   streamPartialReplies: boolean;
+  chatPromptPreamble: string;
 }
 
 export interface SessionEntry {

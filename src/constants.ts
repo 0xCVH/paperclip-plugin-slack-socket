@@ -2,7 +2,7 @@ import type { PluginToolDeclaration, ScopeKey } from "@paperclipai/plugin-sdk";
 import type { SlackSocketConfig } from "./types.js";
 
 export const PLUGIN_ID = "cvh.slack-socket";
-export const PLUGIN_VERSION = "0.4.1";
+export const PLUGIN_VERSION = "0.5.0";
 
 export const ACTION_IDS = {
   approvalApprove: "approval_approve",
@@ -58,6 +58,15 @@ export const ASK_HUMAN_TOOL_DECLARATION: PluginToolDeclaration = {
   },
 };
 
+// Prepended to every Slack chat message sent to the agent (see chat.ts's
+// buildChatPrompt) to frame the turn as a conversation rather than
+// autonomous work. Paperclip's heartbeat scaffolding frames every wake as
+// autonomous work execution by default, which otherwise pushes agents into
+// narrating their reasoning ("the wake payload shows reason: …") instead of
+// just replying. Set to "" in config to send the user's message verbatim.
+export const DEFAULT_CHAT_PROMPT_PREAMBLE =
+  "You are replying to a person in a Slack thread. Answer them directly and conversationally, in your own voice. Do not narrate your reasoning, restate the wake payload or execution contract, or list what you should do — just reply. Keep it concise and readable as a chat message.";
+
 export const DEFAULT_CONFIG: SlackSocketConfig = {
   slackBotTokenRef: "",
   slackAppTokenRef: "",
@@ -75,4 +84,5 @@ export const DEFAULT_CONFIG: SlackSocketConfig = {
   paperclipBaseUrl: "http://localhost:3010",
   sessionIdleHours: 24,
   streamPartialReplies: false,
+  chatPromptPreamble: DEFAULT_CHAT_PROMPT_PREAMBLE,
 };

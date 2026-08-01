@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { createChat, filterRuntimeNoticeLines } from "../src/chat.js";
-import { STATE_KEYS } from "../src/constants.js";
+import { buildChatPrompt, createChat, filterRuntimeNoticeLines } from "../src/chat.js";
+import { DEFAULT_CHAT_PROMPT_PREAMBLE, STATE_KEYS } from "../src/constants.js";
 import { FakeGateway, makeCtx, TEST_CONFIG } from "./helpers.js";
 
 function setup(configOverrides = {}) {
@@ -64,13 +64,15 @@ describe("chat", () => {
     expect(ctx.agents.sessions.create).not.toHaveBeenCalled();
   });
 
-  it("strips the bot mention from mention prompts", async () => {
+  it("strips the bot mention from mention prompts before framing", async () => {
     const { ctx, chat } = setup();
     await chat.handleMention({
       channel: "C1", channelType: "channel", user: "U1", text: "<@UBOT> help me", ts: "2.1",
     });
     const call = (ctx.agents.sessions.sendMessage as any).mock.calls[0];
-    expect(call[2].prompt).toBe("help me");
+    expect(call[2].prompt).toBe(buildChatPrompt(TEST_CONFIG.chatPromptPreamble, "help me"));
+    expect(call[2].prompt).toContain("help me");
+    expect(call[2].prompt).not.toContain("<@UBOT>");
   });
 
   it("posts an apology naming the reason when the session fails", async () => {
@@ -276,6 +278,44 @@ describe("chat", () => {
       expect(intermediate!.text).not.toContain("[paperclip]");
       expect(gateway.updates.at(-1)!.text).toBe("All done!");
     });
+  });
+});
+
+describe("buildChatPrompt", () => {
+  it("with a preamble, returns the preamble, then the label, then the user text, in that order", () => {
+    const result = buildChatPrompt("Be conversational.", "help me");
+    const preambleIdx = result.indexOf("Be conversational.");
+    const labelIdx = result.indexOf("Slack message:");
+    const textIdx = result.indexOf("help me");
+    expect(preambleIdx).toBeGreaterThanOrEqual(0);
+    expect(labelIdx).toBeGreaterThan(preambleIdx);
+    expect(textIdx).toBeGreaterThan(labelIdx);
+  });
+
+  it("with an empty preamble, returns exactly the user text", () => {
+    expect(buildChatPrompt("", "help me")).toBe("help me");
+  });
+
+  it("with a whitespace-only preamble, returns exactly the user text", () => {
+    expect(buildChatPrompt("   \n\t  ", "help me")).toBe("help me");
+  });
+});
+
+describe("chatPromptPreamble (integration via createChat)", () => {
+  it("with the default config, frames the prompt with the default preamble and the user's message", async () => {
+    const { ctx, chat } = setup();
+    await chat.handleMessage(dm("hi there", "300.1"));
+    const call = (ctx.agents.sessions.sendMessage as any).mock.calls[0];
+    expect(call[2].prompt).toContain(DEFAULT_CHAT_PROMPT_PREAMBLE);
+    expect(call[2].prompt.startsWith(DEFAULT_CHAT_PROMPT_PREAMBLE)).toBe(true);
+    expect(call[2].prompt).toContain("hi there");
+  });
+
+  it("with chatPromptPreamble set to empty string, sends the raw message verbatim", async () => {
+    const { ctx, chat } = setup({ chatPromptPreamble: "" });
+    await chat.handleMessage(dm("hi there", "301.1"));
+    const call = (ctx.agents.sessions.sendMessage as any).mock.calls[0];
+    expect(call[2].prompt).toBe("hi there");
   });
 });
 
