@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { runCleanup } from "../src/cleanup.js";
 import { STATE_KEYS } from "../src/constants.js";
-import type { PendingQuestion, SessionEntry } from "../src/types.js";
+import type { IssueThreadEntry, PendingQuestion, SessionEntry } from "../src/types.js";
 import { FakeGateway, makeCtx, TEST_CONFIG } from "./helpers.js";
 
 const HOURS = 3_600_000;
@@ -64,5 +64,38 @@ describe("runCleanup", () => {
 
     expect(ctx.issues.createComment).not.toHaveBeenCalled();
     expect(stateStore.get(STATE_KEYS.questionIndex)).toEqual([key]);
+  });
+
+  const DAYS = 24 * HOURS;
+
+  it("prunes issue-thread entries older than 30 days and keeps fresh ones", async () => {
+    const { ctx, stateStore } = makeCtx();
+    const staleKey = STATE_KEYS.issueThread("iss-old");
+    const freshKey = STATE_KEYS.issueThread("iss-new");
+    const stale: IssueThreadEntry = {
+      channel: "C1", ts: "1.1", createdAt: new Date(Date.now() - 31 * DAYS).toISOString(),
+    };
+    const fresh: IssueThreadEntry = {
+      channel: "C1", ts: "2.1", createdAt: new Date(Date.now() - 1 * DAYS).toISOString(),
+    };
+    stateStore.set(staleKey, stale);
+    stateStore.set(freshKey, fresh);
+    stateStore.set(STATE_KEYS.issueThreadIndex, [staleKey, freshKey]);
+
+    await runCleanup(ctx, new FakeGateway(), TEST_CONFIG);
+
+    expect(stateStore.get(staleKey)).toBeUndefined();
+    expect(stateStore.get(freshKey)).toEqual(fresh);
+    expect(stateStore.get(STATE_KEYS.issueThreadIndex)).toEqual([freshKey]);
+  });
+
+  it("removes dead (missing) issue-thread index entries", async () => {
+    const { ctx, stateStore } = makeCtx();
+    const missingKey = STATE_KEYS.issueThread("iss-gone");
+    stateStore.set(STATE_KEYS.issueThreadIndex, [missingKey]);
+
+    await runCleanup(ctx, new FakeGateway(), TEST_CONFIG);
+
+    expect(stateStore.get(STATE_KEYS.issueThreadIndex)).toEqual([]);
   });
 });

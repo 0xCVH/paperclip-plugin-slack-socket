@@ -12,7 +12,9 @@ import { runCleanup } from "./cleanup.js";
 import { createCommands } from "./commands.js";
 import { loadConfig } from "./config.js";
 import { DEFAULT_CONFIG, JOB_KEYS, SLASH_COMMAND } from "./constants.js";
+import { createEventDeduper } from "./event-dedup.js";
 import { registerNotifications } from "./notifications.js";
+import { errString } from "./redact.js";
 import type { SlackGateway, SlackSocketConfig } from "./types.js";
 
 export type GatewayFactory = (opts: { botToken: string; appToken: string }) => SlackGateway;
@@ -42,7 +44,7 @@ export async function startRuntime(ctx: PluginContext, makeGateway: GatewayFacto
     appToken = await ctx.secrets.resolve(cfg.slackAppTokenRef);
   } catch (err) {
     health = { status: "degraded", message: "Failed to resolve Slack token secrets; check the secret references" };
-    ctx.logger.error("Slack token secret resolution failed", { err: String(err) });
+    ctx.logger.error("Slack token secret resolution failed", { err: errString(err) });
     return health;
   }
 
@@ -56,8 +58,19 @@ export async function startRuntime(ctx: PluginContext, makeGateway: GatewayFacto
   registerNotifications({ ctx, gateway, getConfig });
   askHuman.registerTool();
 
-  gateway.onMention((msg) => chat.handleMention(msg));
+  // Slack Socket Mode redelivers events at-least-once, and a reconnect can
+  // replay a backlog of stale events. Dedupe/stale-filter mention and
+  // message dispatch before it reaches ask-human's answer routing or chat —
+  // reactions, actions, and commands are not deduped (they're not prone to
+  // the same at-least-once redelivery pattern here and are already
+  // effectively idempotent or externally acked).
+  const eventDeduper = createEventDeduper();
+  gateway.onMention(async (msg) => {
+    if (!eventDeduper.shouldProcess(`${msg.channel}:${msg.ts}`)) return;
+    await chat.handleMention(msg);
+  });
   gateway.onMessage(async (msg) => {
+    if (!eventDeduper.shouldProcess(`${msg.channel}:${msg.ts}`)) return;
     if (await askHuman.tryHandleAnswer(msg)) return;
     await chat.handleMessage(msg);
   });
@@ -83,7 +96,7 @@ const plugin = definePlugin({
       await startRuntime(ctx, (opts) => new BoltGateway({ ...opts, logger: ctx.logger }));
     } catch (err) {
       health = { status: "degraded", message: `Slack Socket startup failed: ${String(err)}` };
-      ctx.logger.error("Slack Socket startup failed", { err: String(err) });
+      ctx.logger.error("Slack Socket startup failed", { err: errString(err) });
     }
   },
 

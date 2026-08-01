@@ -1,4 +1,5 @@
 import boltPkg from "@slack/bolt";
+import { errString } from "./redact.js";
 import type {
   InboundAction,
   InboundCommand,
@@ -44,7 +45,11 @@ export class BoltGateway implements SlackGateway {
         subtype?: string; bot_id?: string; channel: string; channel_type?: string;
         user?: string; text?: string; ts: string; thread_ts?: string;
       };
-      if (m.subtype || m.bot_id || !m.user) return;
+      // thread_broadcast messages ("also send to channel" replies) are
+      // genuine human thread replies and must reach chat routing like any
+      // other reply; every other subtype (message_changed, message_deleted,
+      // bot_message, etc.) is not a live human message and stays filtered.
+      if ((m.subtype && m.subtype !== "thread_broadcast") || m.bot_id || !m.user) return;
       const channelType = m.channel_type === "im" ? "im" : m.channel_type === "group" ? "group" : "channel";
       await this.dispatch(this.messageHandlers, {
         channel: m.channel,
@@ -73,7 +78,7 @@ export class BoltGateway implements SlackGateway {
       try {
         await handler(payload);
       } catch (err) {
-        this.logger.warn("Slack handler failed", { err: String(err) });
+        this.logger.warn("Slack handler failed", { err: errString(err) });
       }
     }
   }
@@ -101,7 +106,7 @@ export class BoltGateway implements SlackGateway {
           messageTs: b.message?.ts ?? "",
         });
       } catch (err) {
-        this.logger.warn("Slack action handler failed", { err: String(err) });
+        this.logger.warn("Slack action handler failed", { err: errString(err) });
       }
     });
   }
@@ -112,7 +117,7 @@ export class BoltGateway implements SlackGateway {
       try {
         await handler({ command: cmd.command, text: cmd.text ?? "", user: cmd.user_id, channel: cmd.channel_id });
       } catch (err) {
-        this.logger.warn("Slack command handler failed", { err: String(err) });
+        this.logger.warn("Slack command handler failed", { err: errString(err) });
       }
     });
   }

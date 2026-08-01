@@ -26,6 +26,8 @@ export const STATE_KEYS = {
   session: (channel: string, threadTs: string) => `session:${channel}:${threadTs}`,
   questionIndex: "question-index",
   question: (channel: string, ts: string) => `question:${channel}:${ts}`,
+  issueThreadIndex: "issue-thread-index",
+  issueThread: (issueId: string) => `issue-thread:${issueId}`,
 } as const;
 
 export function stateScope(stateKey: string): ScopeKey {

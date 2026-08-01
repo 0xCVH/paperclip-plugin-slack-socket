@@ -22,10 +22,20 @@ const approveAction = {
 
 describe("approvals", () => {
   it("posts approval.created with buttons to the approvals channel", async () => {
-    const { gateway, emitEvent } = setup({ approvalsChannelId: "C-APPR" });
+    const { ctx, gateway, emitEvent } = setup({ approvalsChannelId: "C-APPR" });
     await emitEvent("approval.created", { entityId: "app-1", payload: { title: "Deploy?" } });
     expect(gateway.posts[0]!.channel).toBe("C-APPR");
     expect(JSON.stringify(gateway.posts[0]!.blocks)).toContain(ACTION_IDS.approvalApprove);
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.notifications.sent", 1, { type: "approval_created" });
+  });
+
+  it("writes a failed metric when the approval.created post throws", async () => {
+    const { ctx, gateway, emitEvent } = setup({ approvalsChannelId: "C-APPR" });
+    gateway.postMessage = async () => {
+      throw new Error("slack down");
+    };
+    await emitEvent("approval.created", { entityId: "app-1", payload: { title: "Deploy?" } });
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.notifications.failed", 1, { type: "approval_created" });
   });
 
   it("decides the approval via REST and updates the message on approve", async () => {

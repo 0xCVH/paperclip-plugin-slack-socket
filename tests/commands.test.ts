@@ -20,6 +20,20 @@ describe("commands", () => {
       companyId: "co-1", title: "Fix the login flow", status: "todo",
     });
     expect(gateway.ephemerals[0]!.text).toContain("https://pc.example/issues/issue-1");
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.commands.invoked", 1, { subcommand: "issue" });
+  });
+
+  it("writes an invoked metric with subcommand 'help' for the help command", async () => {
+    const { ctx, commands } = setup();
+    await commands.handleCommand(cmd("help"));
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.commands.invoked", 1, { subcommand: "help" });
+  });
+
+  it("writes a failed metric when issue creation throws", async () => {
+    const { ctx, commands } = setup();
+    (ctx.issues.create as any).mockRejectedValueOnce(new Error("nope"));
+    await commands.handleCommand(cmd("issue X"));
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.commands.failed", 1, { subcommand: "issue" });
   });
 
   it("shows usage when the title is missing", async () => {

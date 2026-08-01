@@ -1,6 +1,7 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { ASK_HUMAN_TOOL_DECLARATION, STATE_KEYS, TOOL_NAMES, stateScope } from "./constants.js";
 import { formatQuestion, formatQuestionResolved } from "./formatters.js";
+import { errString } from "./redact.js";
 import { updateIndex } from "./state-index.js";
 import type { InboundMessage, InboundReaction, PendingQuestion, SlackGateway } from "./types.js";
 
@@ -40,7 +41,7 @@ export function createAskHuman({ ctx, gateway }: AskHumanDeps): AskHuman {
         contextSource: "slack-socket.ask-human",
       });
     } catch (err) {
-      ctx.logger.warn("Wakeup after Slack answer failed", { err: String(err), issueId: pending.issueId });
+      ctx.logger.warn("Wakeup after Slack answer failed", { err: errString(err), issueId: pending.issueId });
     }
     await gateway.updateMessage({
       channel: pending.channel,
@@ -104,7 +105,7 @@ export function createAskHuman({ ctx, gateway }: AskHumanDeps): AskHuman {
             // and tell the caller the truth instead of the misleading
             // "failed to post" message.
             ctx.logger.error("Failed to track ask_human question after posting to Slack", {
-              err: String(err),
+              err: errString(err),
               channel: posted.channel,
               ts: posted.ts,
               issueId,
@@ -128,7 +129,7 @@ export function createAskHuman({ ctx, gateway }: AskHumanDeps): AskHuman {
           try {
             await ctx.metrics.write("slack.questions.asked", 1, { mode });
           } catch (err) {
-            ctx.logger.warn("Failed to write ask_human metrics", { err: String(err) });
+            ctx.logger.warn("Failed to write ask_human metrics", { err: errString(err) });
           }
           return {
             content: `Question posted to Slack channel ${posted.channel}. The response will be recorded as a comment on issue ${issueId}.`,

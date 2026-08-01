@@ -47,11 +47,27 @@ describe("startRuntime", () => {
       channel: "C1", ts: "10.1", issueId: "iss-1", companyId: "co-1", mode: "answer",
       question: "Q?", askedAt: new Date().toISOString(), timeoutMinutes: 60,
     });
+    // The reply's own ts must be recent (not "10.2") because the event
+    // deduper now filters stale message ts values before this ever reaches
+    // ask-human's answer routing; threadTs ("10.1") is the pending
+    // question's key and is independent of that freshness check.
+    const replyTs = (Date.now() / 1000).toFixed(6);
     await gateway.emitMessage({
-      channel: "C1", channelType: "channel", user: "U5", text: "the answer", ts: "10.2", threadTs: "10.1",
+      channel: "C1", channelType: "channel", user: "U5", text: "the answer", ts: replyTs, threadTs: "10.1",
     });
     expect(ctx.issues.createComment).toHaveBeenCalled();
     expect(ctx.agents.sessions.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("dedupes a message emitted twice, producing only one sendMessage call", async () => {
+    const { ctx } = makeCtx();
+    const gateway = new FakeGateway();
+    await startRuntime(ctx, () => gateway);
+    const ts = (Date.now() / 1000).toFixed(6);
+    const msg = { channel: "D1", channelType: "im" as const, user: "U1", text: "hi", ts };
+    await gateway.emitMessage(msg);
+    await gateway.emitMessage(msg);
+    expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledTimes(1);
   });
 });
 

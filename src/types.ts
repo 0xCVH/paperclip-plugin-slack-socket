@@ -34,6 +34,15 @@ export interface SessionEntry {
   lastActivityAt: string; // ISO 8601
 }
 
+// Links a posted "issue created" Slack message to its issue, so the later
+// "issue done" notification can be posted as a threaded reply instead of a
+// new top-level message.
+export interface IssueThreadEntry {
+  channel: string;
+  ts: string;
+  createdAt: string; // ISO 8601
+}
+
 export type QuestionMode = "reaction" | "answer";
 
 export interface PendingQuestion {

@@ -1,4 +1,5 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
+import { errString } from "./redact.js";
 import type { InboundCommand, SlackGateway, SlackSocketConfig } from "./types.js";
 
 export interface CommandDeps {
@@ -22,6 +23,8 @@ export function createCommands({ ctx, gateway, getConfig }: CommandDeps): Comman
     async handleCommand(cmd) {
       const cfg = await getConfig();
       const [sub, ...rest] = cmd.text.trim().split(/\s+/);
+      const subcommand = sub === "issue" ? "issue" : "help";
+      await ctx.metrics.write("slack.commands.invoked", 1, { subcommand }).catch(() => {});
       if (sub === "issue") {
         const title = rest.join(" ").trim();
         if (!title) {
@@ -34,7 +37,8 @@ export function createCommands({ ctx, gateway, getConfig }: CommandDeps): Comman
         try {
           issue = await ctx.issues.create({ companyId: cfg.companyId, title, status: "todo" });
         } catch (err) {
-          ctx.logger.warn("Slash issue creation failed", { err: String(err) });
+          ctx.logger.warn("Slash issue creation failed", { err: errString(err) });
+          await ctx.metrics.write("slack.commands.failed", 1, { subcommand }).catch(() => {});
           await gateway.postEphemeral({
             channel: cmd.channel,
             user: cmd.user,
@@ -53,7 +57,7 @@ export function createCommands({ ctx, gateway, getConfig }: CommandDeps): Comman
           });
         } catch (err) {
           ctx.logger.warn("Slash issue confirmation ephemeral failed (issue was created)", {
-            err: String(err),
+            err: errString(err),
             issueId: issue.id,
           });
         }

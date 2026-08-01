@@ -12,6 +12,27 @@ This plugin lets people talk to Paperclip agents from Slack and lets Paperclip p
 - **The `ask_human` tool** — agents can pause and ask a human a question in Slack, either via an emoji reaction or a threaded text reply. The response is recorded as a comment on a Paperclip issue and wakes the issue's agent back up.
 - **`/paperclip issue <title>`** — a slash command that creates a Paperclip issue from Slack and replies with a link, visible only to the person who ran it.
 
+## Install the plugin
+
+Paperclip installs plugins instance-wide from an npm package name or a local path, via any of three equivalent routes:
+
+- **Paperclip UI** — **Settings → Plugins → Install**, then enter the npm package name.
+- **CLI** — `paperclipai plugin install <npm-package-or-absolute-path>`.
+- **REST API** — `POST /api/plugins/install` with a JSON body of `{"packageName": "...", "isLocalPath": true|false}`.
+
+This package is not yet published to npm, so today you install it from a local clone instead of by package name:
+
+```sh
+git clone https://github.com/0xCVH/paperclip-plugin-slack-socket
+cd paperclip-plugin-slack-socket
+npm install
+npm run build
+```
+
+Then install the **absolute path** to that clone via whichever route you prefer — UI (paste the absolute path where it asks for a package name), CLI (`paperclipai plugin install /absolute/path/to/paperclip-plugin-slack-socket`), or REST (`{"packageName": "/absolute/path/to/paperclip-plugin-slack-socket", "isLocalPath": true}`). Once this package is published to npm, `paperclip-plugin-slack-socket` will install by name through any of the three routes instead.
+
+Per Paperclip's plugin spec, the host running Paperclip needs a writable filesystem, `npm` available on its `PATH`, and (for npm-name installs) network access to the npm registry.
+
 ## Slack setup
 
 1. Go to [api.slack.com/apps](https://api.slack.com/apps) and click **Create New App**.
@@ -24,7 +45,7 @@ That's it on the Slack side — the manifest already enables Socket Mode, declar
 ## Paperclip setup
 
 1. In Paperclip, go to **Settings → Secrets** and create two secrets: one holding the Bot User OAuth Token (`xoxb-…`) and one holding the App-Level Token (`xapp-…`). Note the secret reference Paperclip shows for each (the settings form's secret-ref fields store whatever the Secrets page provides — the plugin passes it through opaquely and never sees the raw value).
-2. Install the plugin package `paperclip-plugin-slack-socket` into your Paperclip instance (plugin id `cvh.slack-socket`).
+2. Install the plugin into your Paperclip instance (plugin id `cvh.slack-socket`) — see [Install the plugin](#install-the-plugin) above.
 3. Open the plugin's instance settings and fill in:
    - **Slack Bot Token (secret reference)** — the secret reference for the bot token secret from step 1.
    - **Slack App-Level Token (secret reference)** — the secret reference for the app token secret from step 1.

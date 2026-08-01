@@ -1,6 +1,7 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { ACTION_IDS } from "./constants.js";
 import { formatApprovalCreated, formatApprovalDecided } from "./formatters.js";
+import { errString } from "./redact.js";
 import type { InboundAction, SlackGateway, SlackSocketConfig } from "./types.js";
 
 export interface ApprovalDeps {
@@ -25,8 +26,10 @@ export function createApprovals({ ctx, gateway, getConfig }: ApprovalDeps): Appr
         channel,
         ...formatApprovalCreated(e.entityId, e.payload as Record<string, unknown>, cfg.paperclipBaseUrl),
       });
+      await ctx.metrics.write("slack.notifications.sent", 1, { type: "approval_created" }).catch(() => {});
     } catch (err) {
-      ctx.logger.warn("Slack approval notification failed", { err: String(err) });
+      ctx.logger.warn("Slack approval notification failed", { err: errString(err) });
+      await ctx.metrics.write("slack.notifications.failed", 1, { type: "approval_created" }).catch(() => {});
     }
   });
 
@@ -77,7 +80,7 @@ export function createApprovals({ ctx, gateway, getConfig }: ApprovalDeps): Appr
           authHeaders = { Authorization: `Bearer ${apiKey}` };
         } catch (err) {
           ctx.logger.warn("Approval decision via Slack failed: could not resolve the Paperclip board API key", {
-            err: String(err),
+            err: errString(err),
             approvalId,
           });
           await postFailureEphemeral(
@@ -119,7 +122,7 @@ export function createApprovals({ ctx, gateway, getConfig }: ApprovalDeps): Appr
         });
         await ctx.metrics.write("slack.approvals.decided", 1, { decision });
       } catch (err) {
-        ctx.logger.warn("Approval decision via Slack failed", { err: String(err), approvalId });
+        ctx.logger.warn("Approval decision via Slack failed", { err: errString(err), approvalId });
         await postFailureEphemeral(action, approvalId, decision, "It may already be decided.");
       }
     },

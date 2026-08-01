@@ -1,5 +1,7 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { STATE_KEYS, stateScope } from "./constants.js";
+import { markdownToMrkdwn } from "./mrkdwn.js";
+import { errString } from "./redact.js";
 import { updateIndex } from "./state-index.js";
 import type { InboundMessage, SessionEntry, SlackGateway, SlackSocketConfig } from "./types.js";
 
@@ -106,7 +108,7 @@ export function createChat(deps: ChatDeps): Chat {
       const truncated = truncateForStreaming(text);
       updateChain = updateChain
         .then(() => gateway.updateMessage({ channel: placeholder.channel, ts: placeholder.ts, text: truncated }))
-        .catch((err) => ctx.logger.warn("Slack chat.update failed", { err: String(err) }));
+        .catch((err) => ctx.logger.warn("Slack chat.update failed", { err: errString(err) }));
     };
 
     // Final reply: update the placeholder with the first MAX_MESSAGE_LENGTH
@@ -123,7 +125,7 @@ export function createChat(deps: ChatDeps): Chat {
             await gateway.postMessage({ channel: placeholder.channel, threadTs, text: extra });
           }
         })
-        .catch((err) => ctx.logger.warn("Slack chat.update failed", { err: String(err) }));
+        .catch((err) => ctx.logger.warn("Slack chat.update failed", { err: errString(err) }));
     };
 
     const clearPendingTimer = (): void => {
@@ -137,7 +139,9 @@ export function createChat(deps: ChatDeps): Chat {
       if (timer) return;
       timer = setTimeout(() => {
         timer = null;
-        if (buffer) pushUpdate(buffer);
+        // Convert Markdown -> Slack mrkdwn before truncation so the 3900
+        // char limit applies to the text Slack will actually render.
+        if (buffer) pushUpdate(markdownToMrkdwn(buffer));
       }, updateIntervalMs);
     };
 
@@ -152,7 +156,9 @@ export function createChat(deps: ChatDeps): Chat {
               scheduleUpdate();
             } else if (e.eventType === "done") {
               clearPendingTimer();
-              finalizeMessage(e.message ?? (buffer || "_(no reply)_"));
+              // Convert before finalizeMessage's split/truncate so the
+              // 3900-char limit is applied to the mrkdwn-converted text.
+              finalizeMessage(markdownToMrkdwn(e.message ?? (buffer || "_(no reply)_")));
               resolve();
             } else if (e.eventType === "error") {
               clearPendingTimer();
@@ -181,7 +187,7 @@ export function createChat(deps: ChatDeps): Chat {
       const entry = await getOrCreateSession(cfg, msg.channel, threadTs);
       await streamReply(cfg, entry, msg.channel, threadTs, prompt);
     } catch (err) {
-      ctx.logger.error("Slack chat failed", { err: String(err), channel: msg.channel });
+      ctx.logger.error("Slack chat failed", { err: errString(err), channel: msg.channel });
       await gateway
         .postMessage({
           channel: msg.channel,
@@ -208,7 +214,7 @@ export function createChat(deps: ChatDeps): Chat {
         const entry = await ctx.state.get(stateScope(STATE_KEYS.session(msg.channel, msg.threadTs)));
         if (entry) await converse(msg);
       } catch (err) {
-        ctx.logger.error("Slack handleMessage routing failed", { err: String(err), channel: msg.channel });
+        ctx.logger.error("Slack handleMessage routing failed", { err: errString(err), channel: msg.channel });
       }
     },
   };

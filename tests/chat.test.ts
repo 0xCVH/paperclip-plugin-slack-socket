@@ -167,6 +167,24 @@ describe("chat", () => {
     expect(rejoined).toBe(longText);
   });
 
+  it("converts Markdown in the final agent reply to Slack mrkdwn before posting", async () => {
+    const { ctx, gateway, chat } = setup();
+    (ctx.agents.sessions.sendMessage as any).mockImplementationOnce(
+      async (_sessionId: string, _companyId: string, opts: { onEvent?: (e: unknown) => void }) => {
+        opts.onEvent?.({
+          sessionId: "sess-1", runId: "run-1", seq: 1,
+          eventType: "done", stream: null,
+          message: "**bold** and [link](https://x.example)", payload: null,
+        });
+        return { runId: "run-1" };
+      },
+    );
+
+    await chat.handleMessage(dm("hi", "900.1"));
+
+    expect(gateway.updates.at(-1)!.text).toBe("*bold* and <https://x.example|link>");
+  });
+
   it("creates only one session when two first messages race in the same thread", async () => {
     const { ctx, chat } = setup();
     await Promise.all([
