@@ -27,6 +27,7 @@ export interface SlackSocketConfig {
   sessionIdleHours: number;
   streamPartialReplies: boolean;
   chatPromptPreamble: string;
+  allowedSlackUserIds: string[];
 }
 
 export interface SessionEntry {

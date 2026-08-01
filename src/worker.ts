@@ -4,6 +4,7 @@ import {
   type PluginContext,
   type PluginHealthDiagnostics,
 } from "@paperclipai/plugin-sdk";
+import { isUserAllowed } from "./access.js";
 import { createApprovals, type Approvals } from "./approvals.js";
 import { createAskHuman, type AskHuman } from "./ask-human.js";
 import { BoltGateway } from "./bolt-gateway.js";
@@ -73,6 +74,22 @@ let eventsSubscribed = false;
 /** The most recently applied config, or DEFAULT_CONFIG before any has arrived. */
 export function getLiveConfig(): SlackSocketConfig {
   return liveConfig ?? DEFAULT_CONFIG;
+}
+
+// --- Access control -------------------------------------------------------
+//
+// Gate for every inbound Slack surface (mention, message, reaction, action,
+// command): when `allowedSlackUserIds` is non-empty, a user not on it is
+// ignored completely — no reply, no ephemeral, no reaction handling, no
+// approval decision. Checked before the event-dedup check in the mention/
+// message wirings below so a denied event never consumes a dedup key.
+type AccessSurface = "mention" | "message" | "reaction" | "action" | "command";
+
+async function checkAccess(ctx: PluginContext, userId: string, surface: AccessSurface): Promise<boolean> {
+  if (isUserAllowed(getLiveConfig().allowedSlackUserIds, userId)) return true;
+  ctx.logger.info("Ignoring Slack interaction from a user not on the allowlist", { user: userId, surface });
+  await ctx.metrics.write("slack.access.denied", 1, { surface }).catch(() => {});
+  return false;
 }
 
 // --- Config apply pump ---------------------------------------------------
@@ -344,17 +361,28 @@ export async function applyConfig(
   // redelivery/replay risk.
   const eventDeduper = createEventDeduper();
   gateway.onMention(async (msg) => {
+    if (!(await checkAccess(ctx, msg.user, "mention"))) return;
     if (!eventDeduper.shouldProcess(`mention:${msg.channel}:${msg.ts}`)) return;
     await chat.handleMention(msg);
   });
   gateway.onMessage(async (msg) => {
+    if (!(await checkAccess(ctx, msg.user, "message"))) return;
     if (!eventDeduper.shouldProcess(`message:${msg.channel}:${msg.ts}`)) return;
     if (await askHuman.tryHandleAnswer(msg)) return;
     await chat.handleMessage(msg);
   });
-  gateway.onReaction((reaction) => askHuman.handleReaction(reaction));
-  gateway.onAction(/^approval_(approve|reject)$/, (action) => approvals.handleAction(action));
-  gateway.onCommand(SLASH_COMMAND, (cmd) => commands.handleCommand(cmd));
+  gateway.onReaction(async (reaction) => {
+    if (!(await checkAccess(ctx, reaction.user, "reaction"))) return;
+    await askHuman.handleReaction(reaction);
+  });
+  gateway.onAction(/^approval_(approve|reject)$/, async (action) => {
+    if (!(await checkAccess(ctx, action.user, "action"))) return;
+    await approvals.handleAction(action);
+  });
+  gateway.onCommand(SLASH_COMMAND, async (cmd) => {
+    if (!(await checkAccess(ctx, cmd.user, "command"))) return;
+    await commands.handleCommand(cmd);
+  });
 
   currentGateway = gateway;
   try {

@@ -153,6 +153,14 @@ const manifest: PaperclipPluginManifestV1 = {
           "Text prepended to every Slack chat message sent to the agent, to frame the turn as a conversation rather than autonomous work. Set to an empty string to send the user's message verbatim with no framing.",
         default: DEFAULT_CONFIG.chatPromptPreamble,
       },
+      allowedSlackUserIds: {
+        type: "array",
+        items: { type: "string" },
+        title: "Allowed Slack user IDs",
+        description:
+          "When empty (the default), the allowlist is disabled and any workspace member can use the bot. When non-empty, only the listed Slack user IDs (e.g. U01ABC2DEF3) can interact with it at all — everyone else is ignored silently, with no reply. Find a member's Slack user ID via their profile → \"Copy member ID\".",
+        default: DEFAULT_CONFIG.allowedSlackUserIds,
+      },
     },
     required: ["slackBotTokenRef", "slackAppTokenRef", "companyId", "defaultAgentId", "defaultChannelId"],
   },

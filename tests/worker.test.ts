@@ -407,6 +407,94 @@ describe("applyConfig", () => {
   });
 });
 
+describe("access control (allowedSlackUserIds)", () => {
+  function accessCfg(overrides: Partial<typeof TEST_CONFIG> = {}) {
+    return cfg({ allowedSlackUserIds: ["U-ALLOWED"], ...overrides });
+  }
+
+  it("a DM from a denied user produces no session creation, no sendMessage, and no gateway posts", async () => {
+    const { applyConfig } = await loadWorker();
+    const { ctx } = makeCtx();
+    const gateway = new FakeGateway();
+    await applyConfig(ctx, accessCfg(), () => gateway);
+    const ts = (Date.now() / 1000).toFixed(6);
+    await gateway.emitMessage({ channel: "D1", channelType: "im", user: "U-OTHER", text: "hi", ts });
+    expect(ctx.agents.sessions.create).not.toHaveBeenCalled();
+    expect(ctx.agents.sessions.sendMessage).not.toHaveBeenCalled();
+    expect(gateway.posts).toHaveLength(0);
+    expect(ctx.logger.info).toHaveBeenCalledWith(
+      "Ignoring Slack interaction from a user not on the allowlist",
+      expect.objectContaining({ user: "U-OTHER", surface: "message" }),
+    );
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.access.denied", 1, { surface: "message" });
+  });
+
+  it("a slash command from a denied user produces no ephemeral", async () => {
+    const { applyConfig } = await loadWorker();
+    const { ctx } = makeCtx();
+    const gateway = new FakeGateway();
+    await applyConfig(ctx, accessCfg(), () => gateway);
+    await gateway.emitCommand({ command: SLASH_COMMAND, text: "help", user: "U-OTHER", channel: "C1" });
+    expect(gateway.ephemerals).toHaveLength(0);
+    expect(ctx.logger.info).toHaveBeenCalledWith(
+      "Ignoring Slack interaction from a user not on the allowlist",
+      expect.objectContaining({ user: "U-OTHER", surface: "command" }),
+    );
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.access.denied", 1, { surface: "command" });
+  });
+
+  it("an approval button action from a denied user produces no ctx.http.fetch call and no message update", async () => {
+    const { applyConfig } = await loadWorker();
+    const { ctx } = makeCtx();
+    const gateway = new FakeGateway();
+    await applyConfig(ctx, accessCfg(), () => gateway);
+    await gateway.emitAction({
+      actionId: "approval_approve",
+      value: "appr-1",
+      user: "U-OTHER",
+      userName: "Other Person",
+      channel: "C1",
+      messageTs: "10.1",
+    });
+    expect(ctx.http.fetch).not.toHaveBeenCalled();
+    expect(gateway.updates).toHaveLength(0);
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.access.denied", 1, { surface: "action" });
+  });
+
+  it("a reaction from a denied user produces no issues.createComment", async () => {
+    const { applyConfig } = await loadWorker();
+    const { ctx, stateStore } = makeCtx();
+    const gateway = new FakeGateway();
+    await applyConfig(ctx, accessCfg(), () => gateway);
+    stateStore.set(STATE_KEYS.question("C1", "10.1"), {
+      channel: "C1", ts: "10.1", issueId: "iss-1", companyId: "co-1", mode: "reaction",
+      question: "Q?", askedAt: new Date().toISOString(), timeoutMinutes: 60,
+    });
+    await gateway.emitReaction({ channel: "C1", messageTs: "10.1", user: "U-OTHER", reaction: "+1" });
+    expect(ctx.issues.createComment).not.toHaveBeenCalled();
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.access.denied", 1, { surface: "reaction" });
+  });
+
+  it("an allowed user still gets normal message-path behavior", async () => {
+    const { applyConfig } = await loadWorker();
+    const { ctx } = makeCtx();
+    const gateway = new FakeGateway();
+    await applyConfig(ctx, accessCfg(), () => gateway);
+    const ts = (Date.now() / 1000).toFixed(6);
+    await gateway.emitMessage({ channel: "D1", channelType: "im", user: "U-ALLOWED", text: "hi", ts });
+    expect(ctx.agents.sessions.sendMessage).toHaveBeenCalled();
+  });
+
+  it("an allowed user still gets normal command-path behavior", async () => {
+    const { applyConfig } = await loadWorker();
+    const { ctx } = makeCtx();
+    const gateway = new FakeGateway();
+    await applyConfig(ctx, accessCfg(), () => gateway);
+    await gateway.emitCommand({ command: SLASH_COMMAND, text: "help", user: "U-ALLOWED", channel: "C1" });
+    expect(gateway.ephemerals).toHaveLength(1);
+  });
+});
+
 describe("plugin.definition.onConfigChanged (the real host-facing hook)", () => {
   it("resolves both Slack secrets with { companyId } and starts a BoltGateway", async () => {
     const { default: plugin } = await loadWorker();

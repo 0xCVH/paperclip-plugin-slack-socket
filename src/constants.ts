@@ -2,7 +2,7 @@ import type { PluginToolDeclaration, ScopeKey } from "@paperclipai/plugin-sdk";
 import type { SlackSocketConfig } from "./types.js";
 
 export const PLUGIN_ID = "cvh.slack-socket";
-export const PLUGIN_VERSION = "0.6.0";
+export const PLUGIN_VERSION = "0.7.0";
 
 export const ACTION_IDS = {
   approvalApprove: "approval_approve",
@@ -99,4 +99,5 @@ export const DEFAULT_CONFIG: SlackSocketConfig = {
   sessionIdleHours: 24,
   streamPartialReplies: false,
   chatPromptPreamble: DEFAULT_CHAT_PROMPT_PREAMBLE,
+  allowedSlackUserIds: [],
 };
