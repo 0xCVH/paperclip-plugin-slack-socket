@@ -184,6 +184,41 @@ describe("chat", () => {
     expect(rejoined).toBe(longText);
   });
 
+  it("escapes Slack control sequences in an agent's final reply", async () => {
+    const { ctx, gateway, chat } = setup();
+    (ctx.agents.sessions.sendMessage as any).mockImplementationOnce(
+      async (_sessionId: string, _companyId: string, opts: { onEvent?: (e: unknown) => void }) => {
+        opts.onEvent?.({
+          sessionId: "sess-1", runId: "run-1", seq: 1,
+          eventType: "done", stream: null, message: "<!channel> ship it", payload: null,
+        });
+        return { runId: "run-1" };
+      },
+    );
+
+    await chat.handleMessage(dm("hi", "810.1"));
+
+    // An agent must not be able to mass-ping a channel through a chat turn.
+    expect(gateway.updates.at(-1)!.text).toBe("&lt;!channel&gt; ship it");
+  });
+
+  it("still renders an agent's own Markdown link in a chat reply", async () => {
+    const { ctx, gateway, chat } = setup();
+    (ctx.agents.sessions.sendMessage as any).mockImplementationOnce(
+      async (_sessionId: string, _companyId: string, opts: { onEvent?: (e: unknown) => void }) => {
+        opts.onEvent?.({
+          sessionId: "sess-1", runId: "run-1", seq: 1,
+          eventType: "done", stream: null, message: "see [the docs](https://ok.example)", payload: null,
+        });
+        return { runId: "run-1" };
+      },
+    );
+
+    await chat.handleMessage(dm("hi", "811.1"));
+
+    expect(gateway.updates.at(-1)!.text).toBe("see <https://ok.example|the docs>");
+  });
+
   it("converts Markdown in the final agent reply to Slack mrkdwn before posting", async () => {
     const { ctx, gateway, chat } = setup();
     (ctx.agents.sessions.sendMessage as any).mockImplementationOnce(

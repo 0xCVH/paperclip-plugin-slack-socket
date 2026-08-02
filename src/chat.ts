@@ -1,5 +1,6 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { REPLY_CLOSE_TAG, REPLY_OPEN_TAG, STATE_KEYS, stateScope } from "./constants.js";
+import { escapeMrkdwn } from "./formatters.js";
 import { markdownToMrkdwn } from "./mrkdwn.js";
 import { errString } from "./redact.js";
 import { describeHostError } from "./host-errors.js";
@@ -200,7 +201,7 @@ export function createChat(deps: ChatDeps): Chat {
         // char limit applies to the text Slack will actually render. Drop
         // agent-runtime notice lines from the raw stdout being streamed —
         // see filterRuntimeNoticeLines.
-        if (buffer) pushUpdate(markdownToMrkdwn(filterRuntimeNoticeLines(buffer)));
+        if (buffer) pushUpdate(markdownToMrkdwn(escapeMrkdwn(filterRuntimeNoticeLines(buffer))));
       }, updateIntervalMs);
     };
 
@@ -233,7 +234,14 @@ export function createChat(deps: ChatDeps): Chat {
               // tags never reaches Slack. Convert before finalizeMessage's
               // split/truncate so the 3900-char limit is applied to the
               // mrkdwn-converted text.
-              finalizeMessage(markdownToMrkdwn(extractReply(e.message ?? (buffer || "_(no reply)_"))));
+              // Escape before converting: escaping the agent's raw text
+              // removes its ability to emit Slack control sequences
+              // (<!channel>, <!here>, disguised <url|text> links) directly,
+              // while the conversion still produces real link syntax from
+              // the agent's own [text](url) Markdown.
+              finalizeMessage(
+                markdownToMrkdwn(escapeMrkdwn(extractReply(e.message ?? (buffer || "_(no reply)_")))),
+              );
               resolve();
             } else if (e.eventType === "error") {
               clearPendingTimer();
