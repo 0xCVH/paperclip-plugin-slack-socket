@@ -1,4 +1,4 @@
-import type { PluginContext } from "@paperclipai/plugin-sdk";
+import type { PluginContext, ToolRunContext } from "@paperclipai/plugin-sdk";
 import { checkPostTarget } from "./access.js";
 import { POST_MESSAGE_TOOL_DECLARATION, TOOL_NAMES } from "./constants.js";
 import { escapeMrkdwn } from "./formatters.js";
@@ -27,7 +27,7 @@ export function createPostMessage({ ctx, gateway, getConfig }: PostMessageDeps):
           description: POST_MESSAGE_TOOL_DECLARATION.description,
           parametersSchema: POST_MESSAGE_TOOL_DECLARATION.parametersSchema,
         },
-        async (params) => {
+        async (params, runCtx: ToolRunContext) => {
           const p = (params ?? {}) as Record<string, unknown>;
           const target = typeof p.target === "string" ? p.target.trim() : "";
           const text = typeof p.text === "string" ? p.text.trim() : "";
@@ -46,19 +46,42 @@ export function createPostMessage({ ctx, gateway, getConfig }: PostMessageDeps):
             return { error: `Failed to load Slack posting configuration: ${errString(err)}` };
           }
 
+          // This worker process is single-tenant (see the module-level
+          // comments in worker.ts around `boundCompanyId`), but that binding
+          // is enforced only where config changes are applied — nothing
+          // stops the host from routing an invocation for a *different*
+          // company's agent run into this same process. Without this check,
+          // that run would be authorized against the bound company's
+          // `config` (channel/user allowlists, master switches) and post
+          // into the bound company's Slack workspace using the bound
+          // company's bot token. The refusal message intentionally omits
+          // which company this process is bound to.
+          if (runCtx.companyId !== config.companyId) {
+            ctx.logger.warn("slack_post_message: refusing a call whose company does not match the bound config", {
+              agentId: runCtx.agentId,
+              runId: runCtx.runId,
+            });
+            await writeMetric("slack.messages.refused", {});
+            return { error: "Posting to Slack is not authorized for this company." };
+          }
+
           const decision = checkPostTarget(config, target);
           if (!decision.allowed) {
+            ctx.logger.warn("slack_post_message: refusing an unauthorized post target", {
+              agentId: runCtx.agentId,
+              runId: runCtx.runId,
+              reason: decision.reason,
+            });
             await writeMetric("slack.messages.refused", {});
             return { error: decision.reason };
           }
 
           // Escape BEFORE converting. Escaping the raw text removes the
           // agent's ability to emit Slack's control sequences directly —
-          // <!channel>/<!here> mass-pings, or a hand-authored
-          // <https://evil|Payroll> whose visible text hides where it goes —
-          // while the conversion afterwards still turns the agent's own
-          // [text](url) Markdown into genuine Slack link syntax. Converting
-          // first and escaping second would mangle the conversion's output.
+          // <!channel>/<!here> mass-pings — while the conversion afterwards
+          // still turns the agent's own [text](url) Markdown into genuine
+          // Slack link syntax. Converting first and escaping second would
+          // mangle the conversion's output.
           const body = markdownToMrkdwn(escapeMrkdwn(text));
           const [head = body, ...rest] = splitIntoChunks(body, MAX_MESSAGE_LENGTH);
 

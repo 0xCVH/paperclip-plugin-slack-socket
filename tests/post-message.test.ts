@@ -56,6 +56,16 @@ describe("slack_post_message tool", () => {
     expect(gateway.dmOpens).toHaveLength(0);
   });
 
+  it("refuses a call whose runCtx.companyId does not match the bound config's companyId, without posting or opening a DM", async () => {
+    const { handler, gateway } = setup();
+    const foreignRunCtx = { agentId: "agent-2", runId: "run-2", companyId: "co-2", projectId: "proj-2" };
+    const result = await handler({ target: "C-OK", text: "leak" }, foreignRunCtx);
+    expect(result.error).toBeTruthy();
+    expect(result.error).not.toContain("co-1");
+    expect(gateway.posts).toHaveLength(0);
+    expect(gateway.dmOpens).toHaveLength(0);
+  });
+
   it("refuses everything when the master switch is off", async () => {
     const { handler, gateway } = setup({ agentPostMessageEnabled: false });
     const result = await handler({ target: "C-OK", text: "hi" }, RUN_CTX);

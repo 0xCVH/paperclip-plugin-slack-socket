@@ -239,7 +239,12 @@ function ensureCompanyModules(ctx: PluginContext, companyId: string): Approvals 
  * shared by every company that has this plugin installed: a bad config
  * (typo'd secret ref, revoked token, etc.) must never take down a
  * previously-working connection. On failure the previous `liveConfig` and
- * `currentGateway` are left completely untouched.
+ * `currentGateway` are left completely untouched. One consequence worth
+ * naming: this also means a *revoked* posting permission (e.g. narrowing
+ * `agentPostChannelIds` or turning `agentPostMessageEnabled` off) does not
+ * take effect if the save fails — for example during a brief secrets-backend
+ * outage — the previous, more permissive `liveConfig` stays live until a
+ * save succeeds.
  *
  * This also enforces single-tenant binding: the host runs one worker
  * process per installed plugin, shared by every company that configures it,
