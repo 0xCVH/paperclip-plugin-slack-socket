@@ -35,7 +35,18 @@ export function createPostMessage({ ctx, gateway, getConfig }: PostMessageDeps):
           const threadTs = rawThreadTs.length > 0 ? rawThreadTs : undefined;
           if (!target || !text) return { error: "target and text are required" };
 
-          const decision = checkPostTarget(await getConfig(), target);
+          // getConfig() carries no non-throwing guarantee (it's a plain
+          // Promise-returning function on PostMessageDeps), so a rejection
+          // here must not propagate out of the tool handler — tool handlers
+          // never throw. Wrapped the same way the Slack calls below are.
+          let config: SlackSocketConfig;
+          try {
+            config = await getConfig();
+          } catch (err) {
+            return { error: `Failed to load Slack posting configuration: ${errString(err)}` };
+          }
+
+          const decision = checkPostTarget(config, target);
           if (!decision.allowed) {
             await writeMetric("slack.messages.refused", {});
             return { error: decision.reason };
@@ -51,25 +62,59 @@ export function createPostMessage({ ctx, gateway, getConfig }: PostMessageDeps):
           const body = markdownToMrkdwn(escapeMrkdwn(text));
           const [head = body, ...rest] = splitIntoChunks(body, MAX_MESSAGE_LENGTH);
 
+          let channel: string;
+          let first: { channel: string; ts: string };
           try {
-            const channel =
-              decision.kind === "dm" ? await gateway.openDm(decision.target) : decision.target;
-            const first = await gateway.postMessage({ channel, threadTs, text: head });
-            // Overflow goes into a thread rather than as more top-level
-            // messages: an agent posting something long shouldn't take over
-            // the channel. When the caller already gave a threadTs, stay in
-            // that thread instead of nesting under our own first message.
-            for (const extra of rest) {
-              await gateway.postMessage({ channel, threadTs: threadTs ?? first.ts, text: extra });
-            }
-            await writeMetric("slack.messages.posted", { kind: decision.kind });
-            return {
-              content: `Message posted to Slack channel ${first.channel}.`,
-              data: { channel: first.channel, ts: first.ts },
-            };
+            channel = decision.kind === "dm" ? await gateway.openDm(decision.target) : decision.target;
+            first = await gateway.postMessage({ channel, threadTs, text: head });
           } catch (err) {
+            // Nothing was posted (openDm or the head post itself failed) —
+            // this is a clean failure with no partial state to report.
             return { error: `Failed to post message to Slack: ${errString(err)}` };
           }
+
+          // Overflow goes into a thread rather than as more top-level
+          // messages: an agent posting something long shouldn't take over
+          // the channel. When the caller already gave a threadTs, stay in
+          // that thread instead of nesting under our own first message.
+          //
+          // The head chunk is already live in Slack by this point, so a
+          // failure partway through the remaining chunks must NOT be
+          // reported as a plain `{ error }` — that would tell the calling
+          // agent nothing posted, when part of the message is actually
+          // sitting in the channel. Returning a bare error here would also
+          // invite a naive retry that duplicates the head chunk. Instead,
+          // report a success-shaped result whose `content` states the truth
+          // (how many parts landed vs. the total) and whose `data` points at
+          // the head message so the agent knows what's live and where. We
+          // deliberately do not attempt to delete/roll back the already-
+          // posted chunks.
+          let postedCount = 1;
+          for (const extra of rest) {
+            try {
+              await gateway.postMessage({ channel, threadTs: threadTs ?? first.ts, text: extra });
+              postedCount++;
+            } catch (err) {
+              const totalParts = rest.length + 1;
+              ctx.logger.error(
+                "slack_post_message: message split into multiple parts, but a continuation part failed to post after the first part already went live",
+                { channel: first.channel, ts: first.ts, postedParts: postedCount, totalParts, err: errString(err) },
+              );
+              await writeMetric("slack.messages.posted", { kind: decision.kind, partial: "true" });
+              return {
+                content:
+                  `Message posted to Slack channel ${first.channel}, but only ${postedCount} of ${totalParts} ` +
+                  `parts sent — the rest failed: ${errString(err)}`,
+                data: { channel: first.channel, ts: first.ts },
+              };
+            }
+          }
+
+          await writeMetric("slack.messages.posted", { kind: decision.kind });
+          return {
+            content: `Message posted to Slack channel ${first.channel}.`,
+            data: { channel: first.channel, ts: first.ts },
+          };
         },
       );
     },

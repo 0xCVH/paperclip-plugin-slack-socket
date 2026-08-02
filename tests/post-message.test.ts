@@ -117,6 +117,46 @@ describe("slack_post_message tool", () => {
     expect(result.error).toContain("channel_not_found");
   });
 
+  it("returns an error instead of throwing when getConfig() rejects", async () => {
+    const bundle = makeCtx();
+    const gateway = new FakeGateway();
+    const postMessage = createPostMessage({
+      ctx: bundle.ctx,
+      gateway,
+      getConfig: async () => { throw new Error("config store unavailable"); },
+    });
+    postMessage.registerTool();
+    const call = (bundle.ctx.tools.register as any).mock.calls[0];
+    const handler = call[2] as Handler;
+
+    let result: Awaited<ReturnType<Handler>> | undefined;
+    await expect(
+      (async () => {
+        result = await handler({ target: "C-OK", text: "hi" }, RUN_CTX);
+      })(),
+    ).resolves.toBeUndefined();
+
+    expect(result?.error).toContain("config store unavailable");
+    expect(gateway.posts).toHaveLength(0);
+  });
+
+  it("reports a partial success — head posted, data points at it, content states the shortfall — when a continuation chunk fails", async () => {
+    const { handler, gateway } = setup();
+    let call = 0;
+    const realPostMessage = gateway.postMessage.bind(gateway);
+    gateway.postMessage = async (msg) => {
+      call += 1;
+      if (call === 1) return realPostMessage(msg);
+      throw new Error("rate_limited");
+    };
+    const result = await handler({ target: "C-OK", text: "a".repeat(4200) }, RUN_CTX);
+    expect(result.error).toBeUndefined();
+    expect(gateway.posts).toHaveLength(1);
+    expect(result.data).toEqual({ channel: "C-OK", ts: gateway.posts[0]!.ts });
+    expect(result.content).toContain("1 of 2");
+    expect(result.content).toContain("rate_limited");
+  });
+
   it("writes a metric on both the posted and refused paths", async () => {
     const { handler, ctx } = setup();
     await handler({ target: "C-OK", text: "hi" }, RUN_CTX);
