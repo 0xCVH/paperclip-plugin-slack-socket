@@ -2,7 +2,7 @@ import type { PluginToolDeclaration, ScopeKey } from "@paperclipai/plugin-sdk";
 import type { SlackSocketConfig } from "./types.js";
 
 export const PLUGIN_ID = "cvh.slack-socket";
-export const PLUGIN_VERSION = "0.8.0";
+export const PLUGIN_VERSION = "0.9.0";
 
 export const ACTION_IDS = {
   approvalApprove: "approval_approve",
