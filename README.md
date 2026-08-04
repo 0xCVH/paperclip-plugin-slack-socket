@@ -81,7 +81,7 @@ Config is applied live — Paperclip pushes the updated config to the running pl
 - Agents can call the **`ask_human`** tool mid-run to ask a person a question in Slack (by channel or by DMing a user), either waiting for an emoji reaction (`mode: "reaction"`) or a threaded text reply (`mode: "answer"`); the response is attached to the issue as a comment and the issue is woken up.
 - Agents can call **`slack_post_message`** to post to an allowlisted channel or DM an allowlisted user, optionally threading under an existing message via `threadTs`. If someone replies to a DM the bot sent, that reply is handled like any other DM — it starts or continues a chat session with the default agent, and does not go back to the agent that sent the message.
 
-**Note:** the app manifest subscribes only to `message.channels`, `message.groups`, and `message.im` (and requests no `mpim:history` scope) — it does not subscribe to message events for multi-person group DMs (mpim), so the bot does not converse in group DMs at all. The mention-free behavior described above applies to 1:1 DMs only.
+**Note:** the app manifest subscribes to `message.channels`, `message.groups`, and `message.im` — not to `message.mpim` — so an unmentioned message in a multi-person group DM (mpim) never reaches the plugin at all. An `@mention` there arrives as an `app_mention` event, which carries no channel-type restriction, so it is handled like a mention in any channel. The mention-free behavior described above applies to 1:1 DMs only.
 
 ## Manual smoke test checklist
 
