@@ -47,15 +47,58 @@ describe("chat", () => {
     expect(ctx.agents.sessions.create).not.toHaveBeenCalled();
   });
 
-  it("handles a channel thread reply when a session exists for the thread", async () => {
-    const { ctx, chat, stateStore } = setup();
+  it("ignores an unmentioned channel thread reply even when a session exists for the thread", async () => {
+    const { ctx, gateway, chat, stateStore } = setup();
     stateStore.set(STATE_KEYS.session("C1", "50.1"), {
       sessionId: "sess-9", channel: "C1", threadTs: "50.1", lastActivityAt: new Date().toISOString(),
     });
     await chat.handleMessage({
       channel: "C1", channelType: "channel", user: "U1", text: "follow-up", ts: "50.2", threadTs: "50.1",
     });
-    expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledWith("sess-9", "co-1", expect.anything());
+    expect(ctx.agents.sessions.sendMessage).not.toHaveBeenCalled();
+    expect(ctx.agents.sessions.create).not.toHaveBeenCalled();
+    expect(gateway.posts).toHaveLength(0);
+  });
+
+  it("ignores an unmentioned reply in a bot-started thread — the reported regression", async () => {
+    const { ctx, gateway, chat, stateStore } = setup();
+    // The thread root is the bot's own proactive post. State holds a session
+    // for it — however it got there; see the design doc's "Why the current
+    // code allows it". After this change the channel path never reads it.
+    stateStore.set(STATE_KEYS.session("C-FEED", "1000.1"), {
+      sessionId: "sess-sweep", channel: "C-FEED", threadTs: "1000.1",
+      lastActivityAt: new Date().toISOString(),
+    });
+    await chat.handleMessage({
+      channel: "C-FEED", channelType: "group", user: "U-HUMAN",
+      text: "there are currently only 80 Open Findings, not 83 - please re-check",
+      ts: "1000.2", threadTs: "1000.1",
+    });
+    expect(ctx.agents.sessions.sendMessage).not.toHaveBeenCalled();
+    expect(gateway.posts).toHaveLength(0);
+  });
+
+  it("still answers an @mention inside a bot-started thread, reusing that thread's session", async () => {
+    const { ctx, chat, stateStore } = setup();
+    stateStore.set(STATE_KEYS.session("C-FEED", "1000.1"), {
+      sessionId: "sess-sweep", channel: "C-FEED", threadTs: "1000.1",
+      lastActivityAt: new Date().toISOString(),
+    });
+    await chat.handleMention({
+      channel: "C-FEED", channelType: "channel", user: "U-HUMAN",
+      text: "<@UBOT> please re-check the count", ts: "1000.3", threadTs: "1000.1",
+    });
+    expect(ctx.agents.sessions.create).not.toHaveBeenCalled();
+    expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledWith("sess-sweep", "co-1", expect.anything());
+  });
+
+  it("still converses on an unmentioned DM thread reply (proactive-DM replies keep working)", async () => {
+    const { ctx, chat, stateStore } = setup();
+    stateStore.set(STATE_KEYS.session("D1", "200.1"), {
+      sessionId: "sess-dm", channel: "D1", threadTs: "200.1", lastActivityAt: new Date().toISOString(),
+    });
+    await chat.handleMessage(dm("thanks, got it", "200.2", "200.1"));
+    expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledWith("sess-dm", "co-1", expect.anything());
   });
 
   it("skips messages containing the bot mention (handled by handleMention)", async () => {
@@ -142,18 +185,6 @@ describe("chat", () => {
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(gateway.updates.length).toBe(updateCountAfterHandle);
     expect(gateway.updates.at(-1)!.text).toContain("Failed to reach the agent");
-  });
-
-  it("does not throw when ctx.state.get rejects during handleMessage's channel-thread routing", async () => {
-    const { ctx, chat } = setup();
-    (ctx.state.get as any).mockRejectedValueOnce(new Error("state store down"));
-    await expect(
-      chat.handleMessage({
-        channel: "C1", channelType: "channel", user: "U1", text: "hi", ts: "60.1", threadTs: "60.1",
-      }),
-    ).resolves.toBeUndefined();
-    expect(ctx.logger.error).toHaveBeenCalled();
-    expect(ctx.agents.sessions.create).not.toHaveBeenCalled();
   });
 
   it("splits a long final reply: placeholder gets the first chunk, the remainder posts as additional thread messages", async () => {

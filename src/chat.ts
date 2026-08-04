@@ -294,17 +294,15 @@ export function createChat(deps: ChatDeps): Chat {
     async handleMessage(msg) {
       const botId = gateway.botUserId();
       if (botId && msg.text.includes(`<@${botId}>`)) return; // the app_mention event handles it
-      if (msg.channelType === "im") {
-        await converse(msg);
-        return;
-      }
-      if (!msg.threadTs) return;
-      try {
-        const entry = await ctx.state.get(stateScope(STATE_KEYS.session(msg.channel, msg.threadTs)));
-        if (entry) await converse(msg);
-      } catch (err) {
-        ctx.logger.error("Slack handleMessage routing failed", { err: errString(err), channel: msg.channel });
-      }
+      if (msg.channelType === "im") await converse(msg);
+      // Channels, private channels and group DMs: only an explicit @mention
+      // (delivered as app_mention, handled above) starts or continues a
+      // conversation. A thread reply is not addressed to the bot just
+      // because the bot is in the thread — an agent that posts proactively
+      // would otherwise turn every human follow-up under its own message
+      // into an agent turn, including replies people meant for each other.
+      // Mentioning the bot again in the same thread reuses that thread's
+      // session (see getOrCreateSession), so continuity is not lost.
     },
   };
 }
