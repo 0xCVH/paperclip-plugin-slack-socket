@@ -39,7 +39,7 @@ describe("chat", () => {
     expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledTimes(2);
   });
 
-  it("ignores channel messages without an existing thread session", async () => {
+  it("ignores an unmentioned top-level channel message", async () => {
     const { ctx, chat } = setup();
     await chat.handleMessage({
       channel: "C1", channelType: "channel", user: "U1", text: "random chatter", ts: "1.1",

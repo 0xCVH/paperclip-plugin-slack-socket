@@ -183,6 +183,27 @@ describe("applyConfig", () => {
     expect(ctx.agents.sessions.sendMessage).not.toHaveBeenCalled();
   });
 
+  it("routes an answer-mode question reply in a DM away from chat too — proves tryHandleAnswer still runs before handleMessage now that channels are mention-only", async () => {
+    const { applyConfig } = await loadWorker();
+    const { ctx, stateStore } = makeCtx();
+    const gateway = new FakeGateway();
+    await applyConfig(ctx, cfg(), () => gateway);
+    stateStore.set(STATE_KEYS.question("D1", "10.1"), {
+      channel: "D1", ts: "10.1", issueId: "iss-1", companyId: "co-1", mode: "answer",
+      question: "Q?", askedAt: new Date().toISOString(), timeoutMinutes: 60,
+    });
+    // Same freshness note as the channel-thread test above: the reply's own
+    // ts must be recent so the event deduper doesn't filter it before it
+    // reaches ask-human's answer routing; threadTs ("10.1") is the pending
+    // question's key and is independent of that check.
+    const replyTs = (Date.now() / 1000).toFixed(6);
+    await gateway.emitMessage({
+      channel: "D1", channelType: "im", user: "U5", text: "the answer", ts: replyTs, threadTs: "10.1",
+    });
+    expect(ctx.issues.createComment).toHaveBeenCalled();
+    expect(ctx.agents.sessions.sendMessage).not.toHaveBeenCalled();
+  });
+
   it("dedupes a message emitted twice, producing only one sendMessage call", async () => {
     const { applyConfig } = await loadWorker();
     const { ctx } = makeCtx();

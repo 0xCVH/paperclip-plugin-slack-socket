@@ -76,12 +76,12 @@ Config is applied live — Paperclip pushes the updated config to the running pl
 
 - **DM the bot** from the Apps section of Slack's sidebar to start a private conversation with the default agent.
 - **In a channel**, first `/invite @paperclip` (the bot only sees channel messages after being invited), then `@mention` it to start a thread-scoped conversation.
-- **Reply in the thread with another `@mention`** to continue the same agent session. In channels the bot answers only when it is explicitly mentioned; a thread reply that doesn't mention it is ignored, including in threads the bot itself started (e.g. an agent's `slack_post_message` post or a notification). In a 1:1 DM, no mention is needed for any message.
+- **Reply in the thread with another `@mention`** to continue the same agent session. In channels the bot answers only when it is explicitly mentioned; a thread reply that doesn't mention it is ignored, including in threads the bot itself started (e.g. an agent's `slack_post_message` post or a notification) — except a pending `ask_human` question (`mode: "answer"`), where an unmentioned threaded reply still resolves it. In a 1:1 DM, no mention is needed for any message.
 - Run **`/paperclip issue <title>`** anywhere to create a Paperclip issue; the confirmation with a link is ephemeral (only you see it), which requires the bot to be a member of the channel the command was run in — `/invite @paperclip` first, or run the command in a DM with the bot. (The issue is still created even if the bot isn't in the channel; only the confirmation message would fail to post.) `/paperclip help` shows usage.
 - Agents can call the **`ask_human`** tool mid-run to ask a person a question in Slack (by channel or by DMing a user), either waiting for an emoji reaction (`mode: "reaction"`) or a threaded text reply (`mode: "answer"`); the response is attached to the issue as a comment and the issue is woken up.
 - Agents can call **`slack_post_message`** to post to an allowlisted channel or DM an allowlisted user, optionally threading under an existing message via `threadTs`. If someone replies to a DM the bot sent, that reply is handled like any other DM — it starts or continues a chat session with the default agent, and does not go back to the agent that sent the message.
 
-**Note:** multi-person group DMs (mpim) are treated the same as channels — the bot replies only when it is explicitly `@mention`ed, and ignores everything else. The mention-free behavior described above applies to 1:1 DMs only.
+**Note:** the app manifest subscribes only to `message.channels`, `message.groups`, and `message.im` (and requests no `mpim:history` scope) — it does not subscribe to message events for multi-person group DMs (mpim), so the bot does not converse in group DMs at all. The mention-free behavior described above applies to 1:1 DMs only.
 
 ## Manual smoke test checklist
 
