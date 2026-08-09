@@ -25,6 +25,7 @@ export interface SlackSocketConfig {
   approvalsChannelId: string;
   paperclipBaseUrl: string;
   sessionIdleHours: number;
+  turnTimeoutMinutes: number;
   streamPartialReplies: boolean;
   chatPromptPreamble: string;
   allowedSlackUserIds: string[];

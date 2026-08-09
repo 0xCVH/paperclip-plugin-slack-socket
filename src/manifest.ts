@@ -140,6 +140,13 @@ const manifest: PaperclipPluginManifestV1 = {
         description: "Close agent sessions idle longer than this many hours.",
         default: DEFAULT_CONFIG.sessionIdleHours,
       },
+      turnTimeoutMinutes: {
+        type: "number",
+        title: "Turn Timeout Minutes",
+        description:
+          "Give up on a single chat turn after this many minutes without any output from the agent.",
+        default: DEFAULT_CONFIG.turnTimeoutMinutes,
+      },
       streamPartialReplies: {
         type: "boolean",
         title: "Stream partial replies",

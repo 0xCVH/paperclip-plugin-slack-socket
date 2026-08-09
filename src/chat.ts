@@ -14,6 +14,14 @@ export interface ChatDeps {
   getConfig: () => Promise<SlackSocketConfig>;
   /** Minimum ms between streaming chat.update calls. Tests pass 0. */
   updateIntervalMs?: number;
+  /**
+   * Overrides the turn inactivity timeout, in ms. Tests pass small values so
+   * they don't wait out a real timeout; production leaves it unset and the
+   * duration derives from `cfg.turnTimeoutMinutes`. The notice posted on
+   * expiry always names `cfg.turnTimeoutMinutes` — that is the number the
+   * operator configured and the only one meaningful to a reader in Slack.
+   */
+  turnTimeoutMs?: number;
 }
 
 export interface Chat {
@@ -97,9 +105,15 @@ export function buildChatPrompt(preamble: string, text: string): string {
   return `${preamble}\n\nSlack message:\n${text}`;
 }
 
+// Prefix on a reply that lands after the turn watchdog already gave up. By
+// then the person may have mentioned the bot again, so the message has to
+// say which turn it belongs to instead of arriving as a bare answer.
+const LATE_REPLY_PREFIX = "⏳ _Late reply to your earlier message:_\n\n";
+
 export function createChat(deps: ChatDeps): Chat {
   const { ctx, gateway, getConfig } = deps;
   const updateIntervalMs = deps.updateIntervalMs ?? 1000;
+  const turnTimeoutMsOverride = deps.turnTimeoutMs;
 
   // Guards against two concurrent "first messages" in the same thread both
   // passing the "no existing session" check and creating duplicate sessions.
@@ -162,6 +176,19 @@ export function createChat(deps: ChatDeps): Chat {
     let timer: ReturnType<typeof setTimeout> | null = null;
     let updateChain: Promise<void> = Promise.resolve();
 
+    // --- Turn watchdog --------------------------------------------------
+    // `sendMessage` resolves as soon as the host accepts the run; the
+    // agent's output arrives later and asynchronously through `onEvent`. If
+    // that stream stalls (host restart, dropped JSON-RPC connection) nothing
+    // below ever settles: the placeholder reads "_Thinking…_" forever and
+    // `converse` never returns, so the thread is wedged with no way for the
+    // person or an operator to see why. `settled` is the single ownership
+    // gate — whichever of timeout/done/error/rejection happens first owns
+    // the placeholder, and anything arriving afterwards must leave it alone.
+    let settled = false;
+    let turnTimer: ReturnType<typeof setTimeout> | null = null;
+    const turnTimeoutMs = turnTimeoutMsOverride ?? cfg.turnTimeoutMinutes * 60_000;
+
     const pushUpdate = (text: string): void => {
       const truncated = truncateForStreaming(text);
       updateChain = updateChain
@@ -186,10 +213,31 @@ export function createChat(deps: ChatDeps): Chat {
         .catch((err) => ctx.logger.warn("Slack chat.update failed", { err: errString(err) }));
     };
 
+    // A reply that lands after the watchdog fired is still real work: post
+    // it as a new message in the same thread rather than overwriting a
+    // notice the person has already read.
+    const postLateReply = (text: string): void => {
+      const chunks = splitIntoChunks(`${LATE_REPLY_PREFIX}${text}`, MAX_MESSAGE_LENGTH);
+      updateChain = updateChain
+        .then(async () => {
+          for (const chunk of chunks) {
+            await gateway.postMessage({ channel: placeholder.channel, threadTs, text: chunk });
+          }
+        })
+        .catch((err) => ctx.logger.warn("Slack late reply post failed", { err: errString(err) }));
+    };
+
     const clearPendingTimer = (): void => {
       if (timer) {
         clearTimeout(timer);
         timer = null;
+      }
+    };
+
+    const clearTurnTimer = (): void => {
+      if (turnTimer) {
+        clearTimeout(turnTimer);
+        turnTimer = null;
       }
     };
 
@@ -206,6 +254,35 @@ export function createChat(deps: ChatDeps): Chat {
     };
 
     await new Promise<void>((resolve) => {
+      const onTurnTimeout = (): void => {
+        turnTimer = null;
+        if (settled) return;
+        settled = true;
+        // Drop any pending debounced chunk update so it can't fire later and
+        // replace the notice with a stale partial.
+        clearPendingTimer();
+        // Deliberately not phrased as a failure: the run may well still be
+        // alive host-side, which is exactly why a late `done` is posted
+        // rather than discarded.
+        pushUpdate(
+          `⏳ No response from the agent after ${cfg.turnTimeoutMinutes}m — it may still be working. Mention me again to retry.`,
+        );
+        // No tags: the only per-turn dimensions available here are the
+        // channel and thread ids, which are unbounded and must never become
+        // metric labels.
+        void ctx.metrics.write("slack.turns.timedout", 1).catch(() => {});
+        // Unblock converse so the turn can't wedge.
+        resolve();
+      };
+
+      const resetTurnTimer = (): void => {
+        if (settled) return;
+        if (turnTimer) clearTimeout(turnTimer);
+        turnTimer = setTimeout(onTurnTimeout, turnTimeoutMs);
+      };
+
+      resetTurnTimer();
+
       ctx.agents.sessions
         .sendMessage(entry.sessionId, cfg.companyId, {
           prompt,
@@ -216,6 +293,10 @@ export function createChat(deps: ChatDeps): Chat {
           reason: "slack_chat_message",
           onEvent: (event) => {
             const e = event as SessionEventLike;
+            // Any event at all proves the stream is alive, so every one of
+            // them pushes the watchdog out — not only the ones acted on
+            // below (a long run can emit nothing but `status` for minutes).
+            resetTurnTimer();
             if (e.eventType === "chunk" && e.stream === "stdout" && e.message) {
               // Always accumulate: the `done` event's `message` is the SDK's
               // documented canonical final reply, but if it's ever null we
@@ -226,7 +307,9 @@ export function createChat(deps: ChatDeps): Chat {
               // even the model's internal reasoning. Only push them live to
               // Slack when the operator has explicitly opted in; the
               // default is to wait for the canonical final reply.
-              if (cfg.streamPartialReplies) scheduleUpdate();
+              // Never once the turn is settled: a late chunk must not
+              // overwrite the timeout notice with a stale partial.
+              if (cfg.streamPartialReplies && !settled) scheduleUpdate();
             } else if (e.eventType === "done") {
               clearPendingTimer();
               // Extract the tagged reply (see extractReply) before
@@ -239,12 +322,25 @@ export function createChat(deps: ChatDeps): Chat {
               // (<!channel>, <!here>, disguised <url|text> links) directly,
               // while the conversion still produces real link syntax from
               // the agent's own [text](url) Markdown.
-              finalizeMessage(
-                markdownToMrkdwn(escapeMrkdwn(extractReply(e.message ?? (buffer || "_(no reply)_")))),
+              const reply = markdownToMrkdwn(
+                escapeMrkdwn(extractReply(e.message ?? (buffer || "_(no reply)_"))),
               );
+              if (settled) {
+                // The watchdog already rewrote the placeholder and released
+                // the turn. Post the real answer alongside it instead.
+                postLateReply(reply);
+                void ctx.metrics.write("slack.turns.late_reply", 1).catch(() => {});
+                return;
+              }
+              settled = true;
+              clearTurnTimer();
+              finalizeMessage(reply);
               resolve();
             } else if (e.eventType === "error") {
               clearPendingTimer();
+              if (settled) return;
+              settled = true;
+              clearTurnTimer();
               pushUpdate(`:warning: Agent error: ${e.message ?? "unknown error"}`);
               resolve();
             }
@@ -254,6 +350,9 @@ export function createChat(deps: ChatDeps): Chat {
           // Clear any pending chunk-scheduled update so it can't fire later
           // and overwrite this error message with a stale partial buffer.
           clearPendingTimer();
+          if (settled) return;
+          settled = true;
+          clearTurnTimer();
           pushUpdate(`:warning: Failed to reach the agent: ${errString(err)}`);
           resolve();
         });
