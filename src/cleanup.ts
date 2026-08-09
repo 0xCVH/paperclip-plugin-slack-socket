@@ -1,11 +1,14 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { STATE_KEYS, stateScope } from "./constants.js";
 import { formatQuestionExpired } from "./formatters.js";
+import { pruneMessageLinks } from "./message-link.js";
 import { errString } from "./redact.js";
 import { updateIndex } from "./state-index.js";
-import type { IssueThreadEntry, PendingQuestion, SessionEntry, SlackGateway, SlackSocketConfig } from "./types.js";
+import type { PendingQuestion, SessionEntry, SlackGateway, SlackSocketConfig } from "./types.js";
 
-const ISSUE_THREAD_MAX_AGE_MS = 30 * 24 * 3_600_000; // 30 days
+// Entity→message links exist only so a follow-up event can find the message
+// it should update. After a month, no such event is coming.
+const MESSAGE_LINK_MAX_AGE_MS = 30 * 24 * 3_600_000; // 30 days
 
 export async function runCleanup(
   ctx: PluginContext,
@@ -91,22 +94,5 @@ export async function runCleanup(
   }
   await updateIndex(ctx, STATE_KEYS.questionIndex, (current) => current.filter((k) => !removedQuestions.includes(k)));
 
-  const issueThreadIndex =
-    ((await ctx.state.get(stateScope(STATE_KEYS.issueThreadIndex))) as string[] | null) ?? [];
-  const removedIssueThreads: string[] = [];
-  for (const key of issueThreadIndex) {
-    const entry = (await ctx.state.get(stateScope(key))) as IssueThreadEntry | null;
-    if (!entry) {
-      removedIssueThreads.push(key);
-      continue;
-    }
-    const ageMs = now - Date.parse(entry.createdAt);
-    if (ageMs > ISSUE_THREAD_MAX_AGE_MS) {
-      await ctx.state.delete(stateScope(key));
-      removedIssueThreads.push(key);
-    }
-  }
-  await updateIndex(ctx, STATE_KEYS.issueThreadIndex, (current) =>
-    current.filter((k) => !removedIssueThreads.includes(k)),
-  );
+  await pruneMessageLinks(ctx, STATE_KEYS.issueThreadIndex, MESSAGE_LINK_MAX_AGE_MS, now);
 }
