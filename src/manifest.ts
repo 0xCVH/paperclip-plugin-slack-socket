@@ -161,6 +161,14 @@ const manifest: PaperclipPluginManifestV1 = {
           "Text prepended to every Slack chat message sent to the agent, to frame the turn as a conversation rather than autonomous work. Set to an empty string to send the user's message verbatim with no framing.",
         default: DEFAULT_CONFIG.chatPromptPreamble,
       },
+      dmSessionMode: {
+        type: "string",
+        enum: ["channel", "thread"],
+        title: "1:1 DM session scope",
+        description:
+          "How a 1:1 DM with the bot is scoped. \"channel\" (the default) treats the whole DM as one continuous conversation: the bot remembers your previous messages and replies at the top level, like a chat window. \"thread\" starts a fresh conversation for every top-level DM message and posts the reply in a thread under it — the pre-0.10.0 behavior. Channels, private channels and group DMs are always thread-scoped and are unaffected by this setting.",
+        default: DEFAULT_CONFIG.dmSessionMode,
+      },
       allowedSlackUserIds: {
         type: "array",
         items: { type: "string" },

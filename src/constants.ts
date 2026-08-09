@@ -22,6 +22,12 @@ export const SLASH_COMMAND = "/paperclip";
 
 export const STATE_NAMESPACE = "slack-socket";
 
+// Key suffix for a session scoped to a whole 1:1 DM channel rather than to
+// one thread inside it (see resolveSessionScope in chat.ts). Exported so
+// the reset command (commands.ts) rebuilds the same key the chat path
+// wrote, instead of re-typing the literal.
+export const CHANNEL_SESSION_TS = "main";
+
 export const STATE_KEYS = {
   sessionIndex: "session-index",
   session: (channel: string, threadTs: string) => `session:${channel}:${threadTs}`,
@@ -123,6 +129,9 @@ export const DEFAULT_CONFIG: SlackSocketConfig = {
   turnTimeoutMinutes: 10,
   streamPartialReplies: false,
   chatPromptPreamble: DEFAULT_CHAT_PROMPT_PREAMBLE,
+  // Default chosen because today's behavior is the defect: nothing depends
+  // on the bot forgetting the previous line of a DM.
+  dmSessionMode: "channel",
   allowedSlackUserIds: [],
   agentPostMessageEnabled: false,
   agentPostToChannelsEnabled: false,

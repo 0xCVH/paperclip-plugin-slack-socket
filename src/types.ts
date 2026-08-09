@@ -9,6 +9,14 @@ import type { EnvSecretRefBinding } from "@paperclipai/plugin-sdk";
 // inspect, reshape, or assume a string UUID here.
 export type SecretRef = string | EnvSecretRefBinding;
 
+// How a 1:1 DM with the bot is scoped. "channel": the whole DM is one
+// continuous conversation (the bot remembers previous messages and replies
+// top-level). "thread": every top-level DM message starts a fresh session
+// and the reply is threaded under it — the pre-0.10.0 behavior. Channels,
+// private channels and group DMs are ALWAYS thread-scoped; this setting
+// does not touch them.
+export type DmSessionMode = "channel" | "thread";
+
 export interface SlackSocketConfig {
   slackBotTokenRef: SecretRef;
   slackAppTokenRef: SecretRef;
@@ -28,6 +36,7 @@ export interface SlackSocketConfig {
   turnTimeoutMinutes: number;
   streamPartialReplies: boolean;
   chatPromptPreamble: string;
+  dmSessionMode: DmSessionMode;
   allowedSlackUserIds: string[];
   // --- Agent-initiated posting (the slack_post_message tool) ---------
   //
@@ -48,7 +57,14 @@ export interface SlackSocketConfig {
 export interface SessionEntry {
   sessionId: string;
   channel: string;
+  /**
+   * The thread this session belongs to, or CHANNEL_SESSION_TS when `scope`
+   * is "channel" (a 1:1 DM treated as one continuous conversation). Read
+   * `scope`, not this field, to tell the two apart — that's why `scope`
+   * exists rather than downstream code interpreting a sentinel.
+   */
   threadTs: string;
+  scope: "channel" | "thread";
   lastActivityAt: string; // ISO 8601
 }
 

@@ -1,11 +1,17 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import { REPLY_CLOSE_TAG, REPLY_OPEN_TAG, STATE_KEYS, stateScope } from "./constants.js";
+import { CHANNEL_SESSION_TS, REPLY_CLOSE_TAG, REPLY_OPEN_TAG, STATE_KEYS, stateScope } from "./constants.js";
 import { escapeMrkdwn } from "./formatters.js";
 import { markdownToMrkdwn } from "./mrkdwn.js";
 import { errString } from "./redact.js";
 import { describeHostError } from "./host-errors.js";
 import { updateIndex } from "./state-index.js";
-import type { InboundMessage, SessionEntry, SlackGateway, SlackSocketConfig } from "./types.js";
+import type {
+  DmSessionMode,
+  InboundMessage,
+  SessionEntry,
+  SlackGateway,
+  SlackSocketConfig,
+} from "./types.js";
 import { MAX_MESSAGE_LENGTH, splitIntoChunks } from "./slack-text.js";
 
 export interface ChatDeps {
@@ -110,6 +116,46 @@ export function buildChatPrompt(preamble: string, text: string): string {
 // say which turn it belongs to instead of arriving as a bare answer.
 const LATE_REPLY_PREFIX = "⏳ _Late reply to your earlier message:_\n\n";
 
+export interface SessionScope {
+  /** Plugin-state key holding the SessionEntry for this conversation. */
+  key: string;
+  scope: "channel" | "thread";
+  /** `undefined` means "post the reply at the top level, not in a thread". */
+  replyThreadTs: string | undefined;
+}
+
+/**
+ * Decides which agent session a Slack message belongs to and where its reply
+ * goes. Pure — two arguments, no `ctx`, no gateway, no clock — so the whole
+ * scoping rule is unit-testable without any host plumbing.
+ *
+ * | Input                                | Key                              | Reply     |
+ * |--------------------------------------|----------------------------------|-----------|
+ * | im, no threadTs, mode "channel"      | `session:<channel>:main`         | top-level |
+ * | im, inside a thread                  | `session:<channel>:<threadTs>`   | threaded  |
+ * | any non-im channel, or mode "thread" | `session:<channel>:<threadTs∥ts>`| threaded  |
+ *
+ * The last row reproduces the pre-0.10.0 behavior exactly for every non-DM
+ * surface and for operators who set `dmSessionMode: "thread"`. Only the
+ * first row is new: a 1:1 DM is a chat window, not a thread list, so the
+ * whole channel is the conversation unit and the reply belongs top-level.
+ */
+export function resolveSessionScope(msg: InboundMessage, mode: DmSessionMode): SessionScope {
+  if (msg.channelType === "im" && mode === "channel" && !msg.threadTs) {
+    return {
+      key: STATE_KEYS.session(msg.channel, CHANNEL_SESSION_TS),
+      scope: "channel",
+      replyThreadTs: undefined,
+    };
+  }
+  const threadTs = msg.threadTs ?? msg.ts;
+  return {
+    key: STATE_KEYS.session(msg.channel, threadTs),
+    scope: "thread",
+    replyThreadTs: threadTs,
+  };
+}
+
 export function createChat(deps: ChatDeps): Chat {
   const { ctx, gateway, getConfig } = deps;
   const updateIntervalMs = deps.updateIntervalMs ?? 1000;
@@ -127,9 +173,9 @@ export function createChat(deps: ChatDeps): Chat {
   async function getOrCreateSession(
     cfg: SlackSocketConfig,
     channel: string,
-    threadTs: string,
+    scope: SessionScope,
   ): Promise<SessionEntry> {
-    const key = STATE_KEYS.session(channel, threadTs);
+    const key = scope.key;
     const inFlight = inFlightSessions.get(key);
     if (inFlight) return inFlight;
 
@@ -140,13 +186,17 @@ export function createChat(deps: ChatDeps): Chat {
         await ctx.state.set(stateScope(key), updated);
         return updated;
       }
-      const session = await ctx.agents.sessions.create(cfg.defaultAgentId, cfg.companyId, {
+      const created = await ctx.agents.sessions.create(cfg.defaultAgentId, cfg.companyId, {
         reason: "slack-thread",
       });
       const entry: SessionEntry = {
-        sessionId: session.sessionId,
+        sessionId: created.sessionId,
         channel,
-        threadTs,
+        // A channel-scoped DM has no thread; store the same sentinel the
+        // key uses so the entry round-trips its own key, and let `scope`
+        // be what downstream code actually reads.
+        threadTs: scope.replyThreadTs ?? CHANNEL_SESSION_TS,
+        scope: scope.scope,
         lastActivityAt: new Date().toISOString(),
       };
       await ctx.state.set(stateScope(key), entry);
@@ -168,10 +218,18 @@ export function createChat(deps: ChatDeps): Chat {
     cfg: SlackSocketConfig,
     entry: SessionEntry,
     channel: string,
-    threadTs: string,
+    // `undefined` means "post at the top level" — a channel-scoped 1:1 DM.
+    replyThreadTs: string | undefined,
     prompt: string,
   ): Promise<void> {
-    const placeholder = await gateway.postMessage({ channel, threadTs, text: "_Thinking…_" });
+    const placeholder = await gateway.postMessage({ channel, threadTs: replyThreadTs, text: "_Thinking…_" });
+    // Every message posted AFTER the placeholder — overflow chunks and the
+    // watchdog's late reply — belongs under the reply, not beside it. In a
+    // channel-scoped 1:1 DM there is no thread (`replyThreadTs` is
+    // undefined), so nesting under the placeholder keeps a long or late
+    // answer from spraying top-level messages down the DM. Same pattern as
+    // src/post-message.ts:118.
+    const followUpThreadTs = replyThreadTs ?? placeholder.ts;
     let buffer = "";
     let timer: ReturnType<typeof setTimeout> | null = null;
     let updateChain: Promise<void> = Promise.resolve();
@@ -207,7 +265,7 @@ export function createChat(deps: ChatDeps): Chat {
         .then(() => gateway.updateMessage({ channel: placeholder.channel, ts: placeholder.ts, text: first }))
         .then(async () => {
           for (const extra of rest) {
-            await gateway.postMessage({ channel: placeholder.channel, threadTs, text: extra });
+            await gateway.postMessage({ channel: placeholder.channel, threadTs: followUpThreadTs, text: extra });
           }
         })
         .catch((err) => ctx.logger.warn("Slack chat.update failed", { err: errString(err) }));
@@ -221,7 +279,7 @@ export function createChat(deps: ChatDeps): Chat {
       updateChain = updateChain
         .then(async () => {
           for (const chunk of chunks) {
-            await gateway.postMessage({ channel: placeholder.channel, threadTs, text: chunk });
+            await gateway.postMessage({ channel: placeholder.channel, threadTs: followUpThreadTs, text: chunk });
           }
         })
         .catch((err) => ctx.logger.warn("Slack late reply post failed", { err: errString(err) }));
@@ -361,21 +419,26 @@ export function createChat(deps: ChatDeps): Chat {
   }
 
   async function converse(msg: InboundMessage): Promise<void> {
-    const threadTs = msg.threadTs ?? msg.ts;
+    // Resolved inside the try, but seeded here so the catch below can still
+    // reply somewhere sane when getConfig() itself rejects. A reply under
+    // the user's own message is always safe to post.
+    let replyThreadTs: string | undefined = msg.threadTs ?? msg.ts;
     try {
       const cfg = await getConfig();
+      const scope = resolveSessionScope(msg, cfg.dmSessionMode);
+      replyThreadTs = scope.replyThreadTs;
       const text = stripMention(msg.text);
       if (!text) return;
       const prompt = buildChatPrompt(cfg.chatPromptPreamble, text);
-      const entry = await getOrCreateSession(cfg, msg.channel, threadTs);
-      await streamReply(cfg, entry, msg.channel, threadTs, prompt);
+      const entry = await getOrCreateSession(cfg, msg.channel, scope);
+      await streamReply(cfg, entry, msg.channel, scope.replyThreadTs, prompt);
     } catch (err) {
       const reason = describeHostError(err);
       ctx.logger.error("Slack chat failed", { err: reason, channel: msg.channel });
       await gateway
         .postMessage({
           channel: msg.channel,
-          threadTs,
+          threadTs: replyThreadTs,
           // Surface the reason in Slack, not just in the plugin log: an
           // operator reading the thread is usually the only person who sees
           // this, and a bare "something went wrong" makes the plugin

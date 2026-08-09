@@ -191,4 +191,36 @@ describe("instanceConfigSchema vs the host settings form", () => {
     expect(schema.properties.agentDmUserIds?.default).toEqual([]);
     expect(schema.properties.agentDmAnyUser?.default).toBe(false);
   });
+
+  it("accepts both dmSessionMode values the settings form offers", () => {
+    for (const dmSessionMode of ["channel", "thread"]) {
+      const result = validateInstanceConfig({
+        ...baseConfig,
+        slackBotTokenRef: SECRET_REF,
+        slackAppTokenRef: SECRET_REF,
+        dmSessionMode,
+      });
+      expect(result.errors).toEqual([]);
+      expect(result.valid).toBe(true);
+    }
+  });
+
+  it("rejects a dmSessionMode outside the enum", () => {
+    const result = validateInstanceConfig({
+      ...baseConfig,
+      slackBotTokenRef: SECRET_REF,
+      slackAppTokenRef: SECRET_REF,
+      dmSessionMode: "threaded",
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors.map((e) => e.field)).toContain("/dmSessionMode");
+  });
+
+  it('defaults dmSessionMode to "channel" so an operator who changes nothing gets the fix', () => {
+    const schema = manifest.instanceConfigSchema as {
+      properties: Record<string, { default?: unknown; enum?: unknown[] }>;
+    };
+    expect(schema.properties.dmSessionMode?.default).toBe("channel");
+    expect(schema.properties.dmSessionMode?.enum).toEqual(["channel", "thread"]);
+  });
 });
