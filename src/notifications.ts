@@ -1,9 +1,9 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import { STATE_KEYS, stateScope } from "./constants.js";
+import { STATE_KEYS } from "./constants.js";
 import { formatAgentRunFailed, formatIssueCreated, formatIssueDone, type SlackContent } from "./formatters.js";
+import { getMessageLink, linkMessage, unlinkMessage } from "./message-link.js";
 import { errString } from "./redact.js";
-import { updateIndex } from "./state-index.js";
-import type { IssueThreadEntry, SlackGateway, SlackSocketConfig } from "./types.js";
+import type { SlackGateway, SlackSocketConfig } from "./types.js";
 
 export interface NotificationDeps {
   ctx: PluginContext;
@@ -57,16 +57,7 @@ export function registerNotifications({ ctx, gateway, getConfig, companyId }: No
       "issue_created",
     );
     if (posted && issueId) {
-      const key = STATE_KEYS.issueThread(issueId);
-      const entry: IssueThreadEntry = {
-        channel: posted.channel,
-        ts: posted.ts,
-        createdAt: new Date().toISOString(),
-      };
-      await ctx.state.set(stateScope(key), entry);
-      await updateIndex(ctx, STATE_KEYS.issueThreadIndex, (current) =>
-        current.includes(key) ? current : [...current, key],
-      );
+      await linkMessage(ctx, STATE_KEYS.issueThreadIndex, STATE_KEYS.issueThread(issueId), posted);
     }
   });
 
@@ -81,15 +72,14 @@ export function registerNotifications({ ctx, gateway, getConfig, companyId }: No
 
     const issueId = e.entityId ?? "";
     const key = issueId ? STATE_KEYS.issueThread(issueId) : null;
-    const entry = key ? ((await ctx.state.get(stateScope(key))) as IssueThreadEntry | null) : null;
+    const entry = key ? await getMessageLink(ctx, key) : null;
 
     if (entry && key && entry.channel === channel) {
       // Post the completion notice as a threaded reply on the original
       // "issue created" message, then the link is no longer needed — the
       // issue is finished.
       await post(channel, formatIssueDone(payload, issueId, cfg.paperclipBaseUrl), "issue_done", entry.ts);
-      await ctx.state.delete(stateScope(key));
-      await updateIndex(ctx, STATE_KEYS.issueThreadIndex, (current) => current.filter((k) => k !== key));
+      await unlinkMessage(ctx, STATE_KEYS.issueThreadIndex, key);
     } else {
       await post(channel, formatIssueDone(payload, issueId, cfg.paperclipBaseUrl), "issue_done");
     }

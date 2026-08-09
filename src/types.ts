@@ -68,14 +68,23 @@ export interface SessionEntry {
   lastActivityAt: string; // ISO 8601
 }
 
-// Links a posted "issue created" Slack message to its issue, so the later
-// "issue done" notification can be posted as a threaded reply instead of a
-// new top-level message.
-export interface IssueThreadEntry {
+// Links a Slack message we posted to the entity it represents, so a later
+// event can update that same message instead of posting a new one, and so
+// the cleanup job can drop links nothing will ever touch again. See
+// message-link.ts for the link/get/unlink/prune helpers.
+export interface MessageLink {
   channel: string;
   ts: string;
   createdAt: string; // ISO 8601
 }
+
+/**
+ * @deprecated Renamed to `MessageLink`. Issue threads were the first user of
+ * this shape; approval messages are the second, which is what prompted the
+ * rename. Identical shape — kept exported so existing imports (including
+ * tests/cleanup.test.ts) keep compiling without being touched.
+ */
+export type IssueThreadEntry = MessageLink;
 
 export type QuestionMode = "reaction" | "answer";
 
