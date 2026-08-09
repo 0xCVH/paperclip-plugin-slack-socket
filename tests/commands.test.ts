@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createCommands } from "../src/commands.js";
+import { CHANNEL_SESSION_TS, STATE_KEYS } from "../src/constants.js";
+import type { SessionEntry } from "../src/types.js";
 import { FakeGateway, makeCtx, TEST_CONFIG } from "./helpers.js";
 
 function setup() {
@@ -10,6 +12,14 @@ function setup() {
 }
 
 const cmd = (text: string) => ({ command: "/paperclip", text, user: "U1", channel: "C1" });
+// Slack gives a 1:1 IM a channel id starting with "D"; C…/G… are channels,
+// private channels and group DMs.
+const dmCmd = (text: string) => ({ command: "/paperclip", text, user: "U1", channel: "D1" });
+
+const entry = (overrides: Partial<SessionEntry> = {}): SessionEntry => ({
+  sessionId: "sess-dm", channel: "D1", threadTs: CHANNEL_SESSION_TS, scope: "channel",
+  lastActivityAt: new Date().toISOString(), ...overrides,
+});
 
 describe("commands", () => {
   it("creates an issue and replies ephemerally with a link", async () => {
@@ -68,5 +78,74 @@ describe("commands", () => {
       expect.stringContaining("confirmation"),
       expect.objectContaining({ issueId: "issue-1" }),
     );
+  });
+
+  it("in a 1:1 DM, closes the channel-scoped session and clears its state and index membership", async () => {
+    const { ctx, gateway, commands, stateStore } = setup();
+    const key = STATE_KEYS.session("D1", CHANNEL_SESSION_TS);
+    const other = STATE_KEYS.session("C9", "1.1");
+    stateStore.set(key, entry());
+    stateStore.set(STATE_KEYS.sessionIndex, [key, other]);
+
+    await commands.handleCommand(dmCmd("reset"));
+
+    expect(ctx.agents.sessions.close).toHaveBeenCalledWith("sess-dm", "co-1");
+    expect(stateStore.get(key)).toBeUndefined();
+    expect(stateStore.get(STATE_KEYS.sessionIndex)).toEqual([other]);
+    expect(gateway.ephemerals[0]!.text).toContain("reset");
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.commands.invoked", 1, { subcommand: "reset" });
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.sessions.reset", 1, { surface: "command" });
+  });
+
+  it("in a channel, points at the in-thread keyword and closes nothing", async () => {
+    const { ctx, gateway, commands, stateStore } = setup();
+    const key = STATE_KEYS.session("C1", "50.1");
+    stateStore.set(key, entry({ sessionId: "sess-thread", channel: "C1", threadTs: "50.1", scope: "thread" }));
+    stateStore.set(STATE_KEYS.sessionIndex, [key]);
+
+    await commands.handleCommand(cmd("reset"));
+
+    expect(ctx.agents.sessions.close).not.toHaveBeenCalled();
+    expect(stateStore.get(key)).toBeTruthy();
+    expect(stateStore.get(STATE_KEYS.sessionIndex)).toEqual([key]);
+    const text = gateway.ephemerals[0]!.text;
+    expect(text).toContain("thread");
+    expect(text).toContain("reset");
+    // A thread-blind command must never claim there was nothing to reset.
+    expect(text.toLowerCase()).not.toContain("nothing to reset");
+  });
+
+  it("is friendly, not an error, when a DM has no session to reset", async () => {
+    const { ctx, gateway, commands } = setup();
+    await commands.handleCommand(dmCmd("reset"));
+    expect(ctx.agents.sessions.close).not.toHaveBeenCalled();
+    expect(gateway.ephemerals[0]!.text).toContain("Nothing to reset");
+    expect(gateway.ephemerals[0]!.text).not.toContain(":x:");
+  });
+
+  it("drops local state even when the host fails to close the session", async () => {
+    const { ctx, gateway, commands, stateStore } = setup();
+    const key = STATE_KEYS.session("D1", CHANNEL_SESSION_TS);
+    stateStore.set(key, entry());
+    stateStore.set(STATE_KEYS.sessionIndex, [key]);
+    (ctx.agents.sessions.close as any).mockRejectedValueOnce(new Error("host down"));
+
+    await commands.handleCommand(dmCmd("reset"));
+
+    // A stale host-side session is strictly better than a DM wedged to a
+    // session id the host has already forgotten.
+    expect(stateStore.get(key)).toBeUndefined();
+    expect(stateStore.get(STATE_KEYS.sessionIndex)).toEqual([]);
+    expect(gateway.ephemerals[0]!.text).toContain("reset");
+    expect(ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("reset"),
+      expect.objectContaining({ sessionId: "sess-dm" }),
+    );
+  });
+
+  it("documents reset in the help output", async () => {
+    const { gateway, commands } = setup();
+    await commands.handleCommand(cmd("help"));
+    expect(gateway.ephemerals[0]!.text).toContain("/paperclip reset");
   });
 });

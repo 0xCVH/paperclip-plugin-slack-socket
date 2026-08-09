@@ -1056,3 +1056,104 @@ describe("follow-up posts in a top-level DM reply", () => {
     expect(gateway.posts[1]!.threadTs).toBe(gateway.posts[0]!.ts);
   });
 });
+
+describe("reset keyword", () => {
+  const threadEntry = (sessionId: string, channel: string, threadTs: string) => ({
+    sessionId, channel, threadTs, scope: "thread" as const,
+    lastActivityAt: new Date().toISOString(),
+  });
+
+  it("@bot reset clears that thread's session, confirms in-thread, and runs no agent turn", async () => {
+    const { ctx, gateway, chat, stateStore } = setup();
+    const key = STATE_KEYS.session("C1", "600.1");
+    stateStore.set(key, threadEntry("sess-thread", "C1", "600.1"));
+    stateStore.set(STATE_KEYS.sessionIndex, [key]);
+
+    await chat.handleMention({
+      channel: "C1", channelType: "channel", user: "U1",
+      text: "<@UBOT> reset", ts: "600.4", threadTs: "600.1",
+    });
+
+    expect(ctx.agents.sessions.close).toHaveBeenCalledWith("sess-thread", "co-1");
+    expect(ctx.agents.sessions.sendMessage).not.toHaveBeenCalled();
+    expect(ctx.agents.sessions.create).not.toHaveBeenCalled();
+    expect(stateStore.get(key)).toBeUndefined();
+    expect(stateStore.get(STATE_KEYS.sessionIndex)).toEqual([]);
+    expect(gateway.posts).toHaveLength(1);
+    expect(gateway.posts[0]!.threadTs).toBe("600.1");
+    expect(gateway.posts[0]!.text).toContain("reset");
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.sessions.reset", 1, { surface: "mention" });
+  });
+
+  it('"reset the staging database" runs a normal agent turn and clears nothing', async () => {
+    const { ctx, gateway, chat, stateStore } = setup();
+    const key = STATE_KEYS.session("C1", "601.1");
+    stateStore.set(key, threadEntry("sess-keep", "C1", "601.1"));
+
+    await chat.handleMention({
+      channel: "C1", channelType: "channel", user: "U1",
+      text: "<@UBOT> reset the staging database", ts: "601.2", threadTs: "601.1",
+    });
+
+    expect(ctx.agents.sessions.close).not.toHaveBeenCalled();
+    expect(stateStore.get(key)).toBeTruthy();
+    expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledWith("sess-keep", "co-1", expect.anything());
+    expect(gateway.updates.at(-1)!.text).toBe("Hello there!");
+  });
+
+  it("matches case-insensitively and tolerates surrounding whitespace", async () => {
+    const { ctx, chat, stateStore } = setup();
+    const key = STATE_KEYS.session("C1", "602.1");
+    stateStore.set(key, threadEntry("sess-case", "C1", "602.1"));
+
+    await chat.handleMention({
+      channel: "C1", channelType: "channel", user: "U1",
+      text: "  <@UBOT>   ReSeT  ", ts: "602.2", threadTs: "602.1",
+    });
+
+    expect(ctx.agents.sessions.close).toHaveBeenCalledWith("sess-case", "co-1");
+    expect(ctx.agents.sessions.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("is friendly, and still runs no agent turn, when the thread has no session yet", async () => {
+    const { ctx, gateway, chat } = setup();
+    await chat.handleMention({
+      channel: "C1", channelType: "channel", user: "U1",
+      text: "<@UBOT> reset", ts: "603.1", threadTs: "603.1",
+    });
+    expect(ctx.agents.sessions.close).not.toHaveBeenCalled();
+    expect(ctx.agents.sessions.sendMessage).not.toHaveBeenCalled();
+    expect(gateway.posts[0]!.text).toContain("Nothing to reset");
+  });
+
+  it("resets the whole DM conversation and confirms top-level when mentioned in a 1:1 DM", async () => {
+    const { ctx, gateway, chat, stateStore } = setup();
+    const key = STATE_KEYS.session("D1", CHANNEL_SESSION_TS);
+    stateStore.set(key, {
+      sessionId: "sess-dm", channel: "D1", threadTs: CHANNEL_SESSION_TS, scope: "channel",
+      lastActivityAt: new Date().toISOString(),
+    });
+    stateStore.set(STATE_KEYS.sessionIndex, [key]);
+
+    await chat.handleMention(dm("<@UBOT> reset", "700.1"));
+
+    expect(ctx.agents.sessions.close).toHaveBeenCalledWith("sess-dm", "co-1");
+    expect(stateStore.get(key)).toBeUndefined();
+    expect(gateway.posts[0]!.threadTs).toBeUndefined();
+  });
+
+  it("does not fire on an unmentioned DM message — that surface is /paperclip reset", async () => {
+    const { ctx, chat, stateStore } = setup();
+    const key = STATE_KEYS.session("D1", CHANNEL_SESSION_TS);
+    stateStore.set(key, {
+      sessionId: "sess-dm", channel: "D1", threadTs: CHANNEL_SESSION_TS, scope: "channel",
+      lastActivityAt: new Date().toISOString(),
+    });
+
+    await chat.handleMessage(dm("reset", "710.1"));
+
+    expect(ctx.agents.sessions.close).not.toHaveBeenCalled();
+    expect(stateStore.get(key)).toBeTruthy();
+    expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledWith("sess-dm", "co-1", expect.anything());
+  });
+});

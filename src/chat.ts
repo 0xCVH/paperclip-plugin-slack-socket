@@ -1,5 +1,12 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import { CHANNEL_SESSION_TS, REPLY_CLOSE_TAG, REPLY_OPEN_TAG, STATE_KEYS, stateScope } from "./constants.js";
+import {
+  CHANNEL_SESSION_TS,
+  REPLY_CLOSE_TAG,
+  REPLY_OPEN_TAG,
+  RESET_KEYWORD,
+  STATE_KEYS,
+  stateScope,
+} from "./constants.js";
 import { escapeMrkdwn } from "./formatters.js";
 import { markdownToMrkdwn } from "./mrkdwn.js";
 import { errString } from "./redact.js";
@@ -161,6 +168,44 @@ export function resolveSessionScope(msg: InboundMessage, mode: DmSessionMode): S
   };
 }
 
+/**
+ * Clears the conversation stored at `key`: closes the agent session, deletes
+ * the state entry, and drops the key from the session index. Returns whether
+ * there was anything to clear, so callers can tell the user "reset" vs
+ * "nothing to reset" truthfully.
+ *
+ * Lives here rather than in a new module because this is session-lifecycle
+ * logic and chat.ts already owns the create/lookup half of it; `commands.ts`
+ * imports it for `/paperclip reset` (no cycle — chat.ts imports nothing from
+ * commands.ts).
+ *
+ * A failed `ctx.agents.sessions.close` still drops the local state: a stale
+ * host-side session is strictly better than a Slack conversation wedged to a
+ * session id the host has already forgotten. Everything else propagates, so
+ * a caller never confirms a reset that did not happen.
+ */
+export async function resetSession(
+  ctx: PluginContext,
+  cfg: SlackSocketConfig,
+  key: string,
+  surface: "command" | "mention",
+): Promise<boolean> {
+  const entry = (await ctx.state.get(stateScope(key))) as SessionEntry | null;
+  if (!entry) return false;
+  try {
+    await ctx.agents.sessions.close(entry.sessionId, cfg.companyId);
+  } catch (err) {
+    ctx.logger.warn("Failed to close a session during reset; dropping local state anyway", {
+      err: errString(err),
+      sessionId: entry.sessionId,
+    });
+  }
+  await ctx.state.delete(stateScope(key));
+  await updateIndex(ctx, STATE_KEYS.sessionIndex, (current) => current.filter((k) => k !== key));
+  await ctx.metrics.write("slack.sessions.reset", 1, { surface }).catch(() => {});
+  return true;
+}
+
 export function createChat(deps: ChatDeps): Chat {
   const { ctx, gateway, getConfig } = deps;
   const updateIntervalMs = deps.updateIntervalMs ?? 1000;
@@ -173,6 +218,38 @@ export function createChat(deps: ChatDeps): Chat {
   function stripMention(text: string): string {
     const botId = gateway.botUserId();
     return (botId ? text.replaceAll(`<@${botId}>`, "") : text).trim();
+  }
+
+  // `@paperclip reset` — exact match only, after mention-stripping, trimming
+  // and lower-casing, so it can never fire on "reset the staging database".
+  // Returns true when it handled the message, meaning no agent turn runs.
+  async function tryHandleReset(msg: InboundMessage): Promise<boolean> {
+    if (stripMention(msg.text).trim().toLowerCase() !== RESET_KEYWORD) return false;
+    try {
+      const cfg = await getConfig();
+      const scope = resolveSessionScope(msg, cfg.dmSessionMode);
+      const cleared = await resetSession(ctx, cfg, scope.key, "mention");
+      await gateway.postMessage({
+        channel: msg.channel,
+        threadTs: scope.replyThreadTs,
+        text: cleared
+          ? ":broom: Conversation reset — the next message starts fresh."
+          : "Nothing to reset — this conversation is already fresh.",
+      });
+    } catch (err) {
+      // Report failures truthfully rather than confirming a reset that did
+      // not happen (the precedent at src/commands.ts:52).
+      const reason = describeHostError(err);
+      ctx.logger.error("Slack reset failed", { err: reason, channel: msg.channel });
+      await gateway
+        .postMessage({
+          channel: msg.channel,
+          threadTs: msg.threadTs ?? msg.ts,
+          text: `:warning: Sorry — couldn't reset this conversation: ${reason.slice(0, 500)}`,
+        })
+        .catch(() => {});
+    }
+    return true;
   }
 
   async function getOrCreateSession(
@@ -456,6 +533,7 @@ export function createChat(deps: ChatDeps): Chat {
 
   return {
     async handleMention(msg) {
+      if (await tryHandleReset(msg)) return;
       await converse(msg);
     },
     async handleMessage(msg) {

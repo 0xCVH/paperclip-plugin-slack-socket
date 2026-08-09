@@ -20,6 +20,11 @@ export const TOOL_NAMES = {
 
 export const SLASH_COMMAND = "/paperclip";
 
+// The word that clears a conversation, spelled once so the slash subcommand
+// (`/paperclip reset`) and the in-thread mention keyword (`@bot reset`)
+// can never drift apart.
+export const RESET_KEYWORD = "reset";
+
 export const STATE_NAMESPACE = "slack-socket";
 
 // Key suffix for a session scoped to a whole 1:1 DM channel rather than to
