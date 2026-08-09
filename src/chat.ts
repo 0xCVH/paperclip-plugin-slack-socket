@@ -129,23 +129,28 @@ export interface SessionScope {
  * goes. Pure — two arguments, no `ctx`, no gateway, no clock — so the whole
  * scoping rule is unit-testable without any host plumbing.
  *
- * | Input                                | Key                              | Reply     |
- * |--------------------------------------|----------------------------------|-----------|
- * | im, no threadTs, mode "channel"      | `session:<channel>:main`         | top-level |
- * | im, inside a thread                  | `session:<channel>:<threadTs>`   | threaded  |
- * | any non-im channel, or mode "thread" | `session:<channel>:<threadTs∥ts>`| threaded  |
+ * | Input                             | Key                               | Scope   | Reply                              |
+ * |------------------------------------|-----------------------------------|---------|-------------------------------------|
+ * | im, mode "channel"                 | `session:<channel>:main`          | channel | top-level, or threaded if the person wrote in a thread |
+ * | im, mode "thread"                  | `session:<channel>:<threadTs∥ts>` | thread  | threaded                            |
+ * | any non-im channel (any mode)      | `session:<channel>:<threadTs∥ts>` | thread  | threaded                            |
  *
- * The last row reproduces the pre-0.10.0 behavior exactly for every non-DM
- * surface and for operators who set `dmSessionMode: "thread"`. Only the
- * first row is new: a 1:1 DM is a chat window, not a thread list, so the
- * whole channel is the conversation unit and the reply belongs top-level.
+ * Under "channel" mode (the default), a 1:1 DM is one continuous
+ * conversation, not a thread list: EVERY message in it — top-level or inside
+ * any thread, including a thread that formed under the bot's own reply —
+ * shares the one channel-scoped session. Reply placement still tracks where
+ * the person wrote (`replyThreadTs` mirrors `msg.threadTs`), so a reply
+ * never jumps out of the context they're reading; only the session identity
+ * is unconditionally shared. Only "thread" mode and every non-DM surface
+ * give a thread its own session — that reproduces the pre-0.10.0 behavior
+ * exactly.
  */
 export function resolveSessionScope(msg: InboundMessage, mode: DmSessionMode): SessionScope {
-  if (msg.channelType === "im" && mode === "channel" && !msg.threadTs) {
+  if (msg.channelType === "im" && mode === "channel") {
     return {
       key: STATE_KEYS.session(msg.channel, CHANNEL_SESSION_TS),
       scope: "channel",
-      replyThreadTs: undefined,
+      replyThreadTs: msg.threadTs,
     };
   }
   const threadTs = msg.threadTs ?? msg.ts;
