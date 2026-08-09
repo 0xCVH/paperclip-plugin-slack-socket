@@ -1,6 +1,11 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import { ACTION_IDS } from "./constants.js";
-import { formatApprovalCreated, formatApprovalDecided } from "./formatters.js";
+import { ACTION_IDS, STATE_KEYS } from "./constants.js";
+import {
+  formatApprovalCreated,
+  formatApprovalDecided,
+  formatApprovalDecidedElsewhere,
+} from "./formatters.js";
+import { getMessageLink, linkMessage, unlinkMessage } from "./message-link.js";
 import { errString } from "./redact.js";
 import type { InboundAction, SlackGateway, SlackSocketConfig } from "./types.js";
 
@@ -11,8 +16,9 @@ export interface ApprovalDeps {
   /**
    * The single company this worker process is bound to — see the matching
    * comment on `NotificationDeps.companyId` in notifications.ts. The
-   * `approval.created` subscription must be filtered to this company so a
-   * shared worker process never reacts to another company's approvals.
+   * `approval.created` and `approval.decided` subscriptions must both be
+   * filtered to this company so a shared worker process never reacts to
+   * another company's approvals.
    */
   companyId: string;
 }
@@ -28,16 +34,62 @@ export function createApprovals({ ctx, gateway, getConfig, companyId }: Approval
     if (!cfg.notifyOnApprovalCreated || !e.entityId) return;
     const channel = cfg.approvalsChannelId || cfg.defaultChannelId;
     if (!channel) return;
+    const approvalId = e.entityId;
     try {
-      await gateway.postMessage({
+      const posted = await gateway.postMessage({
         channel,
-        ...formatApprovalCreated(e.entityId, e.payload as Record<string, unknown>, cfg.paperclipBaseUrl),
+        ...formatApprovalCreated(approvalId, e.payload as Record<string, unknown>, cfg.paperclipBaseUrl),
       });
       await ctx.metrics.write("slack.notifications.sent", 1, { type: "approval_created" }).catch(() => {});
+      // Remember where the message landed so a decision made anywhere else
+      // can come back and retire its buttons. Its own catch, not the outer
+      // one: the message did go out, so a state failure must not be
+      // reported as a failed notification.
+      await linkMessage(
+        ctx,
+        STATE_KEYS.approvalMessageIndex,
+        STATE_KEYS.approvalMessage(approvalId),
+        posted,
+      ).catch((err: unknown) => {
+        ctx.logger.warn("Failed to link the posted approval message", { err: errString(err), approvalId });
+      });
     } catch (err) {
       ctx.logger.warn("Slack approval notification failed", { err: errString(err) });
       await ctx.metrics.write("slack.notifications.failed", 1, { type: "approval_created" }).catch(() => {});
     }
+  });
+
+  // A decision made outside this Slack message — the Paperclip web UI, the
+  // API, another integration — must not leave live Approve/Reject buttons
+  // sitting in the channel forever. Our own button clicks unlink before they
+  // rewrite the message (see handleAction below), so the host's echo of our
+  // own decision finds no link here and correctly no-ops.
+  ctx.events.on("approval.decided", { companyId }, async (event) => {
+    const e = event as { entityId?: string; payload: unknown };
+    if (!e.entityId) return;
+    const approvalId = e.entityId;
+    const key = STATE_KEYS.approvalMessage(approvalId);
+    const link = await getMessageLink(ctx, key);
+    if (!link) return;
+    try {
+      await gateway.updateMessage({
+        channel: link.channel,
+        ts: link.ts,
+        ...formatApprovalDecidedElsewhere(approvalId, e.payload as Record<string, unknown> | null),
+      });
+    } catch (err) {
+      // Pre-existing failure mode, not a new one: the message keeps its
+      // buttons and a later click lands on the "It may already be decided."
+      // ephemeral below.
+      ctx.logger.warn("Failed to sync a Slack approval message decided elsewhere", {
+        err: errString(err),
+        approvalId,
+      });
+    }
+    // Dropped either way. The approval is decided, so nothing will ever
+    // legitimately rewrite this message again, and a link kept alive after a
+    // failed update would only sit there until the 30-day prune.
+    await unlinkMessage(ctx, STATE_KEYS.approvalMessageIndex, key);
   });
 
   async function postFailureEphemeral(
@@ -116,6 +168,23 @@ export function createApprovals({ ctx, gateway, getConfig, companyId }: Approval
         if (response.status < 200 || response.status >= 300) {
           throw new Error(`Approval ${decision} returned HTTP ${response.status}`);
         }
+        // ORDER IS LOAD-BEARING: drop the link the instant the decision is
+        // recorded, and BEFORE we write our own attribution. The host echoes
+        // an `approval.decided` back for this very decision; with the link
+        // already gone that handler no-ops instead of overwriting
+        // "Approved by <name>" with generic decided-elsewhere text. Its own
+        // catch, so a state failure can never make a decision that actually
+        // succeeded report to the user as failed.
+        await unlinkMessage(
+          ctx,
+          STATE_KEYS.approvalMessageIndex,
+          STATE_KEYS.approvalMessage(approvalId),
+        ).catch((err: unknown) => {
+          ctx.logger.warn("Failed to unlink an approval message decided in Slack", {
+            err: errString(err),
+            approvalId,
+          });
+        });
         await gateway.updateMessage({
           channel: action.channel,
           ts: action.messageTs,

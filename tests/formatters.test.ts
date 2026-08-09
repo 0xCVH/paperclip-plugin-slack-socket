@@ -4,6 +4,7 @@ import {
   formatAgentRunFailed,
   formatApprovalCreated,
   formatApprovalDecided,
+  formatApprovalDecidedElsewhere,
   formatIssueCreated,
   formatIssueDone,
   formatQuestion,
@@ -46,6 +47,45 @@ describe("formatters", () => {
     expect(approved.text).toContain("Approved");
     expect(rejected.text).toContain("Rejected");
     expect(approved.text).toContain("Sam");
+  });
+
+  it("approval decided elsewhere names the decider and drops both buttons", () => {
+    const out = formatApprovalDecidedElsewhere("app-1", { status: "approved", decidedByName: "Dana" });
+    const json = JSON.stringify(out.blocks);
+    expect(out.text).toBe(":white_check_mark: Approved by Dana (approval app-1)");
+    expect(json).not.toContain(ACTION_IDS.approvalApprove);
+    expect(json).not.toContain(ACTION_IDS.approvalReject);
+  });
+
+  it("approval decided elsewhere omits attribution when the payload carries no decider", () => {
+    expect(formatApprovalDecidedElsewhere("app-1", { status: "rejected" }).text).toBe(
+      ":no_entry: Rejected (approval app-1)",
+    );
+  });
+
+  it("approval decided elsewhere quotes an unrecognized status verbatim instead of guessing", () => {
+    // The status vocabulary is host-defined and the published SDK may lag it,
+    // so an unknown value must still retire the buttons and say what it was.
+    const out = formatApprovalDecidedElsewhere("app-1", { status: "revision_requested" });
+    expect(out.text).toContain("revision_requested");
+    expect(JSON.stringify(out.blocks)).not.toContain(ACTION_IDS.approvalApprove);
+    expect(JSON.stringify(out.blocks)).not.toContain(ACTION_IDS.approvalReject);
+  });
+
+  it("approval decided elsewhere falls back to a bare Decided when the payload has no status at all", () => {
+    expect(formatApprovalDecidedElsewhere("app-1", null).text).toBe(":information_source: Decided (approval app-1)");
+  });
+
+  it("escapes a hostile decider name and status in a decided-elsewhere update", () => {
+    const out = formatApprovalDecidedElsewhere("app-1", {
+      status: "<https://evil.example|approved>",
+      decidedByName: "<!channel>",
+    });
+    const json = JSON.stringify(out.blocks);
+    expect(out.text).not.toContain("<!channel>");
+    expect(out.text).not.toContain("<https://evil.example|approved>");
+    expect(json).toContain("&lt;!channel&gt;");
+    expect(json).toContain("&lt;https://evil.example|approved&gt;");
   });
 
   it("question prompts differ by mode", () => {

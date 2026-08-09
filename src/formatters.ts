@@ -106,6 +106,40 @@ export function formatApprovalDecided(
   return { text, blocks: [section(text)] };
 }
 
+// Decision statuses we recognize well enough to render as a verdict. The
+// approval.decided payload shape and the full status vocabulary are
+// host-defined and the published SDK may lag the host (revision_requested,
+// for one, may or may not be terminal), so anything outside these sets is
+// quoted verbatim rather than guessed at.
+const APPROVED_STATUSES = new Set(["approved", "approve"]);
+const REJECTED_STATUSES = new Set(["rejected", "reject"]);
+
+/**
+ * The decided state of an approval that was decided somewhere other than
+ * this Slack message — the Paperclip web UI, the API, another integration.
+ *
+ * Carries no action buttons, which is the entire point: rendering this over
+ * the original message is what retires the live Approve/Reject buttons.
+ * Decider attribution appears only when the payload actually carries one.
+ */
+export function formatApprovalDecidedElsewhere(approvalId: string, payload: Payload): SlackContent {
+  const raw = str(payload, "status") || str(payload, "decision");
+  const decider = str(payload, "decidedByName") || str(payload, "decidedBy");
+  const label = APPROVED_STATUSES.has(raw)
+    ? ":white_check_mark: Approved"
+    : REJECTED_STATUSES.has(raw)
+      ? ":no_entry: Rejected"
+      : raw
+        ? `:information_source: Decided — ${escapeMrkdwn(raw)}`
+        : ":information_source: Decided";
+  const by = decider ? ` by ${escapeMrkdwn(decider)}` : "";
+  const text = `${label}${by} (approval ${approvalId})`;
+  return {
+    text,
+    blocks: [section(text), context("Decided outside Slack; the buttons no longer apply.")],
+  };
+}
+
 export function formatQuestion(question: string, mode: QuestionMode): SlackContent {
   const q = escapeMrkdwn(question);
   const hint =

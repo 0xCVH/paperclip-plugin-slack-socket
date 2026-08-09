@@ -40,6 +40,8 @@ export const STATE_KEYS = {
   question: (channel: string, ts: string) => `question:${channel}:${ts}`,
   issueThreadIndex: "issue-thread-index",
   issueThread: (issueId: string) => `issue-thread:${issueId}`,
+  approvalMessageIndex: "approval-message-index",
+  approvalMessage: (approvalId: string) => `approval-message:${approvalId}`,
 } as const;
 
 export function stateScope(stateKey: string): ScopeKey {
