@@ -142,6 +142,13 @@ const manifest: PaperclipPluginManifestV1 = {
       },
       turnTimeoutMinutes: {
         type: "number",
+        // `0` is a plausible operator misreading of "no timeout", but
+        // src/chat.ts multiplies this straight into a setTimeout delay: 0,
+        // a negative number, or a non-number would produce a 0/NaN delay,
+        // firing the watchdog immediately and timing out every single turn.
+        // This protects the settings form; src/chat.ts additionally clamps
+        // at the read site in case a host ever pushes an unvalidated value.
+        minimum: 1,
         title: "Turn Timeout Minutes",
         description:
           "Give up on a single chat turn after this many minutes without any output from the agent.",

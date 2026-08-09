@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildChatPrompt,
+  clampTurnTimeoutMinutes,
   createChat,
   extractReply,
   filterRuntimeNoticeLines,
@@ -427,6 +428,29 @@ describe("buildChatPrompt", () => {
   });
 });
 
+describe("clampTurnTimeoutMinutes", () => {
+  // Defends the setTimeout delay at the read site against a host that
+  // pushes a config bypassing the manifest schema's `minimum: 1` (the
+  // manifest only protects the settings form). 0, a negative number, or
+  // NaN multiplied into `* 60_000` would otherwise produce a 0 or NaN
+  // delay, firing the watchdog immediately on every turn.
+  it("passes through a valid positive value unchanged", () => {
+    expect(clampTurnTimeoutMinutes(10)).toBe(10);
+  });
+
+  it("floors 0 — a plausible operator misreading of 'no timeout' — to the minimum", () => {
+    expect(clampTurnTimeoutMinutes(0)).toBe(1);
+  });
+
+  it("floors a negative value to the minimum", () => {
+    expect(clampTurnTimeoutMinutes(-5)).toBe(1);
+  });
+
+  it("floors NaN (e.g. from a non-numeric value that reached this call unvalidated) to the minimum", () => {
+    expect(clampTurnTimeoutMinutes(NaN)).toBe(1);
+  });
+});
+
 describe("chatPromptPreamble (integration via createChat)", () => {
   it("with the default config, frames the prompt with the default preamble and the user's message", async () => {
     const { ctx, chat } = setup();
@@ -590,6 +614,37 @@ describe("turn watchdog", () => {
 
     expect(gateway.updates.at(-1)!.text).toBe(
       "⏳ No response from the agent after 3m — it may still be working. Mention me again to retry.",
+    );
+  });
+
+  it("clamps a misconfigured turnTimeoutMinutes of 0 to the 1-minute floor at the real read site, instead of firing the watchdog immediately", async () => {
+    vi.useFakeTimers();
+    // Deliberately does NOT pass turnTimeoutMs — this exercises the actual
+    // `cfg.turnTimeoutMinutes * 60_000` computation in chat.ts (and its
+    // clamp), not a test-injected override.
+    const bundle = makeCtx({ turnTimeoutMinutes: 0 });
+    const gateway = new FakeGateway();
+    const chat = createChat({
+      ctx: bundle.ctx,
+      gateway,
+      getConfig: async () => ({ ...TEST_CONFIG, turnTimeoutMinutes: 0 }),
+      updateIntervalMs: 0,
+    });
+    silentRun(bundle.ctx as any);
+
+    const turn = chat.handleMention(mention("hi", "1206.1"));
+    await vi.advanceTimersByTimeAsync(0);
+    // An unclamped 0m would fire the watchdog on this very tick.
+    expect(gateway.updates).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(gateway.updates).toHaveLength(0); // still short of the clamped 1-minute floor
+
+    await vi.advanceTimersByTimeAsync(1);
+    await turn;
+
+    expect(gateway.updates.at(-1)!.text).toBe(
+      "⏳ No response from the agent after 1m — it may still be working. Mention me again to retry.",
     );
   });
 

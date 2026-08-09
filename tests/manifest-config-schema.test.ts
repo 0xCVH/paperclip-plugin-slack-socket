@@ -137,6 +137,28 @@ describe("instanceConfigSchema vs the host settings form", () => {
     expect(result.errors).toContainEqual({ field: "/turnTimeoutMinutes", message: "must be number" });
   });
 
+  it("rejects a turnTimeoutMinutes of 0 — an operator's plausible misreading of \"no timeout\" that would instead fire the watchdog immediately on every turn", () => {
+    const result = validateInstanceConfig({
+      ...baseConfig,
+      slackBotTokenRef: SECRET_REF,
+      slackAppTokenRef: SECRET_REF,
+      turnTimeoutMinutes: 0,
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContainEqual({ field: "/turnTimeoutMinutes", message: "must be >= 1" });
+  });
+
+  it("rejects a negative turnTimeoutMinutes", () => {
+    const result = validateInstanceConfig({
+      ...baseConfig,
+      slackBotTokenRef: SECRET_REF,
+      slackAppTokenRef: SECRET_REF,
+      turnTimeoutMinutes: -5,
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContainEqual({ field: "/turnTimeoutMinutes", message: "must be >= 1" });
+  });
+
   it("still rejects a config missing required fields", () => {
     const result = validateInstanceConfig({ slackBotTokenRef: SECRET_REF });
     expect(result.valid).toBe(false);
