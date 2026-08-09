@@ -1,6 +1,7 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import manifest from "../src/manifest.js";
-import { JOB_KEYS, TOOL_NAMES } from "../src/constants.js";
+import { JOB_KEYS, PLUGIN_VERSION, TOOL_NAMES } from "../src/constants.js";
 
 describe("manifest", () => {
   it("declares no webhooks (Socket Mode only)", () => {
@@ -38,5 +39,17 @@ describe("manifest", () => {
     };
     expect(schema.properties.paperclipApiKeyRef).toMatchObject({ format: "secret-ref", default: "" });
     expect(schema.required).not.toContain("paperclipApiKeyRef");
+  });
+
+  it("keeps the manifest version and package.json version in lockstep", () => {
+    // The host reads the version from the manifest and operators read it from
+    // npm; letting the two drift ships a build that misreports itself. Read
+    // via node:fs rather than a JSON import because tsconfig.json does not
+    // enable resolveJsonModule.
+    const pkg = JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+    ) as { version: string };
+    expect(manifest.version).toBe(PLUGIN_VERSION);
+    expect(PLUGIN_VERSION).toBe(pkg.version);
   });
 });
