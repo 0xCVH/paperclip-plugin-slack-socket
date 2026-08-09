@@ -118,6 +118,25 @@ export function buildChatPrompt(preamble: string, text: string): string {
   return `${preamble}\n\nSlack message:\n${text}`;
 }
 
+// Floor for a single chat turn's watchdog timeout. The manifest schema's
+// `minimum: 1` (see manifest.ts) protects the settings form, but this plugin
+// also reads `turnTimeoutMinutes` outside that form's validation (a host
+// pushing config directly, or the default merge path), and this number is
+// multiplied straight into a setTimeout delay below — 0, a negative value,
+// or a non-number would produce a 0/NaN delay and fire the watchdog
+// immediately, timing out every turn with a nonsensical "after 0m" notice.
+// 1 minute is short enough to never mask a genuinely stalled turn and long
+// enough that an operator's "0 means no timeout" typo can never be
+// reinterpreted as "time out instantly".
+export const MIN_TURN_TIMEOUT_MINUTES = 1;
+
+/** Clamps a possibly-invalid `turnTimeoutMinutes` to a safe, positive floor. */
+export function clampTurnTimeoutMinutes(minutes: number): number {
+  return Number.isFinite(minutes) && minutes >= MIN_TURN_TIMEOUT_MINUTES
+    ? minutes
+    : MIN_TURN_TIMEOUT_MINUTES;
+}
+
 // Prefix on a reply that lands after the turn watchdog already gave up. By
 // then the person may have mentioned the bot again, so the message has to
 // say which turn it belongs to instead of arriving as a bare answer.
@@ -327,7 +346,13 @@ export function createChat(deps: ChatDeps): Chat {
     // the placeholder, and anything arriving afterwards must leave it alone.
     let settled = false;
     let turnTimer: ReturnType<typeof setTimeout> | null = null;
-    const turnTimeoutMs = turnTimeoutMsOverride ?? cfg.turnTimeoutMinutes * 60_000;
+    // Clamped so a misconfigured (or unvalidated, host-pushed) value can
+    // never produce a 0/NaN delay — see clampTurnTimeoutMinutes above. The
+    // clamped value, not the raw config, is also what the timeout notice
+    // below names, so the message always matches the timer that actually
+    // fired.
+    const turnTimeoutMinutes = clampTurnTimeoutMinutes(cfg.turnTimeoutMinutes);
+    const turnTimeoutMs = turnTimeoutMsOverride ?? turnTimeoutMinutes * 60_000;
 
     const pushUpdate = (text: string): void => {
       const truncated = truncateForStreaming(text);
@@ -405,7 +430,7 @@ export function createChat(deps: ChatDeps): Chat {
         // alive host-side, which is exactly why a late `done` is posted
         // rather than discarded.
         pushUpdate(
-          `⏳ No response from the agent after ${cfg.turnTimeoutMinutes}m — it may still be working. Mention me again to retry.`,
+          `⏳ No response from the agent after ${turnTimeoutMinutes}m — it may still be working. Mention me again to retry.`,
         );
         // No tags: the only per-turn dimensions available here are the
         // channel and thread ids, which are unbounded and must never become
