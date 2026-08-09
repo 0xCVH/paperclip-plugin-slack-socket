@@ -51,6 +51,66 @@ describe("runCleanup", () => {
     expect(stateStore.get(STATE_KEYS.questionIndex)).toEqual([]);
   });
 
+  it("wakes the asking agent when a question expires", async () => {
+    const { ctx, stateStore } = makeCtx();
+    const key = STATE_KEYS.question("C1", "10.1");
+    stateStore.set(key, {
+      channel: "C1", ts: "10.1", issueId: "iss-1", companyId: "co-1", mode: "answer",
+      question: "Ship it?", askedAt: new Date(Date.now() - 2 * HOURS).toISOString(), timeoutMinutes: 60,
+    } satisfies PendingQuestion);
+    stateStore.set(STATE_KEYS.questionIndex, [key]);
+
+    await runCleanup(ctx, new FakeGateway(), TEST_CONFIG);
+
+    expect(ctx.issues.requestWakeup).toHaveBeenCalledWith("iss-1", "co-1", {
+      reason: "slack_ask_human_timeout",
+      contextSource: "slack-socket.ask-human",
+    });
+  });
+
+  it("still strikes the Slack message and deletes state when the wakeup fails", async () => {
+    const { ctx, stateStore } = makeCtx();
+    const gateway = new FakeGateway();
+    (ctx.issues.requestWakeup as any).mockRejectedValueOnce(new Error("wakeup unavailable"));
+    const key = STATE_KEYS.question("C1", "10.1");
+    stateStore.set(key, {
+      channel: "C1", ts: "10.1", issueId: "iss-1", companyId: "co-1", mode: "answer",
+      question: "Ship it?", askedAt: new Date(Date.now() - 2 * HOURS).toISOString(), timeoutMinutes: 60,
+    } satisfies PendingQuestion);
+    stateStore.set(STATE_KEYS.questionIndex, [key]);
+
+    await runCleanup(ctx, gateway, TEST_CONFIG);
+
+    // Ordering is load-bearing: the wakeup sits in its own try/catch so a
+    // wakeup failure can never leave a live-looking question in Slack.
+    expect(gateway.updates).toHaveLength(1);
+    expect(gateway.updates[0]!.ts).toBe("10.1");
+    expect(stateStore.get(key)).toBeUndefined();
+    expect(stateStore.get(STATE_KEYS.questionIndex)).toEqual([]);
+    expect(ctx.logger.warn).toHaveBeenCalledWith(
+      "Wakeup after Slack question expiry failed",
+      expect.objectContaining({ issueId: "iss-1" }),
+    );
+  });
+
+  it("does not wake anyone for a question still inside its timeout", async () => {
+    const { ctx, stateStore } = makeCtx();
+    const gateway = new FakeGateway();
+    const key = STATE_KEYS.question("C1", "10.1");
+    stateStore.set(key, {
+      channel: "C1", ts: "10.1", issueId: "iss-1", companyId: "co-1", mode: "answer",
+      question: "Q?", askedAt: new Date().toISOString(), timeoutMinutes: 60,
+    } satisfies PendingQuestion);
+    stateStore.set(STATE_KEYS.questionIndex, [key]);
+
+    await runCleanup(ctx, gateway, TEST_CONFIG);
+
+    expect(ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(gateway.updates).toHaveLength(0);
+    expect(stateStore.get(key)).toBeDefined();
+    expect(stateStore.get(STATE_KEYS.questionIndex)).toEqual([key]);
+  });
+
   it("keeps questions still inside their timeout", async () => {
     const { ctx, stateStore } = makeCtx();
     const key = STATE_KEYS.question("C1", "10.1");

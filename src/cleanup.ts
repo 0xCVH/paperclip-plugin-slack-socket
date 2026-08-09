@@ -53,6 +53,25 @@ export async function runCleanup(
           `No Slack response to: "${pending.question}" within ${pending.timeoutMinutes} minutes.`,
           pending.companyId,
         );
+        // Wake the agent that asked. Without this the expiry comment lands
+        // on the issue but nothing runs: per the SDK a plugin-attributed
+        // comment wakes nobody, so the asking agent blocks until some
+        // unrelated wake happens. This mirrors the answered path in
+        // ask-human.ts exactly, including the nested try/catch — a wakeup
+        // failure must NOT stop the Slack message from being struck
+        // through, or the question would sit in the channel looking live
+        // forever.
+        try {
+          await ctx.issues.requestWakeup(pending.issueId, pending.companyId, {
+            reason: "slack_ask_human_timeout",
+            contextSource: "slack-socket.ask-human",
+          });
+        } catch (err) {
+          ctx.logger.warn("Wakeup after Slack question expiry failed", {
+            err: errString(err),
+            issueId: pending.issueId,
+          });
+        }
         await gateway.updateMessage({
           channel: pending.channel,
           ts: pending.ts,
