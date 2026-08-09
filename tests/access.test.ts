@@ -1,5 +1,6 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { checkPostTarget, isUserAllowed } from "../src/access.js";
+import { checkPostTarget, checkToolCompany, isUserAllowed } from "../src/access.js";
 import type { SlackSocketConfig } from "../src/types.js";
 import { DEFAULT_CONFIG } from "../src/constants.js";
 
@@ -124,5 +125,61 @@ describe("checkPostTarget", () => {
   it("never authorizes a user id listed in the channel list", () => {
     const cfg = postConfig({ agentPostChannelIds: ["U-OK"], agentDmUserIds: [] });
     expect(checkPostTarget(cfg, "U-OK").allowed).toBe(false);
+  });
+});
+
+describe("checkToolCompany", () => {
+  it("allows a run whose company matches the bound config", () => {
+    expect(checkToolCompany("co-1", "co-1", "Posting to Slack")).toEqual({ allowed: true });
+  });
+
+  it("refuses a run from a different company", () => {
+    const decision = checkToolCompany("co-1", "co-2", "Posting to Slack");
+    expect(decision.allowed).toBe(false);
+    expect(decision.allowed === false && decision.reason).toBe("Posting to Slack is not authorized for this company.");
+  });
+
+  it("builds the refusal from the action label it is given", () => {
+    const decision = checkToolCompany("co-1", "co-2", "Asking a human via Slack");
+    expect(decision.allowed === false && decision.reason).toBe(
+      "Asking a human via Slack is not authorized for this company.",
+    );
+  });
+
+  it("never names the bound company in the refusal", () => {
+    // The reason string is handed straight back to a caller we have just
+    // established belongs to a different tenant, so it must not disclose
+    // which company this worker serves.
+    for (const label of ["Posting to Slack", "Asking a human via Slack"]) {
+      const decision = checkToolCompany("co-secret-tenant", "co-intruder", label);
+      expect(decision.allowed).toBe(false);
+      expect(decision.allowed === false && decision.reason).not.toContain("co-secret-tenant");
+    }
+  });
+
+  it("fails closed when the worker is not bound to a company yet", () => {
+    // getLiveConfig() returns DEFAULT_CONFIG (companyId "") before any
+    // config arrives; a blank bound company must never match a blank run.
+    expect(checkToolCompany(DEFAULT_CONFIG.companyId, "", "Posting to Slack").allowed).toBe(false);
+    expect(checkToolCompany("   ", "   ", "Posting to Slack").allowed).toBe(false);
+    expect(checkToolCompany("", "co-1", "Posting to Slack").allowed).toBe(false);
+  });
+
+  it("compares exactly — no trimming or case folding of a real company id", () => {
+    expect(checkToolCompany("co-1", "CO-1", "Posting to Slack").allowed).toBe(false);
+    expect(checkToolCompany("co-1", " co-1 ", "Posting to Slack").allowed).toBe(false);
+  });
+});
+
+describe("access.ts purity", () => {
+  it("imports no plugin context, gateway or state plumbing", () => {
+    // The spec pins access.ts as the pure-decision module: it takes no ctx
+    // so every decision here stays trivially unit-testable, and so a
+    // security check can never quietly grow an I/O dependency. Logging and
+    // refusal metrics belong at the call sites.
+    const source = readFileSync(new URL("../src/access.ts", import.meta.url), "utf8");
+    expect(source).not.toContain("@paperclipai/plugin-sdk");
+    expect(source).not.toContain("PluginContext");
+    expect(source).not.toContain("SlackGateway");
   });
 });

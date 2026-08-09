@@ -33,6 +33,48 @@ export function isUserAllowed(allowlist: readonly string[], userId: string): boo
   return normalized.includes(trimmedUser);
 }
 
+/** Decision returned by `checkToolCompany`. */
+export type ToolCompanyDecision = { allowed: true } | { allowed: false; reason: string };
+
+/**
+ * Decides whether a tool invocation may act on this worker's behalf, given the
+ * company the worker's config is bound to and the company of the agent run
+ * that called the tool.
+ *
+ * This worker process is single-tenant (see the module-level comments in
+ * worker.ts around `boundCompanyId`), but that binding is enforced only where
+ * config changes are applied — nothing stops the host from routing an
+ * invocation for a *different* company's agent run into this same process.
+ * Without this check, that run would be authorized against the bound company's
+ * config and would reach the bound company's Slack workspace using the bound
+ * company's bot token.
+ *
+ * Both tool call sites share this one function precisely because a security
+ * check duplicated by hand is a security check that drifts.
+ *
+ * `reason` deliberately names only the action, never the bound company: the
+ * string is handed straight back to a caller we have just established belongs
+ * to a *different* tenant, so it must not leak which company this process
+ * serves.
+ *
+ * A blank `configCompanyId` means the worker is not bound yet (that is
+ * `DEFAULT_CONFIG.companyId`, returned by `getLiveConfig()` before any config
+ * arrives). It fails closed rather than matching a blank run company.
+ */
+export function checkToolCompany(
+  configCompanyId: string,
+  runCompanyId: string,
+  actionLabel: string,
+): ToolCompanyDecision {
+  const refused: ToolCompanyDecision = {
+    allowed: false,
+    reason: `${actionLabel} is not authorized for this company.`,
+  };
+  if (configCompanyId.trim().length === 0) return refused;
+  if (runCompanyId !== configCompanyId) return refused;
+  return { allowed: true };
+}
+
 /**
  * Decision returned by `checkPostTarget`. On `allowed: true`, `target` is the
  * trimmed input with its original case preserved: Slack IDs are case-sensitive
