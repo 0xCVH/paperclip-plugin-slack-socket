@@ -1,13 +1,21 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
+import { checkToolCompany } from "./access.js";
 import { ASK_HUMAN_TOOL_DECLARATION, STATE_KEYS, TOOL_NAMES, stateScope } from "./constants.js";
 import { formatQuestion, formatQuestionResolved } from "./formatters.js";
 import { errString } from "./redact.js";
 import { updateIndex } from "./state-index.js";
-import type { InboundMessage, InboundReaction, PendingQuestion, SlackGateway } from "./types.js";
+import type {
+  InboundMessage,
+  InboundReaction,
+  PendingQuestion,
+  SlackGateway,
+  SlackSocketConfig,
+} from "./types.js";
 
 export interface AskHumanDeps {
   ctx: PluginContext;
   gateway: SlackGateway;
+  getConfig: () => Promise<SlackSocketConfig>;
 }
 
 export interface AskHuman {
@@ -17,7 +25,7 @@ export interface AskHuman {
   handleReaction(reaction: InboundReaction): Promise<void>;
 }
 
-export function createAskHuman({ ctx, gateway }: AskHumanDeps): AskHuman {
+export function createAskHuman({ ctx, gateway, getConfig }: AskHumanDeps): AskHuman {
   // Same-process claim guard against the double-resolution race: two
   // near-simultaneous events for the same pending question (e.g. a reaction
   // and a thread reply, or two overlapping reactions) can both pass the
@@ -73,6 +81,42 @@ export function createAskHuman({ ctx, gateway }: AskHumanDeps): AskHuman {
           if (!question || !target || !mode || !issueId) {
             return { error: "question, target, mode and issueId are required" };
           }
+
+          // getConfig() carries no non-throwing guarantee (it's a plain
+          // Promise-returning function on AskHumanDeps), so a rejection here
+          // must not propagate out of the tool handler — tool handlers never
+          // throw. Wrapped exactly like post-message.ts does it.
+          let config: SlackSocketConfig;
+          try {
+            config = await getConfig();
+          } catch (err) {
+            return { error: `Failed to load Slack configuration: ${errString(err)}` };
+          }
+
+          // Cross-tenant guard. This runs BEFORE anything is posted or
+          // stored, because the damage here is not just an unauthorized
+          // Slack message: `pending.companyId` below is taken from
+          // `runCtx.companyId`, so a foreign run's question would harvest a
+          // human answer out of the bound company's workspace and write it
+          // onto the *foreign* company's issue.
+          const companyDecision = checkToolCompany(
+            config.companyId,
+            runCtx.companyId,
+            "Asking a human via Slack",
+          );
+          if (!companyDecision.allowed) {
+            ctx.logger.warn("ask_human: refusing a call whose company does not match the bound config", {
+              agentId: runCtx.agentId,
+              runId: runCtx.runId,
+            });
+            try {
+              await ctx.metrics.write("slack.questions.refused", 1, { mode });
+            } catch (err) {
+              ctx.logger.warn("Failed to write ask_human metrics", { err: errString(err) });
+            }
+            return { error: companyDecision.reason };
+          }
+
           let posted: { channel: string; ts: string };
           try {
             // "U" is a regular user id; Enterprise Grid's cross-workspace

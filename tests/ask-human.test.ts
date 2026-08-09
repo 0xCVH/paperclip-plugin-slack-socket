@@ -1,15 +1,19 @@
 import { describe, expect, it } from "vitest";
 import { createAskHuman } from "../src/ask-human.js";
 import { STATE_KEYS, TOOL_NAMES } from "../src/constants.js";
-import type { PendingQuestion } from "../src/types.js";
-import { FakeGateway, makeCtx } from "./helpers.js";
+import type { PendingQuestion, SlackSocketConfig } from "../src/types.js";
+import { FakeGateway, makeCtx, TEST_CONFIG } from "./helpers.js";
 
 const RUN_CTX = { agentId: "agent-1", runId: "run-1", companyId: "co-1", projectId: "proj-1" };
 
-function setup() {
-  const bundle = makeCtx();
+function setup(configOverrides: Partial<SlackSocketConfig> = {}) {
+  const bundle = makeCtx(configOverrides);
   const gateway = new FakeGateway();
-  const askHuman = createAskHuman({ ctx: bundle.ctx, gateway });
+  const askHuman = createAskHuman({
+    ctx: bundle.ctx,
+    gateway,
+    getConfig: async () => ({ ...TEST_CONFIG, ...configOverrides }),
+  });
   askHuman.registerTool();
   const toolCall = (bundle.ctx.tools.register as any).mock.calls[0];
   const handler = toolCall[2] as (params: unknown, runCtx: typeof RUN_CTX) => Promise<{ content?: string; error?: string }>;
@@ -134,5 +138,62 @@ describe("ask-human tool", () => {
       expect.objectContaining({ channel: "C1", ts: postedTs, text: expect.stringContaining("could not be tracked") }),
     );
     expect(ctx.logger.error).toHaveBeenCalled();
+  });
+
+  it("refuses a cross-tenant call: nothing posted to Slack and no state written", async () => {
+    const { ctx, gateway, handler, stateStore } = setup();
+    const foreignRunCtx = { agentId: "agent-2", runId: "run-2", companyId: "co-2", projectId: "proj-2" };
+    const result = await handler(
+      { question: "What is the prod DB password rotation date?", target: "C1", mode: "answer", issueId: "iss-9" },
+      foreignRunCtx,
+    );
+    expect(result.error).toBe("Asking a human via Slack is not authorized for this company.");
+    expect(result.error).not.toContain("co-1");
+    expect(gateway.posts).toHaveLength(0);
+    expect(gateway.dmOpens).toHaveLength(0);
+    // A tracked question would harvest the human's answer onto the FOREIGN
+    // company's issue (pending.companyId = runCtx.companyId), so the refusal
+    // has to land before any state is written at all.
+    expect(stateStore.size).toBe(0);
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.questions.refused", 1, { mode: "answer" });
+    expect(ctx.logger.warn).toHaveBeenCalled();
+  });
+
+  it("still asks normally when the run company matches the bound config", async () => {
+    const { ctx, gateway, handler, stateStore } = setup();
+    const result = await handler(
+      { question: "Ship it?", target: "C1", mode: "reaction", issueId: "iss-1" }, RUN_CTX,
+    );
+    expect(result.error).toBeUndefined();
+    expect(gateway.posts).toHaveLength(1);
+    expect(stateStore.get(STATE_KEYS.question("C1", gateway.posts[0]!.ts))).toMatchObject({ companyId: "co-1" });
+    const names = (ctx.metrics.write as any).mock.calls.map((c: unknown[]) => c[0]);
+    expect(names).toContain("slack.questions.asked");
+    expect(names).not.toContain("slack.questions.refused");
+  });
+
+  it("returns an error instead of throwing when getConfig() rejects, without posting", async () => {
+    const bundle = makeCtx();
+    const gateway = new FakeGateway();
+    const askHuman = createAskHuman({
+      ctx: bundle.ctx,
+      gateway,
+      getConfig: async () => { throw new Error("config store unavailable"); },
+    });
+    askHuman.registerTool();
+    const handler = (bundle.ctx.tools.register as any).mock.calls[0][2] as
+      (params: unknown, runCtx: typeof RUN_CTX) => Promise<{ content?: string; error?: string }>;
+
+    let result: { content?: string; error?: string } | undefined;
+    await expect(
+      (async () => {
+        result = await handler(
+          { question: "Ship it?", target: "C1", mode: "reaction", issueId: "iss-1" }, RUN_CTX,
+        );
+      })(),
+    ).resolves.toBeUndefined();
+
+    expect(result?.error).toContain("config store unavailable");
+    expect(gateway.posts).toHaveLength(0);
   });
 });

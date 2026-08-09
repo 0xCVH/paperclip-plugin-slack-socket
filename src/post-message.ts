@@ -1,5 +1,5 @@
 import type { PluginContext, ToolRunContext } from "@paperclipai/plugin-sdk";
-import { checkPostTarget } from "./access.js";
+import { checkPostTarget, checkToolCompany } from "./access.js";
 import { POST_MESSAGE_TOOL_DECLARATION, TOOL_NAMES } from "./constants.js";
 import { escapeMrkdwn } from "./formatters.js";
 import { markdownToMrkdwn } from "./mrkdwn.js";
@@ -46,23 +46,17 @@ export function createPostMessage({ ctx, gateway, getConfig }: PostMessageDeps):
             return { error: `Failed to load Slack posting configuration: ${errString(err)}` };
           }
 
-          // This worker process is single-tenant (see the module-level
-          // comments in worker.ts around `boundCompanyId`), but that binding
-          // is enforced only where config changes are applied — nothing
-          // stops the host from routing an invocation for a *different*
-          // company's agent run into this same process. Without this check,
-          // that run would be authorized against the bound company's
-          // `config` (channel/user allowlists, master switches) and post
-          // into the bound company's Slack workspace using the bound
-          // company's bot token. The refusal message intentionally omits
-          // which company this process is bound to.
-          if (runCtx.companyId !== config.companyId) {
+          // Cross-tenant guard, shared with ask_human — see checkToolCompany
+          // in access.ts for why the host can route another company's run
+          // here at all, and why the refusal names no company.
+          const companyDecision = checkToolCompany(config.companyId, runCtx.companyId, "Posting to Slack");
+          if (!companyDecision.allowed) {
             ctx.logger.warn("slack_post_message: refusing a call whose company does not match the bound config", {
               agentId: runCtx.agentId,
               runId: runCtx.runId,
             });
             await writeMetric("slack.messages.refused", {});
-            return { error: "Posting to Slack is not authorized for this company." };
+            return { error: companyDecision.reason };
           }
 
           const decision = checkPostTarget(config, target);

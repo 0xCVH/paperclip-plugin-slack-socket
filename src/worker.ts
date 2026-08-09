@@ -191,7 +191,7 @@ function ensureCoreModules(ctx: PluginContext): CoreModules {
   const getConfig = async (): Promise<SlackSocketConfig> => getLiveConfig();
 
   const chat = createChat({ ctx, gateway: gatewayProxy, getConfig });
-  const askHuman = createAskHuman({ ctx, gateway: gatewayProxy });
+  const askHuman = createAskHuman({ ctx, gateway: gatewayProxy, getConfig });
   const commands = createCommands({ ctx, gateway: gatewayProxy, getConfig });
   // Both tools register here, from setup()'s clean context, against the
   // gateway proxy — the real gateway doesn't exist until a config arrives.
