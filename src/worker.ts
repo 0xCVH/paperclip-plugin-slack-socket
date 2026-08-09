@@ -595,6 +595,15 @@ export async function applyConfig(
   // apply was in flight would otherwise leave onHealth() reporting a stale
   // conflict even though this bind succeeded.
   tenantConflict = null;
+  // A successful apply proves the bind is good right now, so any watchdog
+  // backoff state from a previous failed recovery attempt is stale. Reset it
+  // here rather than waiting for the next tick to notice: ticks are gated by
+  // `recoveryNotBefore`, which escalates up to 15 minutes, so without this an
+  // operator who fixes a revoked token with a normal config save would still
+  // see onHealth report "recovery attempt N" for up to 15 more minutes even
+  // though the socket is already back up.
+  recoveryAttempts = 0;
+  recoveryNotBefore = 0;
   health = { status: "ok" };
   ctx.logger.info("Slack Socket Mode connected");
   return health;

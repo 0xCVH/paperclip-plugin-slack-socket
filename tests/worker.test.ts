@@ -1025,6 +1025,39 @@ describe("socket watchdog", () => {
     await expect(plugin.definition.onHealth?.()).resolves.toEqual({ status: "ok" });
   });
 
+  it("resets the watchdog's recovery counters on a successful applyConfig, so onHealth reports ok right away instead of waiting out the backoff deadline", async () => {
+    // The bug: recoveryAttempts/recoveryNotBefore were only ever reset by a
+    // watchdog TICK's own success branch, never by applyConfig's success
+    // tail. So an operator who fixes a revoked token with a normal save
+    // (onConfigChanged, not a tick) got a socket that was fully back up —
+    // but onHealth still reported "recovery attempt N" for up to another 15
+    // minutes, until the next tick happened to land and re-succeed.
+    const { default: plugin, socketWatchdogTick } = await loadWorker();
+    const { ctx } = makeCtx();
+    (ctx.secrets.resolve as any).mockImplementation(async (ref: string) =>
+      ref === "ref-bot" ? "THROW_ON_START" : `secret-${ref}`,
+    );
+    await plugin.definition.setup(ctx);
+    await plugin.definition.onConfigChanged!(cfg());
+    expect(boltGatewayInstances).toHaveLength(1);
+
+    // A failed watchdog recovery attempt increments recoveryAttempts and
+    // pushes recoveryNotBefore out ~1 minute.
+    await socketWatchdogTick(ctx, 0);
+    await expect(plugin.definition.onHealth?.()).resolves.toEqual({
+      status: "degraded",
+      message: "Slack Socket Mode disconnected; recovery attempt 1",
+    });
+
+    // The operator rotates the secret and saves — a normal onConfigChanged
+    // call, deliberately NOT another watchdog tick, so this only exercises
+    // applyConfig's own success path.
+    (ctx.secrets.resolve as any).mockImplementation(async (ref: string) => `secret-${ref}`);
+    await plugin.definition.onConfigChanged!(cfg({ defaultChannelId: "C-FIXED" }));
+
+    await expect(plugin.definition.onHealth?.()).resolves.toEqual({ status: "ok" });
+  });
+
   it("recoveryInFlight blocks a second, concurrent tick from ever touching probe() while the first is still parked there", async () => {
     // Nothing else pins this guard: deleting it leaves every other worker
     // test green, even though its failure mode is two overlapping recovery
