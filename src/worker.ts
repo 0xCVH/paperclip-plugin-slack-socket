@@ -176,6 +176,106 @@ function startConfigPump(ctx: PluginContext, makeGateway: GatewayFactory): void 
   })();
 }
 
+// --- Socket Mode watchdog -------------------------------------------------
+//
+// Bolt's socket-mode client stops reconnecting on unrecoverable failures
+// (invalid/revoked/rotated token, exhausted network retries), and a
+// `gateway.start()` that threw leaves `currentGateway` holding a DEAD,
+// NON-NULL gateway — it is assigned just before the try/catch in
+// `applyConfig`. Nothing else in this process ever retries, so without this
+// poll the plugin sits degraded until an operator re-saves config by hand.
+// The liveness check therefore probes rather than testing for a missing
+// gateway, and it does not rest on `isConnected()` alone — that flag is fed
+// by listeners attached to Bolt's private receiver internals with optional
+// chaining, so it would silently never flip if Bolt's shape changed.
+//
+// RECOVERY GOES THROUGH THE PUMP AND NEVER CALLS `applyConfig` DIRECTLY.
+// See the "Config apply pump" comment above for the full reasoning: a timer
+// callback that constructed the gateway itself would build it inside
+// whatever AsyncLocalStorage store happened to be active, after which every
+// Slack event would echo the id of an invocation the host finished long ago
+// and be denied with "unknown invocation scope". Enqueueing keeps gateway
+// construction inside the pump's clean store. Re-applying also re-resolves
+// both secret refs, so a rotated token is picked up without an operator save.
+const SOCKET_WATCHDOG_INTERVAL_MS = 60_000;
+const RECOVERY_BACKOFF_MS: readonly number[] = [60_000, 120_000, 240_000, 480_000, 900_000];
+
+let watchdogStarted = false;
+let recoveryInFlight = false;
+let recoveryAttempts = 0;
+let recoveryNotBefore = 0;
+
+/** 1m -> 2m -> 4m -> 8m -> 15m, then flat at the 15m cap. */
+function backoffFor(attempt: number): number {
+  return RECOVERY_BACKOFF_MS[Math.min(Math.max(attempt, 1), RECOVERY_BACKOFF_MS.length) - 1];
+}
+
+/**
+ * One watchdog poll. Exported as a test seam (same precedent as
+ * `startRuntime`) so tests can drive ticks deterministically with an
+ * injected clock instead of waiting out a 60s interval.
+ */
+export async function socketWatchdogTick(ctx: PluginContext, now: number = Date.now()): Promise<void> {
+  // Captured up front so the rest of this function works against one
+  // consistent config even though `liveConfig` can be replaced by an
+  // operator save while we're awaiting.
+  const cfg = liveConfig;
+  // Nothing to recover to before a config has ever applied; never re-enter;
+  // never race the pump — a queued apply is about to rebuild the gateway
+  // anyway; and honor the backoff deadline.
+  if (!cfg || recoveryInFlight || applyQueue.length > 0 || now < recoveryNotBefore) return;
+
+  recoveryInFlight = true;
+  try {
+    const gateway = currentGateway;
+    const alive = gateway !== null && gateway.isConnected() && (await gateway.probe());
+    if (alive) {
+      recoveryAttempts = 0;
+      recoveryNotBefore = 0;
+      return;
+    }
+
+    const attempt = (recoveryAttempts += 1);
+    ctx.logger.warn("Slack Socket Mode looks dead; re-applying the live config to recover", { attempt });
+    await ctx.metrics.write("slack.socket.recovery.attempted", 1, { attempt: String(attempt) }).catch(() => {});
+
+    await new Promise<void>((resolve) => {
+      applyQueue.push({ cfg, done: resolve });
+      signalPump();
+    });
+
+    if (health.status === "ok") {
+      recoveryAttempts = 0;
+      recoveryNotBefore = 0;
+      ctx.logger.info("Slack Socket Mode recovered", { attempt });
+      await ctx.metrics.write("slack.socket.recovery.succeeded", 1, { attempt: String(attempt) }).catch(() => {});
+    } else {
+      recoveryNotBefore = now + backoffFor(attempt);
+      await ctx.metrics.write("slack.socket.recovery.failed", 1, { attempt: String(attempt) }).catch(() => {});
+    }
+  } finally {
+    recoveryInFlight = false;
+  }
+}
+
+/**
+ * Starts the single, process-lifetime Socket Mode watchdog. Must be called
+ * exactly once, from `setup()` — the same clean-ALS-store reasoning as
+ * `startConfigPump`. Guarded by `watchdogStarted` for idempotency, and the
+ * interval is unref'd so a 60s poll can never hold the process (or a test
+ * run) open.
+ */
+export function startSocketWatchdog(ctx: PluginContext): void {
+  if (watchdogStarted) return;
+  watchdogStarted = true;
+  const timer = setInterval(() => {
+    void socketWatchdogTick(ctx).catch((err) => {
+      ctx.logger.warn("Slack Socket Mode watchdog tick failed", { err: errString(err) });
+    });
+  }, SOCKET_WATCHDOG_INTERVAL_MS);
+  timer.unref();
+}
+
 // Registration that must happen exactly once per worker process regardless
 // of company: the ask_human tool registration and (from setup()) the
 // cleanup job. All of it is wired against a gateway *proxy* (see
@@ -440,6 +540,7 @@ const plugin = definePlugin({
       await runCleanup(ctx, gatewayProxy, getLiveConfig());
     });
     startConfigPump(ctx, (opts) => new BoltGateway({ ...opts, logger: ctx.logger }));
+    startSocketWatchdog(ctx);
   },
 
   // Never calls `applyConfig` (and therefore never constructs the gateway)
@@ -462,6 +563,16 @@ const plugin = definePlugin({
   async onHealth() {
     if (tenantConflict) return { status: "degraded", message: tenantConflict };
     if (!liveConfig) return { status: "degraded", message: "Waiting for configuration" };
+    // Reported ahead of `health` on purpose: while the watchdog is backing
+    // off, "recovery attempt N" is what an operator needs to see — that the
+    // socket is dead AND that it is being retried — not just the apply error
+    // left behind by the most recent failed attempt.
+    if (recoveryAttempts > 0) {
+      return {
+        status: "degraded",
+        message: `Slack Socket Mode disconnected; recovery attempt ${recoveryAttempts}`,
+      };
+    }
     if (health.status !== "ok") return health;
     if (currentGateway && !currentGateway.isConnected()) {
       return { status: "degraded", message: "Slack Socket Mode disconnected; Bolt is reconnecting" };

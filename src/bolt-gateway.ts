@@ -174,6 +174,19 @@ export class BoltGateway implements SlackGateway {
   isConnected(): boolean { return this.connected; }
   botUserId(): string | undefined { return this.botId; }
 
+  async probe(): Promise<boolean> {
+    // Plain HTTP against the same client `start()` uses, so it does not need
+    // the socket to be up. Any failure at all — network, revoked token,
+    // rotated token — reads as "not alive"; the watchdog's job is to re-apply
+    // the config, which re-resolves both secret refs.
+    try {
+      const auth = await this.app.client.auth.test();
+      return auth.ok === true;
+    } catch {
+      return false;
+    }
+  }
+
   async postMessage(msg: OutboundMessage): Promise<{ channel: string; ts: string }> {
     const res = await this.app.client.chat.postMessage({
       channel: msg.channel,

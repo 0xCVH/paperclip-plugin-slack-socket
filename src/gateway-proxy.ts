@@ -66,6 +66,15 @@ export function createGatewayProxy(
       return getGateway()?.botUserId();
     },
 
+    async probe() {
+      const gateway = getGateway();
+      if (!gateway) {
+        warnUnconfigured("probe");
+        return false;
+      }
+      return gateway.probe();
+    },
+
     async postMessage(msg: OutboundMessage) {
       const gateway = getGateway();
       if (!gateway) {
