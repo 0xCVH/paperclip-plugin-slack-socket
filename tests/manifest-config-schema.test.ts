@@ -110,6 +110,33 @@ describe("instanceConfigSchema vs the host settings form", () => {
     expect(result.valid).toBe(true);
   });
 
+  it("accepts turnTimeoutMinutes and defaults it to 10", () => {
+    const result = validateInstanceConfig({
+      ...baseConfig,
+      slackBotTokenRef: SECRET_REF,
+      slackAppTokenRef: SECRET_REF,
+      turnTimeoutMinutes: 5,
+    });
+    expect(result.errors).toEqual([]);
+    expect(result.valid).toBe(true);
+
+    const schema = manifest.instanceConfigSchema as {
+      properties: Record<string, { default?: unknown }>;
+    };
+    expect(schema.properties.turnTimeoutMinutes?.default).toBe(10);
+  });
+
+  it("rejects a non-numeric turnTimeoutMinutes", () => {
+    const result = validateInstanceConfig({
+      ...baseConfig,
+      slackBotTokenRef: SECRET_REF,
+      slackAppTokenRef: SECRET_REF,
+      turnTimeoutMinutes: "10",
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContainEqual({ field: "/turnTimeoutMinutes", message: "must be number" });
+  });
+
   it("still rejects a config missing required fields", () => {
     const result = validateInstanceConfig({ slackBotTokenRef: SECRET_REF });
     expect(result.valid).toBe(false);

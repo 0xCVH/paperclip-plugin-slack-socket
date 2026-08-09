@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildChatPrompt, createChat, extractReply, filterRuntimeNoticeLines } from "../src/chat.js";
 import { DEFAULT_CHAT_PROMPT_PREAMBLE, REPLY_CLOSE_TAG, REPLY_OPEN_TAG, STATE_KEYS } from "../src/constants.js";
 import { FakeGateway, makeCtx, TEST_CONFIG } from "./helpers.js";
@@ -494,6 +494,259 @@ describe("extractReply", () => {
     const answer = "Hey! What's up? How can I help you today";
     const input = `${narration}${REPLY_OPEN_TAG}${answer}${REPLY_CLOSE_TAG}`;
     expect(extractReply(input)).toBe(answer);
+  });
+});
+
+describe("turn watchdog", () => {
+  // The only fake-timer tests in the suite. A stalled turn is *defined* by a
+  // timer firing, and the production default is 10 real minutes, so there is
+  // nothing else to drive it with.
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const TURN_TIMEOUT_MS = 50;
+  const TIMEOUT_NOTICE =
+    "⏳ No response from the agent after 10m — it may still be working. Mention me again to retry.";
+
+  function setupWatchdog(configOverrides = {}) {
+    const bundle = makeCtx(configOverrides);
+    const gateway = new FakeGateway();
+    const chat = createChat({
+      ctx: bundle.ctx,
+      gateway,
+      getConfig: async () => ({ ...TEST_CONFIG, ...configOverrides }),
+      updateIntervalMs: 0,
+      // Milliseconds, not minutes: only the timer duration is injected, so
+      // the test doesn't wait 10 minutes. The notice still names the
+      // configured turnTimeoutMinutes — see the assertions below.
+      turnTimeoutMs: TURN_TIMEOUT_MS,
+    });
+    return { ...bundle, gateway, chat };
+  }
+
+  // The watchdog is surface-independent, so these tests drive it through a
+  // channel @mention: channel threading is fixed by design and won't shift
+  // under later session-scoping changes.
+  const mention = (text: string, ts: string) => ({
+    channel: "C1", channelType: "channel" as const, user: "U1", text: `<@UBOT> ${text}`, ts,
+  });
+
+  const silentRun = (ctx: { agents: { sessions: { sendMessage: unknown } } }) => {
+    (ctx.agents.sessions.sendMessage as any).mockImplementationOnce(async () => ({ runId: "run-1" }));
+  };
+
+  it("settles a turn whose event stream never delivers anything and rewrites the placeholder", async () => {
+    vi.useFakeTimers();
+    const { ctx, gateway, chat } = setupWatchdog();
+    // The host accepted the run and then went silent — no chunk, no status,
+    // no done, no error. This is the defect: with nothing to settle on, the
+    // placeholder said "_Thinking…_" forever and converse never returned.
+    silentRun(ctx as any);
+
+    const turn = chat.handleMention(mention("hi", "1200.1"));
+    // Let the placeholder post and the watchdog arm before the clock moves.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(gateway.posts).toHaveLength(1);
+    expect(gateway.posts[0]!.text).toBe("_Thinking…_");
+    expect(gateway.updates).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(TURN_TIMEOUT_MS);
+    await turn;
+
+    expect(gateway.updates).toHaveLength(1);
+    expect(gateway.updates[0]!.ts).toBe(gateway.posts[0]!.ts);
+    expect(gateway.updates[0]!.text).toBe(TIMEOUT_NOTICE);
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.turns.timedout", 1);
+  });
+
+  it("names the configured timeout in minutes, not the injected milliseconds", async () => {
+    vi.useFakeTimers();
+    const { ctx, gateway, chat } = setupWatchdog({ turnTimeoutMinutes: 3 });
+    silentRun(ctx as any);
+
+    const turn = chat.handleMention(mention("hi", "1201.1"));
+    await vi.advanceTimersByTimeAsync(TURN_TIMEOUT_MS);
+    await turn;
+
+    expect(gateway.updates.at(-1)!.text).toBe(
+      "⏳ No response from the agent after 3m — it may still be working. Mention me again to retry.",
+    );
+  });
+
+  it("keeps the watchdog alive while events keep arriving", async () => {
+    vi.useFakeTimers();
+    const { ctx, gateway, chat } = setupWatchdog();
+    (ctx.agents.sessions.sendMessage as any).mockImplementationOnce(
+      async (_sessionId: string, _companyId: string, opts: { onEvent?: (e: unknown) => void }) => {
+        // Four status events, each landing before the previous deadline.
+        // Total elapsed (4 × 40ms) is well past the 50ms timeout, so this
+        // only stays alive if every event resets the timer.
+        for (let seq = 1; seq <= 4; seq += 1) {
+          setTimeout(() => {
+            opts.onEvent?.({
+              sessionId: "sess-1", runId: "run-1", seq,
+              eventType: "status", stream: "system", message: "working", payload: null,
+            });
+          }, seq * 40);
+        }
+        setTimeout(() => {
+          opts.onEvent?.({
+            sessionId: "sess-1", runId: "run-1", seq: 5,
+            eventType: "done", stream: null, message: "Took a while, but here you go.", payload: null,
+          });
+        }, 190);
+        return { runId: "run-1" };
+      },
+    );
+
+    const turn = chat.handleMention(mention("hi", "1202.1"));
+    await vi.advanceTimersByTimeAsync(200);
+    await turn;
+
+    expect(gateway.updates).toHaveLength(1);
+    expect(gateway.updates[0]!.text).toBe("Took a while, but here you go.");
+    expect(ctx.metrics.write).not.toHaveBeenCalledWith("slack.turns.timedout", 1);
+  });
+
+  it("ignores an error event that arrives after the timeout, leaving the notice in place", async () => {
+    vi.useFakeTimers();
+    const { ctx, gateway, chat } = setupWatchdog();
+    (ctx.agents.sessions.sendMessage as any).mockImplementationOnce(
+      async (_sessionId: string, _companyId: string, opts: { onEvent?: (e: unknown) => void }) => {
+        setTimeout(() => {
+          opts.onEvent?.({
+            sessionId: "sess-1", runId: "run-1", seq: 1,
+            eventType: "error", stream: null, message: "agent crashed", payload: null,
+          });
+        }, TURN_TIMEOUT_MS * 4);
+        return { runId: "run-1" };
+      },
+    );
+
+    const turn = chat.handleMention(mention("hi", "1203.1"));
+    await vi.advanceTimersByTimeAsync(TURN_TIMEOUT_MS);
+    await turn;
+    expect(gateway.updates).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(TURN_TIMEOUT_MS * 4);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Nothing may double-post over a notice the person has already read.
+    expect(gateway.updates).toHaveLength(1);
+    expect(gateway.updates[0]!.text).toBe(TIMEOUT_NOTICE);
+    expect(gateway.posts).toHaveLength(1);
+  });
+
+  it("never lets a late streamed chunk overwrite the timeout notice", async () => {
+    vi.useFakeTimers();
+    const { ctx, gateway, chat } = setupWatchdog({ streamPartialReplies: true });
+    (ctx.agents.sessions.sendMessage as any).mockImplementationOnce(
+      async (_sessionId: string, _companyId: string, opts: { onEvent?: (e: unknown) => void }) => {
+        setTimeout(() => {
+          opts.onEvent?.({
+            sessionId: "sess-1", runId: "run-1", seq: 1,
+            eventType: "chunk", stream: "stdout", message: "half an answer", payload: null,
+          });
+        }, TURN_TIMEOUT_MS * 4);
+        return { runId: "run-1" };
+      },
+    );
+
+    const turn = chat.handleMention(mention("hi", "1204.1"));
+    await vi.advanceTimersByTimeAsync(TURN_TIMEOUT_MS);
+    await turn;
+
+    await vi.advanceTimersByTimeAsync(TURN_TIMEOUT_MS * 4);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(gateway.updates).toHaveLength(1);
+    expect(gateway.updates[0]!.text).toBe(TIMEOUT_NOTICE);
+  });
+
+  it("leaves a normal fast turn untouched and arms no surviving timer", async () => {
+    vi.useFakeTimers();
+    const { ctx, gateway, chat } = setupWatchdog();
+    // The default sendMessage mock (helpers.ts) delivers chunk + done
+    // synchronously, so the turn finishes long before the watchdog.
+    await chat.handleMention(mention("hi", "1205.1"));
+
+    expect(gateway.updates).toHaveLength(1);
+    expect(gateway.updates[0]!.text).toBe("Hello there!");
+    expect(ctx.metrics.write).not.toHaveBeenCalledWith("slack.turns.timedout", 1);
+
+    // A watchdog timer surviving a completed turn would fire here and
+    // overwrite a reply the person has already read.
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(TURN_TIMEOUT_MS * 10);
+    expect(gateway.updates).toHaveLength(1);
+    expect(gateway.updates[0]!.text).toBe("Hello there!");
+  });
+
+  it("posts a done that arrives after the timeout as a new message instead of overwriting the notice", async () => {
+    vi.useFakeTimers();
+    const { ctx, gateway, chat } = setupWatchdog();
+    (ctx.agents.sessions.sendMessage as any).mockImplementationOnce(
+      async (_sessionId: string, _companyId: string, opts: { onEvent?: (e: unknown) => void }) => {
+        setTimeout(() => {
+          opts.onEvent?.({
+            sessionId: "sess-1", runId: "run-1", seq: 1,
+            eventType: "done", stream: null,
+            message: "Sorry, that took a while. Here it is.", payload: null,
+          });
+        }, TURN_TIMEOUT_MS * 4);
+        return { runId: "run-1" };
+      },
+    );
+
+    const turn = chat.handleMention(mention("hi", "1300.1"));
+    await vi.advanceTimersByTimeAsync(TURN_TIMEOUT_MS);
+    await turn;
+    expect(gateway.updates.at(-1)!.text).toBe(TIMEOUT_NOTICE);
+
+    await vi.advanceTimersByTimeAsync(TURN_TIMEOUT_MS * 4);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The notice the person already read is untouched...
+    expect(gateway.updates).toHaveLength(1);
+    expect(gateway.updates[0]!.text).toBe(TIMEOUT_NOTICE);
+    // ...and the agent's real answer still lands, in the same thread.
+    expect(gateway.posts).toHaveLength(2);
+    expect(gateway.posts[1]!.threadTs).toBe("1300.1");
+    expect(gateway.posts[1]!.text).toContain("Late reply");
+    expect(gateway.posts[1]!.text).toContain("Sorry, that took a while. Here it is.");
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.turns.late_reply", 1);
+  });
+
+  it("extracts and escapes a late reply exactly like an on-time one", async () => {
+    vi.useFakeTimers();
+    const { ctx, gateway, chat } = setupWatchdog();
+    (ctx.agents.sessions.sendMessage as any).mockImplementationOnce(
+      async (_sessionId: string, _companyId: string, opts: { onEvent?: (e: unknown) => void }) => {
+        setTimeout(() => {
+          opts.onEvent?.({
+            sessionId: "sess-1", runId: "run-1", seq: 1,
+            eventType: "done", stream: null,
+            message: `Narrating first.${REPLY_OPEN_TAG}**bold** <!channel>${REPLY_CLOSE_TAG}`,
+            payload: null,
+          });
+        }, TURN_TIMEOUT_MS * 4);
+        return { runId: "run-1" };
+      },
+    );
+
+    const turn = chat.handleMention(mention("hi", "1301.1"));
+    await vi.advanceTimersByTimeAsync(TURN_TIMEOUT_MS);
+    await turn;
+    await vi.advanceTimersByTimeAsync(TURN_TIMEOUT_MS * 4);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const late = gateway.posts[1]!.text;
+    expect(late).not.toContain("Narrating first.");
+    expect(late).toContain("*bold*");
+    // The late path must not become a hole in the mention-escaping pipeline.
+    expect(late).toContain("&lt;!channel&gt;");
+    expect(late).not.toContain("<!channel>");
   });
 });
 

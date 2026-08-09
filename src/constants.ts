@@ -120,6 +120,7 @@ export const DEFAULT_CONFIG: SlackSocketConfig = {
   paperclipApiKeyRef: "",
   paperclipBaseUrl: "http://localhost:3010",
   sessionIdleHours: 24,
+  turnTimeoutMinutes: 10,
   streamPartialReplies: false,
   chatPromptPreamble: DEFAULT_CHAT_PROMPT_PREAMBLE,
   allowedSlackUserIds: [],
