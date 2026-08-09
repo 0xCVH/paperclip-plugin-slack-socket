@@ -1,5 +1,8 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
+import { resetSession } from "./chat.js";
+import { CHANNEL_SESSION_TS, RESET_KEYWORD, STATE_KEYS } from "./constants.js";
 import { errString } from "./redact.js";
+import { isDmChannelId } from "./slack-ids.js";
 import type { InboundCommand, SlackGateway, SlackSocketConfig } from "./types.js";
 
 export interface CommandDeps {
@@ -15,6 +18,7 @@ export interface Commands {
 const HELP = [
   "*Paperclip commands*",
   "• `/paperclip issue <title>` — create a Paperclip issue",
+  "• `/paperclip reset` — start a fresh conversation in this DM",
   "• `/paperclip help` — show this help",
 ].join("\n");
 
@@ -23,8 +27,48 @@ export function createCommands({ ctx, gateway, getConfig }: CommandDeps): Comman
     async handleCommand(cmd) {
       const cfg = await getConfig();
       const [sub, ...rest] = cmd.text.trim().split(/\s+/);
-      const subcommand = sub === "issue" ? "issue" : "help";
+      const subcommand = sub === "issue" || sub === RESET_KEYWORD ? sub : "help";
       await ctx.metrics.write("slack.commands.invoked", 1, { subcommand }).catch(() => {});
+
+      if (sub === RESET_KEYWORD) {
+        if (!isDmChannelId(cmd.channel)) {
+          // Every channel session is thread-scoped by design and a slash
+          // command cannot see which thread you are in, so there is nothing
+          // this could correctly target. Point at the mechanism that works
+          // rather than reporting a misleading "no session to reset".
+          await gateway.postEphemeral({
+            channel: cmd.channel,
+            user: cmd.user,
+            text:
+              "In a channel, each conversation lives in its own thread, and a slash command can't tell which " +
+              "thread you're in. Mention me with `reset` in the thread you want to clear instead: `@Paperclip reset`.",
+          });
+          return;
+        }
+        const key = STATE_KEYS.session(cmd.channel, CHANNEL_SESSION_TS);
+        let cleared: boolean;
+        try {
+          cleared = await resetSession(ctx, cfg, key, "command");
+        } catch (err) {
+          ctx.logger.warn("Slash reset failed", { err: errString(err), channel: cmd.channel });
+          await ctx.metrics.write("slack.commands.failed", 1, { subcommand }).catch(() => {});
+          await gateway.postEphemeral({
+            channel: cmd.channel,
+            user: cmd.user,
+            text: ":x: Failed to reset the conversation. Check the plugin configuration.",
+          });
+          return;
+        }
+        await gateway.postEphemeral({
+          channel: cmd.channel,
+          user: cmd.user,
+          text: cleared
+            ? ":broom: Conversation reset — the next message starts fresh."
+            : "Nothing to reset — this conversation is already fresh.",
+        });
+        return;
+      }
+
       if (sub === "issue") {
         const title = rest.join(" ").trim();
         if (!title) {
