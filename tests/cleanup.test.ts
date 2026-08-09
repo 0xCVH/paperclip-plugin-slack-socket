@@ -8,7 +8,7 @@ const HOURS = 3_600_000;
 
 function session(threadTs: string, ageMs: number): SessionEntry {
   return {
-    sessionId: `sess-${threadTs}`, channel: "C1", threadTs,
+    sessionId: `sess-${threadTs}`, channel: "C1", threadTs, scope: "thread",
     lastActivityAt: new Date(Date.now() - ageMs).toISOString(),
   };
 }

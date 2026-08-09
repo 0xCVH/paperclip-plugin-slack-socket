@@ -1,6 +1,19 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildChatPrompt, createChat, extractReply, filterRuntimeNoticeLines } from "../src/chat.js";
-import { DEFAULT_CHAT_PROMPT_PREAMBLE, REPLY_CLOSE_TAG, REPLY_OPEN_TAG, STATE_KEYS } from "../src/constants.js";
+import {
+  buildChatPrompt,
+  createChat,
+  extractReply,
+  filterRuntimeNoticeLines,
+  resolveSessionScope,
+} from "../src/chat.js";
+import {
+  CHANNEL_SESSION_TS,
+  DEFAULT_CHAT_PROMPT_PREAMBLE,
+  REPLY_CLOSE_TAG,
+  REPLY_OPEN_TAG,
+  STATE_KEYS,
+} from "../src/constants.js";
+import type { InboundMessage } from "../src/types.js";
 import { FakeGateway, makeCtx, TEST_CONFIG } from "./helpers.js";
 
 function setup(configOverrides = {}) {
@@ -20,8 +33,8 @@ const dm = (text: string, ts: string, threadTs?: string) => ({
 });
 
 describe("chat", () => {
-  it("creates a session for a new DM thread and posts the agent reply", async () => {
-    const { ctx, gateway, chat, stateStore } = setup();
+  it("creates a session for a new DM thread and posts the agent reply (dmSessionMode: thread)", async () => {
+    const { ctx, gateway, chat, stateStore } = setup({ dmSessionMode: "thread" });
     await chat.handleMessage(dm("hi", "100.1"));
     expect(ctx.agents.sessions.create).toHaveBeenCalledWith("agent-1", "co-1", expect.anything());
     // placeholder post then updated with the final reply
@@ -32,7 +45,7 @@ describe("chat", () => {
   });
 
   it("reuses the session for a reply in the same thread", async () => {
-    const { ctx, chat } = setup();
+    const { ctx, chat } = setup({ dmSessionMode: "thread" });
     await chat.handleMessage(dm("hi", "100.1"));
     await chat.handleMessage(dm("again", "100.2", "100.1"));
     expect(ctx.agents.sessions.create).toHaveBeenCalledTimes(1);
@@ -188,7 +201,7 @@ describe("chat", () => {
   });
 
   it("splits a long final reply: placeholder gets the first chunk, the remainder posts as additional thread messages", async () => {
-    const { ctx, gateway, chat } = setup();
+    const { ctx, gateway, chat } = setup({ dmSessionMode: "thread" });
     const longText = "a".repeat(9000);
     (ctx.agents.sessions.sendMessage as any).mockImplementationOnce(
       async (_sessionId: string, _companyId: string, opts: { onEvent?: (e: unknown) => void }) => {
@@ -269,7 +282,7 @@ describe("chat", () => {
   });
 
   it("creates only one session when two first messages race in the same thread", async () => {
-    const { ctx, chat } = setup();
+    const { ctx, chat } = setup({ dmSessionMode: "thread" });
     await Promise.all([
       chat.handleMessage(dm("first", "700.1")),
       chat.handleMessage(dm("second", "700.2", "700.1")),
@@ -765,5 +778,234 @@ describe("wake reason", () => {
     });
     const call = (bundle.ctx.agents.sessions.sendMessage as any).mock.calls[0];
     expect(call[2].reason).toBe("slack_chat_message");
+  });
+});
+
+describe("resolveSessionScope", () => {
+  const im = (ts: string, threadTs?: string): InboundMessage => ({
+    channel: "D1", channelType: "im", user: "U1", text: "hi", ts, threadTs,
+  });
+  const chan = (ts: string, threadTs?: string): InboundMessage => ({
+    channel: "C1", channelType: "channel", user: "U1", text: "hi", ts, threadTs,
+  });
+
+  it('row 1 — a top-level 1:1 DM in mode "channel" is one conversation, replied to top-level', () => {
+    expect(resolveSessionScope(im("100.1"), "channel")).toEqual({
+      key: "session:D1:main",
+      scope: "channel",
+      replyThreadTs: undefined,
+    });
+  });
+
+  it("row 2 — a 1:1 DM inside a thread keeps its own thread-scoped session and a threaded reply", () => {
+    expect(resolveSessionScope(im("100.3", "100.2"), "channel")).toEqual({
+      key: "session:D1:100.2",
+      scope: "thread",
+      replyThreadTs: "100.2",
+    });
+  });
+
+  it("row 3 — a non-im channel is always thread-scoped and threaded, top-level or not", () => {
+    expect(resolveSessionScope(chan("50.1"), "channel")).toEqual({
+      key: "session:C1:50.1",
+      scope: "thread",
+      replyThreadTs: "50.1",
+    });
+    expect(resolveSessionScope(chan("50.3", "50.1"), "channel")).toEqual({
+      key: "session:C1:50.1",
+      scope: "thread",
+      replyThreadTs: "50.1",
+    });
+  });
+
+  it("row 3 — a group DM is a non-im channel and is unaffected by the DM mode", () => {
+    const groupDm: InboundMessage = {
+      channel: "G1", channelType: "group", user: "U1", text: "hi", ts: "60.1",
+    };
+    expect(resolveSessionScope(groupDm, "channel")).toEqual({
+      key: "session:G1:60.1",
+      scope: "thread",
+      replyThreadTs: "60.1",
+    });
+  });
+
+  it('mode "thread" restores the pre-0.10.0 DM behavior byte for byte', () => {
+    expect(resolveSessionScope(im("100.1"), "thread")).toEqual({
+      key: "session:D1:100.1",
+      scope: "thread",
+      replyThreadTs: "100.1",
+    });
+    expect(resolveSessionScope(im("100.3", "100.2"), "thread")).toEqual({
+      key: "session:D1:100.2",
+      scope: "thread",
+      replyThreadTs: "100.2",
+    });
+  });
+
+  it("keys the channel-scoped DM off the shared CHANNEL_SESSION_TS sentinel", () => {
+    expect(resolveSessionScope(im("100.1"), "channel").key).toBe(
+      STATE_KEYS.session("D1", CHANNEL_SESSION_TS),
+    );
+  });
+
+  it("is pure: two arguments only, mutates nothing, stable across calls", () => {
+    const msg = im("100.1");
+    const snapshot = JSON.stringify(msg);
+    const first = resolveSessionScope(msg, "channel");
+    const second = resolveSessionScope(msg, "channel");
+    expect(second).toEqual(first);
+    expect(JSON.stringify(msg)).toBe(snapshot);
+    // No PluginContext, no gateway, no clock — the scoping rule must stay
+    // unit-testable without any host plumbing.
+    expect(resolveSessionScope.length).toBe(2);
+  });
+});
+
+describe("1:1 DM continuity (dmSessionMode)", () => {
+  it("keeps ONE session across three consecutive top-level DM messages and replies top-level", async () => {
+    const { ctx, gateway, chat, stateStore } = setup();
+    await chat.handleMessage(dm("first", "100.1"));
+    await chat.handleMessage(dm("second", "100.2"));
+    await chat.handleMessage(dm("third", "100.3"));
+
+    // The whole point of the fix: the third message reaches the agent with
+    // the first two still in its context.
+    expect(ctx.agents.sessions.create).toHaveBeenCalledTimes(1);
+    expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledTimes(3);
+    for (const call of (ctx.agents.sessions.sendMessage as any).mock.calls) {
+      expect(call[0]).toBe("sess-1");
+    }
+
+    // A DM reply is a chat message, not a one-message thread.
+    expect(gateway.posts).toHaveLength(3);
+    for (const post of gateway.posts) expect(post.threadTs).toBeUndefined();
+
+    const key = STATE_KEYS.session("D1", CHANNEL_SESSION_TS);
+    expect(stateStore.get(key)).toBeTruthy();
+    expect(stateStore.get(STATE_KEYS.sessionIndex)).toEqual([key]);
+  });
+
+  it("stores the resolved scope on the entry so it is self-describing", async () => {
+    const { chat, stateStore } = setup();
+    await chat.handleMessage(dm("hi", "110.1"));
+    await chat.handleMention({
+      channel: "C1", channelType: "channel", user: "U1", text: "<@UBOT> hi", ts: "111.1",
+    });
+    expect(stateStore.get(STATE_KEYS.session("D1", CHANNEL_SESSION_TS))).toMatchObject({
+      scope: "channel",
+      channel: "D1",
+    });
+    expect(stateStore.get(STATE_KEYS.session("C1", "111.1"))).toMatchObject({
+      scope: "thread",
+      channel: "C1",
+      threadTs: "111.1",
+    });
+  });
+
+  it("still gives a DM message inside a thread its own thread-scoped session", async () => {
+    const { ctx, gateway, chat, stateStore } = setup();
+    await chat.handleMessage(dm("top level", "200.1"));
+    await chat.handleMessage(dm("in a thread", "200.3", "200.2"));
+
+    expect(ctx.agents.sessions.create).toHaveBeenCalledTimes(2);
+    expect(stateStore.get(STATE_KEYS.session("D1", CHANNEL_SESSION_TS))).toBeTruthy();
+    expect(stateStore.get(STATE_KEYS.session("D1", "200.2"))).toBeTruthy();
+    expect(gateway.posts[0]!.threadTs).toBeUndefined();
+    expect(gateway.posts[1]!.threadTs).toBe("200.2");
+  });
+
+  it('with dmSessionMode "thread", reproduces the pre-0.10.0 DM behavior exactly', async () => {
+    const { ctx, gateway, chat, stateStore } = setup({ dmSessionMode: "thread" });
+    await chat.handleMessage(dm("first", "300.1"));
+    await chat.handleMessage(dm("second", "300.2"));
+
+    expect(ctx.agents.sessions.create).toHaveBeenCalledTimes(2);
+    expect(gateway.posts[0]!.threadTs).toBe("300.1");
+    expect(gateway.posts[1]!.threadTs).toBe("300.2");
+    expect(stateStore.get(STATE_KEYS.session("D1", "300.1"))).toBeTruthy();
+    expect(stateStore.get(STATE_KEYS.session("D1", "300.2"))).toBeTruthy();
+    expect(stateStore.get(STATE_KEYS.session("D1", CHANNEL_SESSION_TS))).toBeUndefined();
+  });
+
+  it("leaves channel mentions thread-scoped and threaded — no change to channel behavior", async () => {
+    const { ctx, gateway, chat, stateStore } = setup();
+    await chat.handleMention({
+      channel: "C1", channelType: "channel", user: "U1", text: "<@UBOT> hello", ts: "400.1",
+    });
+    expect(stateStore.get(STATE_KEYS.session("C1", "400.1"))).toBeTruthy();
+    expect(stateStore.get(STATE_KEYS.session("C1", CHANNEL_SESSION_TS))).toBeUndefined();
+    expect(gateway.posts[0]!.threadTs).toBe("400.1");
+
+    await chat.handleMention({
+      channel: "C1", channelType: "channel", user: "U1",
+      text: "<@UBOT> again", ts: "400.3", threadTs: "400.1",
+    });
+    expect(ctx.agents.sessions.create).toHaveBeenCalledTimes(1);
+    expect(gateway.posts[1]!.threadTs).toBe("400.1");
+  });
+});
+
+describe("follow-up posts in a top-level DM reply", () => {
+  it("threads overflow chunks under the reply instead of spraying top-level DM messages", async () => {
+    const { ctx, gateway, chat } = setup();
+    const longText = "a".repeat(9000);
+    (ctx.agents.sessions.sendMessage as any).mockImplementationOnce(
+      async (_sessionId: string, _companyId: string, opts: { onEvent?: (e: unknown) => void }) => {
+        opts.onEvent?.({
+          sessionId: "sess-1", runId: "run-1", seq: 1,
+          eventType: "done", stream: null, message: longText, payload: null,
+        });
+        return { runId: "run-1" };
+      },
+    );
+
+    await chat.handleMessage(dm("hi", "500.1"));
+
+    const placeholder = gateway.posts[0]!;
+    expect(placeholder.threadTs).toBeUndefined();
+    const extras = gateway.posts.slice(1);
+    expect(extras.length).toBe(2); // 9000 chars = 3900 + 3900 + 1200
+    // Same pattern as src/post-message.ts:118 — a long answer nests under
+    // its own head message rather than taking over the conversation.
+    for (const post of extras) expect(post.threadTs).toBe(placeholder.ts);
+  });
+
+  // NOTE: this one test uses REAL timers, not vi.useFakeTimers(). The late
+  // reply is posted by a fire-and-forget continuation the test cannot await
+  // directly, so it observes the effect by sleeping past the deadline. Keep
+  // the 4x margin between turnTimeoutMs (5) and the sleep (20) — narrowing it
+  // makes the test flaky on a loaded CI runner. If it ever does flake, raise
+  // the sleep; do not lower turnTimeoutMs.
+  it("threads a late reply under the top-level DM reply too", async () => {
+    const bundle = makeCtx();
+    const gateway = new FakeGateway();
+    const chat = createChat({
+      ctx: bundle.ctx,
+      gateway,
+      getConfig: async () => ({ ...TEST_CONFIG }),
+      updateIntervalMs: 0,
+      turnTimeoutMs: 5,
+    });
+    let fire: ((e: unknown) => void) | undefined;
+    (bundle.ctx.agents.sessions.sendMessage as any).mockImplementationOnce(
+      async (_sessionId: string, _companyId: string, opts: { onEvent?: (e: unknown) => void }) => {
+        // Stall the event stream so the turn watchdog settles the turn.
+        fire = opts.onEvent;
+        return { runId: "run-1" };
+      },
+    );
+
+    await chat.handleMessage(dm("hi", "510.1"));
+    expect(gateway.posts).toHaveLength(1);
+    expect(gateway.posts[0]!.threadTs).toBeUndefined();
+
+    fire!({
+      sessionId: "sess-1", runId: "run-1", seq: 1,
+      eventType: "done", stream: null, message: "Late but real", payload: null,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(gateway.posts).toHaveLength(2);
+    expect(gateway.posts[1]!.threadTs).toBe(gateway.posts[0]!.ts);
   });
 });
