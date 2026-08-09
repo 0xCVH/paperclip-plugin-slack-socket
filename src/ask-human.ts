@@ -188,6 +188,14 @@ export function createAskHuman({ ctx, gateway, getConfig }: AskHumanDeps): AskHu
       const key = STATE_KEYS.question(msg.channel, msg.threadTs);
       const pending = (await ctx.state.get(stateScope(key))) as PendingQuestion | null;
       if (!pending || pending.mode !== "answer") return false;
+      // An attachment-only message (Slack's file_share subtype, passed
+      // through to routing so a captioned upload isn't swallowed — see
+      // bolt-gateway.ts) can carry `text: ""`. That is not an answer: it
+      // must not claim the key, delete the pending state, post a comment, or
+      // wake the agent. Checked before the claim guard below so a blank
+      // message never reaches it; falls through to chat routing, which
+      // already no-ops on empty text (src/chat.ts).
+      if (!msg.text.trim()) return false;
       // This message IS an answer to a pending question — claim it before
       // any further await so a concurrent resolution for the same key
       // can't also record it. If another in-flight call already holds the

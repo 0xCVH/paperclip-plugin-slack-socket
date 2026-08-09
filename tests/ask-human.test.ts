@@ -90,6 +90,36 @@ describe("ask-human tool", () => {
     );
   });
 
+  it("leaves a pending answer-mode question untouched when the reply has no text (e.g. a caption-less file_share attachment)", async () => {
+    const { ctx, gateway, askHuman, stateStore } = setup();
+    const key = STATE_KEYS.question("C1", "10.1");
+    stateStore.set(key, pending({ mode: "answer" }));
+    stateStore.set(STATE_KEYS.questionIndex, [key]);
+    const claimed = await askHuman.tryHandleAnswer({
+      channel: "C1", channelType: "channel", user: "U5", text: "", ts: "10.2", threadTs: "10.1",
+    });
+    expect(claimed).toBe(false);
+    expect(ctx.issues.createComment).not.toHaveBeenCalled();
+    expect(ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(gateway.updates).toHaveLength(0);
+    // Still pending: neither the state entry nor its index slot were touched.
+    expect(stateStore.get(key)).toMatchObject({ mode: "answer" });
+    expect(stateStore.get(STATE_KEYS.questionIndex)).toEqual([key]);
+  });
+
+  it("also leaves it pending when the reply is whitespace-only", async () => {
+    const { ctx, askHuman, stateStore } = setup();
+    const key = STATE_KEYS.question("C1", "10.1");
+    stateStore.set(key, pending({ mode: "answer" }));
+    stateStore.set(STATE_KEYS.questionIndex, [key]);
+    const claimed = await askHuman.tryHandleAnswer({
+      channel: "C1", channelType: "channel", user: "U5", text: "   ", ts: "10.2", threadTs: "10.1",
+    });
+    expect(claimed).toBe(false);
+    expect(ctx.issues.createComment).not.toHaveBeenCalled();
+    expect(stateStore.get(key)).toMatchObject({ mode: "answer" });
+  });
+
   it("does not claim unrelated messages", async () => {
     const { askHuman } = setup();
     const claimed = await askHuman.tryHandleAnswer({
