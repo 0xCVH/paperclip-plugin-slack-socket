@@ -116,12 +116,25 @@ describe("approvals", () => {
     );
   });
 
-  it("posts an ephemeral failure note when the REST call fails", async () => {
-    const { ctx, gateway, approvals } = setup();
+  it("posts an ephemeral failure note when the REST call fails, and retains the message link so a later web-UI decision can still fix the message", async () => {
+    const { ctx, gateway, approvals, stateStore, emitEvent } = setup({ approvalsChannelId: "C-APPR" });
+    await emitEvent("approval.created", { entityId: "app-1", payload: { title: "Deploy?" } });
+    const key = STATE_KEYS.approvalMessage("app-1");
+    // Precondition: the link exists before the failed decision, so the
+    // assertions below aren't vacuously true.
+    expect(stateStore.get(key)).toBeTruthy();
+
     (ctx.http.fetch as any).mockResolvedValueOnce({ status: 500, json: async () => ({}) });
-    await approvals.handleAction(approveAction);
+    await approvals.handleAction({ ...approveAction, channel: "C-APPR", messageTs: gateway.posts[0]!.ts });
+
     expect(gateway.updates).toHaveLength(0);
     expect(gateway.ephemerals[0]!.user).toBe("U9");
+    // The link must survive a failed REST decision: the unlink only happens
+    // after a successful decision (see the ORDER IS LOAD-BEARING comment in
+    // approvals.ts), so a later decision made outside Slack (the web UI)
+    // must still find this link and be able to update the message.
+    expect(stateStore.get(key)).toBeTruthy();
+    expect(stateStore.get(STATE_KEYS.approvalMessageIndex)).toContain(key);
   });
 
   it("links the posted approval message to its approval id", async () => {
