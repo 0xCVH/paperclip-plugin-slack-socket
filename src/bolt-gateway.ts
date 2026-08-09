@@ -1,5 +1,6 @@
 import boltPkg from "@slack/bolt";
 import { errString } from "./redact.js";
+import { isDmChannelId } from "./slack-ids.js";
 import type {
   InboundAction,
   InboundCommand,
@@ -52,7 +53,13 @@ export class BoltGateway implements SlackGateway {
       const e = event as { channel: string; user?: string; text?: string; ts: string; thread_ts?: string };
       await this.dispatch(this.mentionHandlers, {
         channel: e.channel,
-        channelType: "channel",
+        // Unlike `message`, app_mention carries no channel_type field, so
+        // the conversation kind has to be inferred from the id shape (see
+        // isDmChannelId). Slack fires app_mention inside 1:1 DMs too — a
+        // hardcoded "channel" here made "@bot hi" in a DM start a fresh,
+        // thread-scoped session while a plain "hi" in the same DM kept the
+        // remembered channel-scoped one.
+        channelType: isDmChannelId(e.channel) ? "im" : "channel",
         user: e.user ?? "",
         text: e.text ?? "",
         ts: e.ts,

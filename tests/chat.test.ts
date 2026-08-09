@@ -106,7 +106,13 @@ describe("chat", () => {
   });
 
   it("still converses on an unmentioned DM thread reply (proactive-DM replies keep working)", async () => {
-    const { ctx, chat, stateStore } = setup();
+    // Pinned to dmSessionMode "thread": this pre-seeds a session keyed to a
+    // specific DM thread, which is exactly the thread-per-DM shape that
+    // "channel" mode's human ruling retired (a reply inside any DM thread
+    // now joins the one channel-scoped session instead of looking up a
+    // thread-keyed entry — see the "1:1 DM continuity" describe block).
+    // This test stays real coverage of the "thread" escape hatch.
+    const { ctx, chat, stateStore } = setup({ dmSessionMode: "thread" });
     stateStore.set(STATE_KEYS.session("D1", "200.1"), {
       sessionId: "sess-dm", channel: "D1", threadTs: "200.1", lastActivityAt: new Date().toISOString(),
     });
@@ -797,11 +803,27 @@ describe("resolveSessionScope", () => {
     });
   });
 
-  it("row 2 — a 1:1 DM inside a thread keeps its own thread-scoped session and a threaded reply", () => {
+  it('row 2 — a 1:1 DM inside a thread, in mode "channel", joins the channel-scoped session but keeps a threaded reply', () => {
+    // Human ruling: the whole 1:1 DM is one conversation. A message inside a
+    // thread must not fork a second, empty-context session — but the reply
+    // still lands in the thread the person wrote in, so it never jumps out
+    // of the context they're reading.
     expect(resolveSessionScope(im("100.3", "100.2"), "channel")).toEqual({
-      key: "session:D1:100.2",
-      scope: "thread",
+      key: "session:D1:main",
+      scope: "channel",
       replyThreadTs: "100.2",
+    });
+  });
+
+  it('row 2b — a DM message whose threadTs equals its own ts also joins the channel-scoped session', () => {
+    // This shape (a message "in reply to itself") previously fell through
+    // to the thread branch — !msg.threadTs was false — and got the old
+    // per-message session back by accident. It's just another message
+    // inside a thread now, like every other row-2 shape.
+    expect(resolveSessionScope(im("100.1", "100.1"), "channel")).toEqual({
+      key: "session:D1:main",
+      scope: "channel",
+      replyThreadTs: "100.1",
     });
   });
 
@@ -902,14 +924,21 @@ describe("1:1 DM continuity (dmSessionMode)", () => {
     });
   });
 
-  it("still gives a DM message inside a thread its own thread-scoped session", async () => {
+  it("a reply inside a DM thread continues the channel-scoped session instead of starting a new one", async () => {
     const { ctx, gateway, chat, stateStore } = setup();
     await chat.handleMessage(dm("top level", "200.1"));
     await chat.handleMessage(dm("in a thread", "200.3", "200.2"));
 
-    expect(ctx.agents.sessions.create).toHaveBeenCalledTimes(2);
+    // Human ruling: the whole 1:1 DM is one conversation. Replying under a
+    // long or late answer (which lands in a thread — see followUpThreadTs
+    // in streamReply) must not silently lose context by forking a second,
+    // empty session.
+    expect(ctx.agents.sessions.create).toHaveBeenCalledTimes(1);
+    expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledTimes(2);
     expect(stateStore.get(STATE_KEYS.session("D1", CHANNEL_SESSION_TS))).toBeTruthy();
-    expect(stateStore.get(STATE_KEYS.session("D1", "200.2"))).toBeTruthy();
+    expect(stateStore.get(STATE_KEYS.session("D1", "200.2"))).toBeUndefined();
+    // Reply placement still tracks where the person wrote, so a reply never
+    // jumps out of the thread they're reading.
     expect(gateway.posts[0]!.threadTs).toBeUndefined();
     expect(gateway.posts[1]!.threadTs).toBe("200.2");
   });
@@ -942,6 +971,24 @@ describe("1:1 DM continuity (dmSessionMode)", () => {
     });
     expect(ctx.agents.sessions.create).toHaveBeenCalledTimes(1);
     expect(gateway.posts[1]!.threadTs).toBe("400.1");
+  });
+
+  it("an @mention inside a DM joins the same channel-scoped session as a plain message — no divergent history", async () => {
+    // This is the end of the pipeline whose start is bolt-gateway.ts's
+    // isDmChannelId fix: once app_mention correctly tags a DM mention as
+    // channelType "im" (instead of always "channel"), handleMention and
+    // handleMessage must land on the exact same session regardless of
+    // whether the person typed the bot's name.
+    const { ctx, gateway, chat, stateStore } = setup();
+    await chat.handleMessage(dm("hello", "600.1"));
+    await chat.handleMention({
+      channel: "D1", channelType: "im", user: "U1", text: "<@UBOT> hello again", ts: "600.2",
+    });
+
+    expect(ctx.agents.sessions.create).toHaveBeenCalledTimes(1);
+    expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledTimes(2);
+    expect(gateway.posts[1]!.threadTs).toBeUndefined();
+    expect(stateStore.get(STATE_KEYS.session("D1", CHANNEL_SESSION_TS))).toBeTruthy();
   });
 });
 
