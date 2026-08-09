@@ -129,6 +129,13 @@ let applyQueue: PendingApply[] = [];
 let wakePump: (() => void) | null = null;
 let pumpSignalled = false;
 let pumpStarted = false;
+// True for the whole duration of an `applyConfig` call, not just while a job
+// sits in `applyQueue` — the pump `shift()`s a job off the queue before
+// awaiting `applyConfig`, so `applyQueue.length` alone reads as empty for the
+// entire apply (e.g. a new gateway's `start()` handshake). The socket
+// watchdog below checks this flag too, so a tick landing mid-apply never
+// mistakes a gateway that is legitimately still connecting for a dead one.
+let applyInFlight = false;
 
 function signalPump(): void {
   pumpSignalled = true;
@@ -163,12 +170,14 @@ function startConfigPump(ctx: PluginContext, makeGateway: GatewayFactory): void 
       await waitForWork();
       while (applyQueue.length) {
         const job = applyQueue.shift()!;
+        applyInFlight = true;
         try {
           await applyConfig(ctx, job.cfg, makeGateway);
         } catch (err) {
           ctx.logger.error("Slack config apply failed", { err: errString(err) });
           health = { status: "degraded", message: `Slack Socket configuration failed: ${errString(err)}` };
         } finally {
+          applyInFlight = false;
           job.done();
         }
       }
@@ -197,8 +206,29 @@ function startConfigPump(ctx: PluginContext, makeGateway: GatewayFactory): void 
 // and be denied with "unknown invocation scope". Enqueueing keeps gateway
 // construction inside the pump's clean store. Re-applying also re-resolves
 // both secret refs, so a rotated token is picked up without an operator save.
+//
+// Two more failure modes this section guards against, both found by review
+// and reproduced empirically:
+//  - A `probe()` that never settles must not wedge `recoveryInFlight` shut
+//    forever. `gateway.probe()` is a plain HTTP call, and a WebClient with no
+//    configured timeout plus Slack's default ~10-retries-over-~30-minutes
+//    policy can leave it pending far longer than this watchdog's 60s tick
+//    interval — precisely in the revoked-token case this feature exists to
+//    fix, since that's when `isConnected()` is still true and the `&&` below
+//    actually calls `probe()`. `probeWithTimeout` bounds every probe, for
+//    every `SlackGateway` implementation, not just Bolt's.
+//  - `liveConfig` must be re-read immediately before enqueueing a recovery
+//    job, not reused from a value captured before the probe was awaited: an
+//    operator's own config save can land and fully complete while a tick is
+//    mid-probe (it isn't blocked by `recoveryInFlight`, which only guards
+//    this function's own re-entrancy), and enqueueing a stale capture would
+//    silently revert that completed save — including a narrowed
+//    `allowedSlackUserIds`/`agentPostChannelIds`/`agentPostMessageEnabled`.
 const SOCKET_WATCHDOG_INTERVAL_MS = 60_000;
 const RECOVERY_BACKOFF_MS: readonly number[] = [60_000, 120_000, 240_000, 480_000, 900_000];
+// Well under the 60s tick interval, so a hung probe is bounded to a small
+// fraction of one tick rather than swallowing several.
+const PROBE_TIMEOUT_MS = 10_000;
 
 let watchdogStarted = false;
 let recoveryInFlight = false;
@@ -211,29 +241,78 @@ function backoffFor(attempt: number): number {
 }
 
 /**
+ * Bounds `gateway.probe()` to `timeoutMs` so a hung round-trip can never
+ * wedge the watchdog: `await`ing an unbounded `probe()` would suspend
+ * `socketWatchdogTick` indefinitely, and since control never returns to it,
+ * the `finally { recoveryInFlight = false }` below would never run either —
+ * this function is what keeps that `await` from ever going unbounded.
+ * Treats a timeout, and a rejection, the same as `probe()` resolving
+ * `false`: "not alive", which is exactly the signal that should trigger
+ * recovery rather than be swallowed. Lives here — bounding every
+ * `SlackGateway` implementation from the call site — rather than inside
+ * `BoltGateway.probe()` itself, which only Bolt would benefit from.
+ */
+function probeWithTimeout(gateway: SlackGateway, timeoutMs: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve(false);
+    }, timeoutMs);
+    // Bookkeeping timer only; never let it hold the process (or a test run)
+    // open by itself.
+    timer.unref();
+    gateway.probe().then(
+      (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(result);
+      },
+      () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(false);
+      },
+    );
+  });
+}
+
+/**
  * One watchdog poll. Exported as a test seam (same precedent as
  * `startRuntime`) so tests can drive ticks deterministically with an
  * injected clock instead of waiting out a 60s interval.
  */
 export async function socketWatchdogTick(ctx: PluginContext, now: number = Date.now()): Promise<void> {
-  // Captured up front so the rest of this function works against one
-  // consistent config even though `liveConfig` can be replaced by an
-  // operator save while we're awaiting.
-  const cfg = liveConfig;
   // Nothing to recover to before a config has ever applied; never re-enter;
-  // never race the pump — a queued apply is about to rebuild the gateway
-  // anyway; and honor the backoff deadline.
-  if (!cfg || recoveryInFlight || applyQueue.length > 0 || now < recoveryNotBefore) return;
+  // never race the pump — a queued OR in-flight apply is either about to
+  // rebuild the gateway or is already mid-handshake, and in both cases this
+  // tick has nothing useful to add; and honor the backoff deadline.
+  if (!liveConfig || recoveryInFlight || applyQueue.length > 0 || applyInFlight || now < recoveryNotBefore) {
+    return;
+  }
 
   recoveryInFlight = true;
   try {
     const gateway = currentGateway;
-    const alive = gateway !== null && gateway.isConnected() && (await gateway.probe());
+    const alive = gateway !== null && gateway.isConnected() && (await probeWithTimeout(gateway, PROBE_TIMEOUT_MS));
     if (alive) {
       recoveryAttempts = 0;
       recoveryNotBefore = 0;
       return;
     }
+
+    // Re-checked here, right before enqueueing, using a fresh read of
+    // `liveConfig` — not a value captured before the probe above (see the
+    // section comment for why that was a bug). If an operator save landed
+    // and finished while we were awaiting the probe, either it already
+    // fixed things (nothing left to recover — bail silently) or another
+    // apply is now queued/in-flight that will settle things on its own;
+    // either way this tick must not push a job built from a stale config.
+    if (!liveConfig || applyQueue.length > 0 || applyInFlight) return;
+    const cfg = liveConfig;
 
     const attempt = (recoveryAttempts += 1);
     ctx.logger.warn("Slack Socket Mode looks dead; re-applying the live config to recover", { attempt });
