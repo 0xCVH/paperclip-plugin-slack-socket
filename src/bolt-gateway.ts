@@ -47,7 +47,19 @@ export class BoltGateway implements SlackGateway {
 
   constructor(opts: { botToken: string; appToken: string; logger: GatewayLogger }) {
     this.logger = opts.logger;
-    this.app = new App({ token: opts.botToken, appToken: opts.appToken, socketMode: true });
+    this.app = new App({
+      token: opts.botToken,
+      appToken: opts.appToken,
+      socketMode: true,
+      // Defense in depth, not a substitute for the socket watchdog's own
+      // bound (see probeWithTimeout in worker.ts): with no clientOptions at
+      // all, the underlying WebClient uses timeout: 0 (no per-request abort)
+      // plus Slack's default ~10-retries-over-~30-minutes policy, so any
+      // call through `this.app.client` — including the `auth.test()` used by
+      // both `start()` and `probe()` — could otherwise hang far longer than
+      // this plugin's 60s watchdog tick interval.
+      clientOptions: { timeout: 10_000 },
+    });
 
     this.app.event("app_mention", async ({ event }) => {
       const e = event as { channel: string; user?: string; text?: string; ts: string; thread_ts?: string };
