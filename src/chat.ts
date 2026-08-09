@@ -293,10 +293,20 @@ export function createChat(deps: ChatDeps): Chat {
       const entry: SessionEntry = {
         sessionId: created.sessionId,
         channel,
-        // A channel-scoped DM has no thread; store the same sentinel the
-        // key uses so the entry round-trips its own key, and let `scope`
-        // be what downstream code actually reads.
+        // NOT a key round-trip. `scope.replyThreadTs` mirrors wherever the
+        // triggering message actually landed — for a channel-scoped DM
+        // (scope.scope === "channel") that's `undefined` only when the
+        // message was top-level; a message that arrived inside a thread
+        // (including one that formed under the bot's own reply) stores that
+        // real threadTs here even though the entry lives under the shared
+        // channel-scoped "…:main" key (STATE_KEYS.session(channel,
+        // CHANNEL_SESSION_TS)). So `STATE_KEYS.session(channel,
+        // entry.threadTs)` does NOT reliably reproduce the key this entry is
+        // actually stored under — only resolveSessionScope(msg, mode) does.
         threadTs: scope.replyThreadTs ?? CHANNEL_SESSION_TS,
+        // Written for potential future use; nothing reads entry.scope today.
+        // Don't assume it's load-bearing — the actual scoping decision lives
+        // in resolveSessionScope, not in re-deriving it from a stored entry.
         scope: scope.scope,
         lastActivityAt: new Date().toISOString(),
       };
