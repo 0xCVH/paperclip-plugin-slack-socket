@@ -25,4 +25,11 @@ describe("helpers", () => {
     await emitEvent("issue.created", { entityId: "i1" });
     expect(seen).toEqual({ entityId: "i1" });
   });
+
+  it("FakeGateway probes true by default and honors probeResult", async () => {
+    const gw = new FakeGateway();
+    await expect(gw.probe()).resolves.toBe(true);
+    gw.probeResult = false;
+    await expect(gw.probe()).resolves.toBe(false);
+  });
 });

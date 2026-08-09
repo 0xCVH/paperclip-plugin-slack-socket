@@ -90,4 +90,25 @@ describe("createGatewayProxy", () => {
     current = null;
     expect(proxy.isConnected()).toBe(false);
   });
+
+  it("delegates probe() to the live gateway", async () => {
+    const real = new FakeGateway();
+    const logger = makeLogger();
+    const proxy = createGatewayProxy(() => real, logger);
+
+    await expect(proxy.probe()).resolves.toBe(true);
+    real.probeResult = false;
+    await expect(proxy.probe()).resolves.toBe(false);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it("probe() reports false — never true — when there is no live gateway", async () => {
+    // Fail-closed: the worker's watchdog treats a false probe as "recover",
+    // so an unconfigured proxy answering `true` would suppress recovery
+    // forever.
+    const logger = makeLogger();
+    const proxy = createGatewayProxy(() => null, logger);
+    await expect(proxy.probe()).resolves.toBe(false);
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("probe"), expect.anything());
+  });
 });

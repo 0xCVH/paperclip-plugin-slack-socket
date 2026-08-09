@@ -18,7 +18,7 @@ vi.mock("@slack/web-api", () => ({
 // actually getting started/stopped) without opening a real Socket Mode
 // connection. vi.hoisted so the class is available inside vi.mock's factory.
 const { boltGatewayInstances, BoltGatewayMock, alsCapture } = vi.hoisted(() => {
-  const instances: Array<{ started: boolean; opts: unknown }> = [];
+  const instances: Array<{ started: boolean; opts: unknown; probeResult: boolean }> = [];
   // Lets individual tests observe the ALS store active at the moment a
   // BoltGateway is constructed, without this file-level mock needing to
   // import node:async_hooks itself or know about any particular
@@ -31,6 +31,9 @@ const { boltGatewayInstances, BoltGatewayMock, alsCapture } = vi.hoisted(() => {
   };
   class Mock {
     started = false;
+    // Settable per instance so a test can simulate a socket Bolt still
+    // believes is open but Slack no longer answers for (revoked token).
+    probeResult = true;
     opts: unknown;
     private botId = "UBOT";
     constructor(opts: unknown) {
@@ -56,6 +59,9 @@ const { boltGatewayInstances, BoltGatewayMock, alsCapture } = vi.hoisted(() => {
     }
     botUserId(): string {
       return this.botId;
+    }
+    async probe(): Promise<boolean> {
+      return this.probeResult;
     }
     async postMessage(): Promise<{ channel: string; ts: string }> {
       return { channel: "C", ts: "1" };
@@ -790,5 +796,225 @@ describe("describeHostError — background authorization", () => {
     );
     expect(message).toContain("Disable and re-enable");
     expect(message).not.toContain("invocation scope");
+  });
+});
+
+describe("socket watchdog", () => {
+  it("startSocketWatchdog installs exactly one unref'd 60s interval, however many times it is called", async () => {
+    const { startSocketWatchdog } = await loadWorker();
+    const { ctx } = makeCtx();
+    const unref = vi.fn();
+    // No awaits inside the spy window: setInterval is a global vitest itself
+    // may use, so it is mocked for as short a stretch as possible.
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation((() => ({ unref })) as any);
+    try {
+      startSocketWatchdog(ctx);
+      startSocketWatchdog(ctx);
+      expect(setIntervalSpy).toHaveBeenCalledTimes(1);
+      expect(setIntervalSpy.mock.calls[0]![1]).toBe(60_000);
+      // Unref'd so a 60s poll can never hold the worker process — or a test
+      // run — open.
+      expect(unref).toHaveBeenCalledTimes(1);
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  it("is started by setup(), so a later explicit call is a no-op", async () => {
+    const { default: plugin, startSocketWatchdog } = await loadWorker();
+    const { ctx } = makeCtx();
+    await plugin.definition.setup(ctx);
+    const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+    try {
+      startSocketWatchdog(ctx);
+      expect(setIntervalSpy).not.toHaveBeenCalled();
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  it("does nothing before any config has applied", async () => {
+    const { default: plugin, socketWatchdogTick } = await loadWorker();
+    const { ctx } = makeCtx();
+    await plugin.definition.setup(ctx);
+    await socketWatchdogTick(ctx, 0);
+    expect(boltGatewayInstances).toHaveLength(0);
+    expect(ctx.metrics.write).not.toHaveBeenCalledWith(
+      "slack.socket.recovery.attempted",
+      1,
+      expect.anything(),
+    );
+  });
+
+  it("leaves a healthy gateway alone: connected and probing true means no recovery", async () => {
+    const { default: plugin, socketWatchdogTick } = await loadWorker();
+    const { ctx } = makeCtx();
+    await plugin.definition.setup(ctx);
+    await plugin.definition.onConfigChanged!(cfg());
+    expect(boltGatewayInstances).toHaveLength(1);
+
+    await socketWatchdogTick(ctx, 0);
+
+    expect(boltGatewayInstances).toHaveLength(1);
+    expect(ctx.metrics.write).not.toHaveBeenCalledWith(
+      "slack.socket.recovery.attempted",
+      1,
+      expect.anything(),
+    );
+    await expect(plugin.definition.onHealth?.()).resolves.toEqual({ status: "ok" });
+  });
+
+  it("recovers through the config pump — never by calling applyConfig directly — so the new gateway is built outside the tick's ALS store", async () => {
+    // THE load-bearing invariant (src/worker.ts's "Config apply pump"
+    // comment). A timer callback that called applyConfig itself would
+    // construct the Slack gateway inside whatever AsyncLocalStorage store was
+    // active, and every later Slack event would echo the id of an invocation
+    // the host finished long ago — denied with "unknown invocation scope".
+    // Asserting the captured store is undefined is the only way to prove the
+    // work actually travelled through applyQueue + signalPump.
+    const als = new AsyncLocalStorage<{ invocationId: string }>();
+    const { default: plugin, socketWatchdogTick } = await loadWorker();
+    const { ctx } = makeCtx();
+    await plugin.definition.setup(ctx);
+    await plugin.definition.onConfigChanged!(cfg());
+
+    boltGatewayInstances[0]!.started = false; // socket dropped for good
+    alsCapture.als = als;
+    alsCapture.captured = "unset";
+
+    await als.run({ invocationId: "watchdog-1" }, async () => {
+      await socketWatchdogTick(ctx, 0);
+    });
+
+    expect(boltGatewayInstances).toHaveLength(2);
+    expect(boltGatewayInstances[1]!.started).toBe(true);
+    expect(alsCapture.captured).toBeUndefined();
+  });
+
+  it("skips while a config apply is queued, so it never races the pump", async () => {
+    const { default: plugin, socketWatchdogTick } = await loadWorker();
+    const { ctx } = makeCtx();
+    await plugin.definition.setup(ctx);
+    await plugin.definition.onConfigChanged!(cfg());
+    expect(boltGatewayInstances).toHaveLength(1);
+
+    // Park the next apply inside applyConfig's teardown by holding the
+    // current gateway's stop() open, leaving a second job sitting in
+    // applyQueue with nothing draining it.
+    let releaseStop: () => void = () => {};
+    (boltGatewayInstances[0] as any).stop = () =>
+      new Promise<void>((resolve) => {
+        releaseStop = resolve;
+      });
+    // Dead socket, so the queue guard is the only thing that can stop the
+    // watchdog from recovering.
+    boltGatewayInstances[0]!.started = false;
+
+    const p1 = plugin.definition.onConfigChanged!(cfg({ defaultChannelId: "C-A" }));
+    const p2 = plugin.definition.onConfigChanged!(cfg({ defaultChannelId: "C-B" }));
+    // One macrotask is enough: everything between waitForWork() and the held
+    // stop() is microtask-only, and the microtask queue drains first.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(boltGatewayInstances).toHaveLength(1); // parked before makeGateway
+
+    await socketWatchdogTick(ctx, 0);
+
+    expect(ctx.metrics.write).not.toHaveBeenCalledWith(
+      "slack.socket.recovery.attempted",
+      1,
+      expect.anything(),
+    );
+
+    releaseStop();
+    await Promise.all([p1, p2]);
+  });
+
+  it("recovers a gateway that still claims isConnected() but fails its probe", async () => {
+    const { default: plugin, socketWatchdogTick } = await loadWorker();
+    const { ctx } = makeCtx();
+    await plugin.definition.setup(ctx);
+    await plugin.definition.onConfigChanged!(cfg());
+
+    // Token revoked underneath a socket Bolt still believes is open: the
+    // liveness check must not rest on isConnected() alone.
+    boltGatewayInstances[0]!.probeResult = false;
+    expect(boltGatewayInstances[0]!.started).toBe(true);
+
+    await socketWatchdogTick(ctx, 0);
+
+    expect(boltGatewayInstances).toHaveLength(2);
+    expect(boltGatewayInstances[1]!.started).toBe(true);
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.socket.recovery.attempted", 1, { attempt: "1" });
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.socket.recovery.succeeded", 1, { attempt: "1" });
+  });
+
+  it("recovers from a failed gateway.start(), where currentGateway holds a dead but NON-NULL gateway", async () => {
+    const { default: plugin, socketWatchdogTick } = await loadWorker();
+    const { ctx } = makeCtx();
+    (ctx.secrets.resolve as any).mockImplementation(async (ref: string) =>
+      ref === "ref-bot" ? "THROW_ON_START" : `secret-${ref}`,
+    );
+    await plugin.definition.setup(ctx);
+    await plugin.definition.onConfigChanged!(cfg());
+
+    // currentGateway was assigned before the try/catch around start(), so a
+    // "is there a gateway at all?" check would wrongly call this healthy.
+    expect(boltGatewayInstances).toHaveLength(1);
+    expect(boltGatewayInstances[0]!.started).toBe(false);
+    await expect(plugin.definition.onHealth?.()).resolves.toMatchObject({ status: "degraded" });
+
+    // That failure rolled the claim back (didClaim); the recovering apply
+    // simply re-claims boundCompanyId, which is correct.
+    (ctx.secrets.resolve as any).mockImplementation(async (ref: string) => `secret-${ref}`);
+    await socketWatchdogTick(ctx, 0);
+
+    expect(boltGatewayInstances).toHaveLength(2);
+    expect(boltGatewayInstances[1]!.started).toBe(true);
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.socket.recovery.succeeded", 1, { attempt: "1" });
+    await expect(plugin.definition.onHealth?.()).resolves.toEqual({ status: "ok" });
+  });
+
+  it("escalates the backoff on repeated failures, reports the attempt in onHealth, and resets once recovery succeeds", async () => {
+    const { default: plugin, socketWatchdogTick } = await loadWorker();
+    const { ctx } = makeCtx();
+    (ctx.secrets.resolve as any).mockImplementation(async (ref: string) =>
+      ref === "ref-bot" ? "THROW_ON_START" : `secret-${ref}`,
+    );
+    await plugin.definition.setup(ctx);
+    await plugin.definition.onConfigChanged!(cfg());
+    expect(boltGatewayInstances).toHaveLength(1);
+
+    // Attempt 1 fails -> next attempt no earlier than now + 1m.
+    await socketWatchdogTick(ctx, 0);
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.socket.recovery.attempted", 1, { attempt: "1" });
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.socket.recovery.failed", 1, { attempt: "1" });
+    expect(boltGatewayInstances).toHaveLength(2);
+
+    await socketWatchdogTick(ctx, 59_999); // still inside the 1m backoff
+    expect(boltGatewayInstances).toHaveLength(2);
+
+    // Attempt 2 fails -> next attempt no earlier than 60_000 + 2m.
+    await socketWatchdogTick(ctx, 60_000);
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.socket.recovery.attempted", 1, { attempt: "2" });
+    expect(boltGatewayInstances).toHaveLength(3);
+
+    await socketWatchdogTick(ctx, 179_999); // still inside the 2m backoff
+    expect(boltGatewayInstances).toHaveLength(3);
+
+    await expect(plugin.definition.onHealth?.()).resolves.toEqual({
+      status: "degraded",
+      message: "Slack Socket Mode disconnected; recovery attempt 2",
+    });
+
+    // Token fixed: re-applying re-resolves both secret refs, so attempt 3
+    // succeeds without an operator save, and the backoff resets.
+    (ctx.secrets.resolve as any).mockImplementation(async (ref: string) => `secret-${ref}`);
+    await socketWatchdogTick(ctx, 180_000);
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.socket.recovery.succeeded", 1, { attempt: "3" });
+    expect(boltGatewayInstances).toHaveLength(4);
+    expect(boltGatewayInstances[3]!.started).toBe(true);
+    await expect(plugin.definition.onHealth?.()).resolves.toEqual({ status: "ok" });
   });
 });

@@ -145,6 +145,15 @@ export interface SlackGateway {
   stop(): Promise<void>;
   isConnected(): boolean;
   botUserId(): string | undefined;
+  /**
+   * Independent liveness signal: an `auth.test` round-trip, false on any
+   * failure. The worker's socket watchdog uses this so recovery never rests
+   * solely on `isConnected()`, which is fed by listeners attached to Bolt's
+   * private receiver internals (see bolt-gateway.ts) with optional chaining
+   * and would silently never flip if Bolt's shape changed. It also catches a
+   * revoked or rotated token on a socket Bolt still believes is open.
+   */
+  probe(): Promise<boolean>;
   postMessage(msg: OutboundMessage): Promise<{ channel: string; ts: string }>;
   updateMessage(msg: { channel: string; ts: string; text: string; blocks?: unknown[] }): Promise<void>;
   postEphemeral(msg: { channel: string; user: string; text: string }): Promise<void>;

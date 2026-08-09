@@ -121,6 +121,8 @@ export class FakeGateway implements SlackGateway {
   ephemerals: Array<{ channel: string; user: string; text: string }> = [];
   dmOpens: string[] = [];
   started = false;
+  /** Settable so a test can simulate a socket Slack has stopped answering. */
+  probeResult = true;
 
   private botId: string | undefined = "UBOT";
   private tsCounter = 0;
@@ -136,6 +138,7 @@ export class FakeGateway implements SlackGateway {
   async stop(): Promise<void> { this.started = false; }
   isConnected(): boolean { return this.started; }
   botUserId(): string | undefined { return this.botId; }
+  async probe(): Promise<boolean> { return this.probeResult; }
 
   async postMessage(msg: OutboundMessage): Promise<{ channel: string; ts: string }> {
     const ts = `1700000000.${String(++this.tsCounter).padStart(6, "0")}`;
