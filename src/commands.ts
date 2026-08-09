@@ -22,6 +22,18 @@ const HELP = [
   "• `/paperclip help` — show this help",
 ].join("\n");
 
+// Shown whenever `/paperclip reset` has no thread_ts to work with and the
+// conversation it would need to target is thread-scoped: any non-DM channel
+// (always thread-scoped by design), and a 1:1 DM under dmSessionMode
+// "thread" (see resolveSessionScope in chat.ts — under that mode a DM is
+// thread-scoped exactly like a channel, so nothing is ever stored under the
+// CHANNEL_SESSION_TS sentinel this command would otherwise look up). Both
+// cases share the same underlying reason, so they share the same pointer
+// rather than two near-duplicate strings.
+const THREAD_SCOPED_RESET_POINTER =
+  "Each conversation here lives in its own thread, and a slash command can't tell which thread you're in. " +
+  "Mention me with `reset` in the thread you want to clear instead: `@Paperclip reset`.";
+
 export function createCommands({ ctx, gateway, getConfig }: CommandDeps): Commands {
   return {
     async handleCommand(cmd) {
@@ -31,17 +43,19 @@ export function createCommands({ ctx, gateway, getConfig }: CommandDeps): Comman
       await ctx.metrics.write("slack.commands.invoked", 1, { subcommand }).catch(() => {});
 
       if (sub === RESET_KEYWORD) {
-        if (!isDmChannelId(cmd.channel)) {
-          // Every channel session is thread-scoped by design and a slash
-          // command cannot see which thread you are in, so there is nothing
-          // this could correctly target. Point at the mechanism that works
-          // rather than reporting a misleading "no session to reset".
+        // A slash-command payload carries channel_id but never thread_ts.
+        // That's harmless in the common case (a DM under the default
+        // dmSessionMode "channel" session), but it means this command has
+        // nothing it could correctly target in a non-DM channel (always
+        // thread-scoped) or in a DM under dmSessionMode "thread" (also
+        // thread-scoped — see resolveSessionScope). Point at the mechanism
+        // that works instead of reporting a misleading "no session to reset"
+        // while a real, thread-scoped session sits invisibly out of reach.
+        if (!isDmChannelId(cmd.channel) || cfg.dmSessionMode === "thread") {
           await gateway.postEphemeral({
             channel: cmd.channel,
             user: cmd.user,
-            text:
-              "In a channel, each conversation lives in its own thread, and a slash command can't tell which " +
-              "thread you're in. Mention me with `reset` in the thread you want to clear instead: `@Paperclip reset`.",
+            text: THREAD_SCOPED_RESET_POINTER,
           });
           return;
         }
