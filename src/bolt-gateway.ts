@@ -11,6 +11,26 @@ import type {
 
 const { App } = boltPkg;
 
+// Slack stamps a subtype on some genuinely human messages. `thread_broadcast`
+// is a thread reply the author also sent to the channel; `file_share` is a
+// message carrying an attachment, and it still holds whatever the human typed
+// alongside the file. Both must reach chat routing like any other message.
+// Every other subtype (message_changed, message_deleted, channel_join,
+// bot_message, …) is not a live human message and stays filtered.
+const PASSTHROUGH_SUBTYPES = new Set(["thread_broadcast", "file_share"]);
+
+/**
+ * True when an inbound Slack message event is a live human message that chat
+ * routing should see. Pure and exported so the filter is testable without
+ * standing up a Bolt app.
+ */
+export function shouldDispatchMessage(m: { subtype?: string; bot_id?: string; user?: string }): boolean {
+  if (m.subtype && !PASSTHROUGH_SUBTYPES.has(m.subtype)) return false;
+  if (m.bot_id) return false;
+  if (!m.user) return false;
+  return true;
+}
+
 interface GatewayLogger {
   warn(message: string, data?: Record<string, unknown>): void;
 }
@@ -45,16 +65,15 @@ export class BoltGateway implements SlackGateway {
         subtype?: string; bot_id?: string; channel: string; channel_type?: string;
         user?: string; text?: string; ts: string; thread_ts?: string;
       };
-      // thread_broadcast messages ("also send to channel" replies) are
-      // genuine human thread replies and must reach chat routing like any
-      // other reply; every other subtype (message_changed, message_deleted,
-      // bot_message, etc.) is not a live human message and stays filtered.
-      if ((m.subtype && m.subtype !== "thread_broadcast") || m.bot_id || !m.user) return;
+      if (!shouldDispatchMessage(m)) return;
       const channelType = m.channel_type === "im" ? "im" : m.channel_type === "group" ? "group" : "channel";
       await this.dispatch(this.messageHandlers, {
         channel: m.channel,
         channelType,
-        user: m.user,
+        // shouldDispatchMessage already rejected a missing user; the `?? ""`
+        // only restores the narrowing TypeScript loses across the call, and
+        // matches the app_mention handler above.
+        user: m.user ?? "",
         text: m.text ?? "",
         ts: m.ts,
         threadTs: m.thread_ts,
