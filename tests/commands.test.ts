@@ -1,13 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { createCommands } from "../src/commands.js";
 import { CHANNEL_SESSION_TS, STATE_KEYS } from "../src/constants.js";
-import type { SessionEntry } from "../src/types.js";
+import type { SessionEntry, SlackSocketConfig } from "../src/types.js";
 import { FakeGateway, makeCtx, TEST_CONFIG } from "./helpers.js";
 
-function setup() {
+function setup(configOverrides: Partial<SlackSocketConfig> = {}) {
   const bundle = makeCtx();
   const gateway = new FakeGateway();
-  const commands = createCommands({ ctx: bundle.ctx, gateway, getConfig: async () => TEST_CONFIG });
+  const commands = createCommands({
+    ctx: bundle.ctx,
+    gateway,
+    getConfig: async () => ({ ...TEST_CONFIG, ...configOverrides }),
+  });
   return { ...bundle, gateway, commands };
 }
 
@@ -95,6 +99,29 @@ describe("commands", () => {
     expect(gateway.ephemerals[0]!.text).toContain("reset");
     expect(ctx.metrics.write).toHaveBeenCalledWith("slack.commands.invoked", 1, { subcommand: "reset" });
     expect(ctx.metrics.write).toHaveBeenCalledWith("slack.sessions.reset", 1, { surface: "command" });
+  });
+
+  it("in a DM under dmSessionMode 'thread', points at the mention keyword and closes nothing (a slash command has no thread_ts)", async () => {
+    const { ctx, gateway, commands, stateStore } = setup({ dmSessionMode: "thread" });
+    // Under "thread" mode a 1:1 DM is thread-scoped exactly like a channel —
+    // resolveSessionScope never writes anything under CHANNEL_SESSION_TS —
+    // so a real, live session sits at a thread-keyed entry the slash command
+    // (channel_id only, no thread_ts) cannot see.
+    const key = STATE_KEYS.session("D1", "50.1");
+    stateStore.set(key, entry({ sessionId: "sess-thread-dm", channel: "D1", threadTs: "50.1", scope: "thread" }));
+    stateStore.set(STATE_KEYS.sessionIndex, [key]);
+
+    await commands.handleCommand(dmCmd("reset"));
+
+    expect(ctx.agents.sessions.close).not.toHaveBeenCalled();
+    expect(stateStore.get(key)).toBeTruthy();
+    expect(stateStore.get(STATE_KEYS.sessionIndex)).toEqual([key]);
+    const text = gateway.ephemerals[0]!.text;
+    expect(text).toContain("thread");
+    expect(text).toContain("reset");
+    // A thread-blind command must never claim there was nothing to reset —
+    // a live thread-scoped session exists, it's just invisible to this surface.
+    expect(text.toLowerCase()).not.toContain("nothing to reset");
   });
 
   it("in a channel, points at the in-thread keyword and closes nothing", async () => {
