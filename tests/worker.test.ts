@@ -85,6 +85,10 @@ const { boltGatewayInstances, BoltGatewayMock, alsCapture } = vi.hoisted(() => {
 
 vi.mock("../src/bolt-gateway.js", () => ({ BoltGateway: BoltGatewayMock }));
 
+// Captured once, at module scope, so it survives regardless of how a test
+// that patches this shared prototype ends (see the afterEach restore below).
+const originalBoltGatewayStart = BoltGatewayMock.prototype.start;
+
 /** Re-imports src/worker.js as a fresh module instance so its module-level
  * runtime state (liveConfig, currentGateway, the cached module set, etc.)
  * doesn't leak between tests. */
@@ -103,11 +107,16 @@ beforeEach(() => {
   alsCapture.captured = "not-constructed";
 });
 
-// Belt-and-suspenders for the fake-timer test(s) below: guarantees real
-// timers are restored even if a test throws before reaching its own
-// cleanup. A no-op for every other test, which never enables fake timers.
+// Belt-and-suspenders: guarantees real timers and the shared BoltGatewayMock
+// prototype are restored even if a test throws — or times out — before
+// reaching its own cleanup. A try/finally inside the test body doesn't cover
+// a vitest timeout: the test is never resumed, so its finally never runs,
+// and a still-patched prototype.start would leak into every later test in
+// this file, turning one failure into a cascade. A no-op for every other
+// test, which never touches either of these.
 afterEach(() => {
   vi.useRealTimers();
+  BoltGatewayMock.prototype.start = originalBoltGatewayStart;
 });
 
 describe("applyConfig", () => {
@@ -1184,10 +1193,12 @@ describe("socket watchdog", () => {
     expect(boltGatewayInstances).toHaveLength(1);
 
     // Patch the mock's shared start() so the *next* constructed instance's
-    // handshake hangs. Restored in `finally` — this prototype is shared by
-    // every BoltGateway instance across the whole test file via vi.hoisted,
-    // so leaving it patched would silently break later tests.
-    const originalStart = BoltGatewayMock.prototype.start;
+    // handshake hangs. Restored by the file-level afterEach (not a local
+    // try/finally): this prototype is shared by every BoltGateway instance
+    // across the whole test file via vi.hoisted, so leaving it patched would
+    // silently break later tests — and a try/finally here wouldn't even
+    // cover a vitest timeout, since a timed-out test is never resumed to
+    // reach its own finally block.
     let releaseStart: () => void = () => {};
     BoltGatewayMock.prototype.start = function (this: { started: boolean }) {
       return new Promise<void>((resolve) => {
@@ -1198,30 +1209,26 @@ describe("socket watchdog", () => {
       });
     };
 
-    try {
-      const applyPromise = plugin.definition.onConfigChanged!(cfg({ defaultChannelId: "C-A" }));
-      // One macrotask is enough: everything between waitForWork() and the
-      // held start() is microtask-only, and the microtask queue drains first.
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(boltGatewayInstances).toHaveLength(2); // the new gateway now exists...
-      expect(boltGatewayInstances[1]!.started).toBe(false); // ...but hasn't finished starting
-      // applyQueue is already empty at this point — only applyInFlight can
-      // still tell the watchdog an apply is genuinely in progress.
+    const applyPromise = plugin.definition.onConfigChanged!(cfg({ defaultChannelId: "C-A" }));
+    // One macrotask is enough: everything between waitForWork() and the
+    // held start() is microtask-only, and the microtask queue drains first.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(boltGatewayInstances).toHaveLength(2); // the new gateway now exists...
+    expect(boltGatewayInstances[1]!.started).toBe(false); // ...but hasn't finished starting
+    // applyQueue is already empty at this point — only applyInFlight can
+    // still tell the watchdog an apply is genuinely in progress.
 
-      await socketWatchdogTick(ctx, 0);
+    await socketWatchdogTick(ctx, 0);
 
-      expect(ctx.metrics.write).not.toHaveBeenCalledWith(
-        "slack.socket.recovery.attempted",
-        1,
-        expect.anything(),
-      );
-      expect(boltGatewayInstances).toHaveLength(2); // the watchdog did not pile a third gateway on top
+    expect(ctx.metrics.write).not.toHaveBeenCalledWith(
+      "slack.socket.recovery.attempted",
+      1,
+      expect.anything(),
+    );
+    expect(boltGatewayInstances).toHaveLength(2); // the watchdog did not pile a third gateway on top
 
-      releaseStart();
-      await applyPromise;
-      expect(boltGatewayInstances[1]!.started).toBe(true);
-    } finally {
-      BoltGatewayMock.prototype.start = originalStart;
-    }
+    releaseStart();
+    await applyPromise;
+    expect(boltGatewayInstances[1]!.started).toBe(true);
   });
 });
