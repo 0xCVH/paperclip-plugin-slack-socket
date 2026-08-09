@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { runCleanup } from "../src/cleanup.js";
 import { STATE_KEYS } from "../src/constants.js";
-import type { IssueThreadEntry, PendingQuestion, SessionEntry } from "../src/types.js";
+import type { IssueThreadEntry, MessageLink, PendingQuestion, SessionEntry } from "../src/types.js";
 import { FakeGateway, makeCtx, TEST_CONFIG } from "./helpers.js";
 
 const HOURS = 3_600_000;
@@ -157,5 +157,26 @@ describe("runCleanup", () => {
     await runCleanup(ctx, new FakeGateway(), TEST_CONFIG);
 
     expect(stateStore.get(STATE_KEYS.issueThreadIndex)).toEqual([]);
+  });
+
+  it("prunes approval-message links older than 30 days and keeps fresh ones", async () => {
+    const { ctx, stateStore } = makeCtx();
+    const staleKey = STATE_KEYS.approvalMessage("app-old");
+    const freshKey = STATE_KEYS.approvalMessage("app-new");
+    const stale: MessageLink = {
+      channel: "C1", ts: "1.1", createdAt: new Date(Date.now() - 31 * DAYS).toISOString(),
+    };
+    const fresh: MessageLink = {
+      channel: "C1", ts: "2.1", createdAt: new Date(Date.now() - 1 * DAYS).toISOString(),
+    };
+    stateStore.set(staleKey, stale);
+    stateStore.set(freshKey, fresh);
+    stateStore.set(STATE_KEYS.approvalMessageIndex, [staleKey, freshKey]);
+
+    await runCleanup(ctx, new FakeGateway(), TEST_CONFIG);
+
+    expect(stateStore.get(staleKey)).toBeUndefined();
+    expect(stateStore.get(freshKey)).toEqual(fresh);
+    expect(stateStore.get(STATE_KEYS.approvalMessageIndex)).toEqual([freshKey]);
   });
 });
