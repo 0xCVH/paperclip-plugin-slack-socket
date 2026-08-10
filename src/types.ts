@@ -140,6 +140,19 @@ export interface OutboundMessage {
   threadTs?: string;
 }
 
+/**
+ * One message read back from a Slack thread. `isBot` is true for anything
+ * this app posted — including an alert another agent run wrote through the
+ * `slack_post_message` tool — so a transcript can label it as the bot's own
+ * words rather than a third party's claim.
+ */
+export interface ThreadMessage {
+  user: string;
+  text: string;
+  ts: string;
+  isBot: boolean;
+}
+
 export interface SlackGateway {
   start(): Promise<void>;
   stop(): Promise<void>;
@@ -159,6 +172,26 @@ export interface SlackGateway {
   postEphemeral(msg: { channel: string; user: string; text: string }): Promise<void>;
   openDm(userId: string): Promise<string>;
   getUserDisplayName(userId: string): Promise<string>;
+  /**
+   * The messages of one thread, oldest first. `conversations.replies`
+   * returns the parent plus only the oldest page of replies, so a single
+   * call would seed a long thread with its opening and miss the recent
+   * discussion — normally the part a person means by "this issue above".
+   * Implementations page on `response_metadata.next_cursor` until Slack
+   * reports no more pages or a hard cap of requests is reached, so a
+   * runaway thread cannot hang a turn; bounding the returned transcript to
+   * something a chat turn can use is the caller's job, not this method's.
+   * `limit` is the page size passed to each underlying request, not a cap
+   * on the total number of messages returned.
+   *
+   * Needs no OAuth scope beyond the `channels:history` / `groups:history` /
+   * `im:history` already granted in slack-app-manifest.json, so this works
+   * in public channels, private channels and 1:1 DMs. A multi-person group
+   * DM (mpim) needs `mpim:history`, which this app does not grant; there
+   * the call rejects with `missing_scope`, and callers should treat that as
+   * "no history available" and proceed rather than fail the turn.
+   */
+  fetchThreadReplies(channel: string, threadTs: string, limit: number): Promise<ThreadMessage[]>;
   onMessage(handler: (msg: InboundMessage) => Promise<void>): void;
   onMention(handler: (msg: InboundMessage) => Promise<void>): void;
   onReaction(handler: (reaction: InboundReaction) => Promise<void>): void;

@@ -8,6 +8,7 @@ import type {
   OutboundMessage,
   SlackGateway,
   SlackSocketConfig,
+  ThreadMessage,
 } from "../src/types.js";
 import { DEFAULT_CONFIG } from "../src/constants.js";
 
@@ -123,6 +124,10 @@ export class FakeGateway implements SlackGateway {
   started = false;
   /** Settable so a test can simulate a socket Slack has stopped answering. */
   probeResult = true;
+  /** Transcript `fetchThreadReplies` returns; set per test. */
+  threadReplies: ThreadMessage[] = [];
+  /** Every fetchThreadReplies call, so a test can assert what was requested. */
+  threadFetches: Array<{ channel: string; threadTs: string; limit: number }> = [];
 
   private botId: string | undefined = "UBOT";
   private tsCounter = 0;
@@ -161,6 +166,11 @@ export class FakeGateway implements SlackGateway {
 
   async getUserDisplayName(userId: string): Promise<string> {
     return `name-${userId}`;
+  }
+
+  async fetchThreadReplies(channel: string, threadTs: string, limit: number): Promise<ThreadMessage[]> {
+    this.threadFetches.push({ channel, threadTs, limit });
+    return this.threadReplies;
   }
 
   onMessage(handler: (msg: InboundMessage) => Promise<void>): void { this.messageHandlers.push(handler); }

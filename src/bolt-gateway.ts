@@ -8,6 +8,7 @@ import type {
   InboundReaction,
   OutboundMessage,
   SlackGateway,
+  ThreadMessage,
 } from "./types.js";
 
 const { App } = boltPkg;
@@ -19,6 +20,12 @@ const { App } = boltPkg;
 // Every other subtype (message_changed, message_deleted, channel_join,
 // bot_message, …) is not a live human message and stays filtered.
 const PASSTHROUGH_SUBTYPES = new Set(["thread_broadcast", "file_share"]);
+
+// conversations.replies returns the parent plus one page of replies per
+// call. Paging past the first page is bounded by a hard request count, not
+// just Slack's has_more/next_cursor signals, so a runaway thread (or a
+// pathological cursor loop) cannot hang a turn indefinitely.
+const THREAD_REPLIES_MAX_PAGES = 5;
 
 /**
  * True when an inbound Slack message event is a live human message that chat
@@ -225,6 +232,52 @@ export class BoltGateway implements SlackGateway {
   async openDm(userId: string): Promise<string> {
     const res = await this.app.client.conversations.open({ users: userId });
     return (res.channel as { id?: string })?.id ?? userId;
+  }
+
+  /**
+   * Reads a thread back from Slack, oldest first. A single
+   * conversations.replies call returns only the oldest page, which on a
+   * long thread would seed the opening and miss the recent discussion — the
+   * opposite of useful for "raise a ticket for this issue above". So this
+   * pages on `response_metadata.next_cursor` until `has_more` is false, no
+   * cursor comes back, or THREAD_REPLIES_MAX_PAGES requests have been made,
+   * then concatenates the pages in order. `limit` is the page size sent on
+   * each request, not a cap on the total transcript returned — trimming the
+   * transcript to what a chat turn can use is the caller's job.
+   *
+   * Needs channels:history, groups:history or im:history (already granted),
+   * so this works in public channels, private channels and 1:1 DMs. In a
+   * multi-person group DM the required mpim:history scope is not granted,
+   * so the call rejects with a missing_scope error instead; this method does
+   * not swallow that, so callers should treat a rejection as "no history
+   * available" and proceed rather than fail the turn.
+   */
+  async fetchThreadReplies(channel: string, threadTs: string, limit: number): Promise<ThreadMessage[]> {
+    const collected: ThreadMessage[] = [];
+    let cursor: string | undefined;
+
+    for (let page = 0; page < THREAD_REPLIES_MAX_PAGES; page++) {
+      const res = await this.app.client.conversations.replies(
+        cursor ? { channel, ts: threadTs, limit, cursor } : { channel, ts: threadTs, limit },
+      );
+      const messages = res.messages;
+      if (Array.isArray(messages)) {
+        for (const m of messages as Array<{ user?: string; text?: string; ts?: string; bot_id?: string }>) {
+          collected.push({
+            user: m.user ?? "",
+            text: m.text ?? "",
+            ts: m.ts ?? "",
+            isBot: Boolean(m.bot_id) || (this.botId !== undefined && m.user === this.botId),
+          });
+        }
+      }
+
+      const nextCursor = (res as { response_metadata?: { next_cursor?: string } }).response_metadata?.next_cursor;
+      if (!res.has_more || !nextCursor) break;
+      cursor = nextCursor;
+    }
+
+    return collected;
   }
 
   async getUserDisplayName(userId: string): Promise<string> {

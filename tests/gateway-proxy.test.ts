@@ -102,6 +102,31 @@ describe("createGatewayProxy", () => {
     expect(logger.warn).not.toHaveBeenCalled();
   });
 
+  it("delegates fetchThreadReplies to the live gateway, passing channel, thread ts and limit through", async () => {
+    const real = new FakeGateway();
+    const logger = makeLogger();
+    const proxy = createGatewayProxy(() => real, logger);
+    real.threadReplies = [{ user: "U1", text: "the alert", ts: "1.1", isBot: true }];
+
+    await expect(proxy.fetchThreadReplies("C1", "1.1", 50)).resolves.toEqual([
+      { user: "U1", text: "the alert", ts: "1.1", isBot: true },
+    ]);
+    expect(real.threadFetches).toEqual([{ channel: "C1", threadTs: "1.1", limit: 50 }]);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it("fetchThreadReplies returns an empty transcript, never throws, when there is no live gateway", async () => {
+    // Seeding is best-effort: chat routing proceeds with no history rather
+    // than failing the turn, so an unconfigured proxy must answer with a
+    // transcript shape instead of an exception.
+    const logger = makeLogger();
+    const proxy = createGatewayProxy(() => null, logger);
+    await expect(proxy.fetchThreadReplies("C1", "1.1", 50)).resolves.toEqual([]);
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("fetchThreadReplies"), expect.anything(),
+    );
+  });
+
   it("probe() reports false — never true — when there is no live gateway", async () => {
     // Fail-closed: the worker's watchdog treats a false probe as "recover",
     // so an unconfigured proxy answering `true` would suppress recovery
