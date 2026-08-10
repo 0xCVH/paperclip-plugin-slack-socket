@@ -652,43 +652,58 @@ export function createChat(deps: ChatDeps): Chat {
    * The bot's own messages are labelled exactly "you" so the agent reads its
    * own alert as its own words rather than as a third party's claim. `isBot`
    * alone is not enough for that — another app's messages are a third party,
-   * so the id has to match this bot's. `names` is per-turn, so a 40-message
-   * thread between three people costs three users.info calls, not 40.
+   * so the id has to match this bot's.
    *
    * A message with no user id at all (Slack's bot_id present but no
    * accompanying user — see ThreadMessage's isBot note in types.ts) never
    * reaches gateway.getUserDisplayName(""); it gets UNKNOWN_SPEAKER_LABEL
    * directly, so the line still reads as "[unknown] ..." instead of
    * "[] ...".
+   *
+   * IMPORTANT 2 (fix round 1): resolution is dedupe-then-resolve, not one id
+   * at a time. Every distinct non-bot, non-empty user id in the thread is
+   * collected first, then all of them are looked up CONCURRENTLY. This runs
+   * before the caller's turn watchdog has even started (see buildSeedBlock /
+   * converse), so a sequential await-per-speaker on a busy thread could
+   * leave a person staring at total silence for as long as it takes N
+   * users.info calls to finish one after another. The per-turn cache this
+   * replaces is not lost — it becomes the resolved id set itself, so a
+   * speaker who wrote five times in the thread still costs exactly one
+   * users.info call, just concurrently with everyone else's instead of
+   * blocking them.
    */
   async function resolveThreadEntries(messages: ThreadMessage[]): Promise<ThreadContextEntry[]> {
     const botId = gateway.botUserId();
-    const names = new Map<string, string>();
-    const entries: ThreadContextEntry[] = [];
+    const isBotsOwn = (message: ThreadMessage): boolean =>
+      message.isBot && botId !== undefined && message.user === botId;
+
+    const idsToResolve = new Set<string>();
     for (const message of messages) {
-      if (message.isBot && botId !== undefined && message.user === botId) {
-        entries.push({ label: "you", text: message.text });
-        continue;
-      }
-      if (!message.user) {
-        entries.push({ label: UNKNOWN_SPEAKER_LABEL, text: message.text });
-        continue;
-      }
-      let label = names.get(message.user);
-      if (label === undefined) {
+      if (!isBotsOwn(message) && message.user) idsToResolve.add(message.user);
+    }
+
+    const names = new Map<string, string>();
+    await Promise.all(
+      Array.from(idsToResolve, async (userId) => {
         // A name we can't resolve isn't worth failing a turn over: the raw
         // user id still attributes the line to a distinct speaker.
-        label = await gateway.getUserDisplayName(message.user).catch(() => message.user);
+        let label = await gateway.getUserDisplayName(userId).catch(() => userId);
         // CRITICAL: a resolved display name that reads as the reserved "you"
         // (case/whitespace-insensitively — see isReservedYouLabel) must never
         // reach rendering unchanged, or this speaker's line becomes
         // indistinguishable from the bot's own "[you] ..." line above.
-        if (isReservedYouLabel(label)) label = disambiguateReservedLabel(label, message.user);
-        names.set(message.user, label);
-      }
-      entries.push({ label, text: message.text });
-    }
-    return entries;
+        if (isReservedYouLabel(label)) label = disambiguateReservedLabel(label, userId);
+        names.set(userId, label);
+      }),
+    );
+
+    return messages.map((message) => {
+      if (isBotsOwn(message)) return { label: "you", text: message.text };
+      if (!message.user) return { label: UNKNOWN_SPEAKER_LABEL, text: message.text };
+      // Always present: every non-bot, non-empty user id was added to
+      // idsToResolve above and resolved (or fell back to itself) there.
+      return { label: names.get(message.user) ?? message.user, text: message.text };
+    });
   }
 
   /**
@@ -745,12 +760,14 @@ export function createChat(deps: ChatDeps): Chat {
   async function streamReply(
     cfg: SlackSocketConfig,
     entry: SessionEntry,
-    channel: string,
     // `undefined` means "post at the top level" — a channel-scoped 1:1 DM.
     replyThreadTs: string | undefined,
     prompt: string,
+    // Posted by the caller (converse) BEFORE any thread-history seeding, not
+    // here — see the placeholder-post call in converse for why. Also the
+    // source of the channel every message in this turn posts to.
+    placeholder: { channel: string; ts: string },
   ): Promise<void> {
-    const placeholder = await gateway.postMessage({ channel, threadTs: replyThreadTs, text: "_Thinking…_" });
     // Every message posted AFTER the placeholder — overflow chunks and the
     // watchdog's late reply — belongs under the reply, not beside it. In a
     // channel-scoped 1:1 DM there is no thread (`replyThreadTs` is
@@ -964,6 +981,18 @@ export function createChat(deps: ChatDeps): Chat {
       const text = stripMention(msg.text);
       if (!text) return;
       const { entry, created } = await getOrCreateSession(cfg, msg.channel, scope);
+      // Posted BEFORE any thread-history fetch, not after. Seeding can cost
+      // several sequential Slack API calls — paginated conversations.replies
+      // plus a users.info lookup per distinct speaker — and the turn
+      // watchdog does not start until streamReply runs below. Without this
+      // ordering, the very first turn in a busy thread could leave a person
+      // staring at total silence for as long as those calls take, with
+      // nothing armed yet to rescue them (see buildSeedBlock / streamReply).
+      const placeholder = await gateway.postMessage({
+        channel: msg.channel,
+        threadTs: scope.replyThreadTs,
+        text: "_Thinking…_",
+      });
       // Seed once, on this session's first turn only. Every later turn in the
       // same thread already has the history in the session, so re-sending it
       // would re-send the same text repeatedly and grow without bound.
@@ -971,7 +1000,7 @@ export function createChat(deps: ChatDeps): Chat {
       const prompt = seed
         ? `${seed}\n\n${buildChatPrompt(cfg.chatPromptPreamble, text)}`
         : buildChatPrompt(cfg.chatPromptPreamble, text);
-      await streamReply(cfg, entry, msg.channel, scope.replyThreadTs, prompt);
+      await streamReply(cfg, entry, scope.replyThreadTs, prompt, placeholder);
     } catch (err) {
       const reason = describeHostError(err);
       ctx.logger.error("Slack chat failed", { err: reason, channel: msg.channel });

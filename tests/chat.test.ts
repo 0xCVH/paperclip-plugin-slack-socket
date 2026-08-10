@@ -1840,6 +1840,34 @@ describe("thread history seeding", () => {
     expect(prompt).toContain("[you]");
   });
 
+  // IMPORTANT 2, fix round 1: buildSeedBlock used to run before the
+  // "_Thinking…_" placeholder was posted and before the turn watchdog
+  // started (streamReply owned both). Seeding can cost several sequential
+  // Slack calls — paginated conversations.replies plus a users.info lookup
+  // per distinct speaker — so a person could stare at total silence for as
+  // long as those calls take, with nothing armed to rescue them. Pins the
+  // ordering directly so it cannot silently regress back to that.
+  it("posts the _Thinking… placeholder before fetching thread history, so a slow thread never leaves the person with no acknowledgement at all", async () => {
+    const { chat, gateway, fetchThreadReplies } = setupSeeding();
+    const order: string[] = [];
+    const originalPostMessage = gateway.postMessage.bind(gateway);
+    gateway.postMessage = vi.fn(async (msg) => {
+      order.push("postMessage");
+      return originalPostMessage(msg);
+    });
+    fetchThreadReplies.mockImplementation(async () => {
+      order.push("fetchThreadReplies");
+      return alertThread("1000.2");
+    });
+
+    await chat.handleMention(mentionInThread("hi", "1000.2", "1000.1"));
+
+    const firstPost = order.indexOf("postMessage");
+    const firstFetch = order.indexOf("fetchThreadReplies");
+    expect(firstPost).toBeGreaterThanOrEqual(0);
+    expect(firstFetch).toBeGreaterThan(firstPost);
+  });
+
   it("does not re-seed the second turn in the same thread", async () => {
     const { ctx, chat, fetchThreadReplies } = setupSeeding();
     fetchThreadReplies.mockResolvedValue(alertThread("1000.2"));
