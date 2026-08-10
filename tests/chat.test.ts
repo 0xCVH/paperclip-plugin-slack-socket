@@ -1732,8 +1732,21 @@ describe("thread history seeding", () => {
   // ThreadMessage.user === "" (see the isBot note in types.ts). That must
   // never reach getUserDisplayName("") and render as "[] some text" — it
   // needs a stable fallback label instead.
+  //
+  // Fix round 1, IMPORTANT 1: FakeGateway's default getUserDisplayName
+  // returns `name-${userId}`, which is non-empty even for userId === "" —
+  // so without the override below this test was satisfied by "[name-] ..."
+  // whether or not the "" short-circuit exists at all, and proved nothing.
+  // The real gateway returns "" for an id it can't look up, which is
+  // exactly the case A3.3 exists for — so the override mirrors that, and
+  // the extra assertion pins that getUserDisplayName is never even called
+  // with "" (the actual fix), not just that the rendered output happens to
+  // look fine.
   it("gives a message with no user id at all a stable fallback label instead of rendering '[] ...'", async () => {
-    const { ctx, chat, fetchThreadReplies } = setupSeeding();
+    const { ctx, chat, gateway, fetchThreadReplies } = setupSeeding();
+    gateway.getUserDisplayName = vi.fn(async (userId: string) =>
+      userId === "" ? "" : `name-${userId}`,
+    );
     fetchThreadReplies.mockResolvedValue([
       threadMessage("UBOT", "the alert", "2100.1", true),
       threadMessage("", "posted with no user attached", "2100.15"),
@@ -1744,6 +1757,7 @@ describe("thread history seeding", () => {
       mentionInThread("raise a ticket for this issue here above", "2100.2", "2100.1"),
     );
 
+    expect(gateway.getUserDisplayName).not.toHaveBeenCalledWith("");
     const prompt = (ctx.agents.sessions.sendMessage as any).mock.calls[0][2].prompt as string;
     expect(prompt).not.toContain("[] posted with no user attached");
     expect(prompt).toContain("posted with no user attached");
