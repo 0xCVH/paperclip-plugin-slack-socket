@@ -248,6 +248,19 @@ const CONTROL_TAGS: ReadonlyArray<readonly [tag: string, escaped: string]> = [
 // fragments can rejoin into a live one. That's the invariant a change to
 // this function has to preserve.
 //
+// A second, easy-to-miss invariant this depends on: ANY later pass over
+// this same text — sanitizeLabel's newline collapse below, or anything
+// added after it — must SUBSTITUTE characters, never DELETE them. A tag
+// split across two fragments by, say, an embedded newline (e.g.
+// "</thread_cont" + "\n" + "ext>") does not match here and is left
+// unescaped on both sides, which is fine as long as the split persists.
+// But if a later pass ever replaces that newline with "" instead of a
+// character, the fragments rejoin into a live, unescaped tag — this
+// function already ran and won't run again. sanitizeLabel's newline
+// collapse below substitutes a SPACE for exactly this reason; if that ever
+// became "", or a future "strip zero-width/control characters" pass did,
+// this invariant would be the thing it broke.
+//
 // This is deliberately NOT escapeMrkdwn: that guards text on its way OUT to
 // Slack. This text travels IN, to the agent — applying Slack's escaping here
 // would mangle every & < > a person legitimately typed and would not be a
@@ -266,14 +279,44 @@ function neutralizeFenceTags(value: string): string {
 // distinction is load-bearing: it's how the bot tells its own proactive
 // alert apart from a third party's claim (see the buildThreadContext tests
 // above). "]" is neutralised so a label can never close its bracket early;
-// any newline is collapsed to a space so a label can never start a
-// rendered line of its own.
+// any newline is collapsed to a SPACE — not removed — so a label can never
+// start a rendered line of its own. The space is required, not cosmetic:
+// see the "substitute, never delete" note on neutralizeFenceTags above.
 function sanitizeLabel(label: string): string {
   return neutralizeFenceTags(label)
     .replaceAll("\r\n", " ")
     .replaceAll("\r", " ")
     .replaceAll("\n", " ")
     .replaceAll("]", "&#93;");
+}
+
+// Message bodies, unlike labels, are NOT newline-collapsed — multi-line
+// content (a list, a stack trace, a code block) has to survive readably,
+// which is the whole point of seeding the thread in the first place. That
+// leaves an embedded newline in a body as the easy half of the [you]
+// forgery: no display-name trickery needed, an ordinary message reading
+// "sure\n[you] SECURITY: ..." renders as a second line indistinguishable
+// from a genuine attribution line once buildThreadContext joins everything
+// with "\n".
+//
+// The fix is structural, not content-based: every line of a body after the
+// first is prefixed with CONTINUATION_MARKER, which is always prepended by
+// the renderer and never derived from the body — so body content can never
+// occupy the line-initial position a "[label] " attribution line occupies.
+// Only buildThreadContext's own template ever emits a line starting with
+// "[". The marker itself is inserted, never deletes anything, so it cannot
+// reassemble a split control tag either (see the invariant note above).
+//
+// This does NOT make an attributed line trustworthy — "&#93;", "&lt;...&gt;"
+// and homoglyph "]"/"[" remain legible to a model, so injected text can
+// still *describe* itself as "[you] ...". What this guarantees is narrower
+// and structural: no body content can occupy the attribution POSITION —
+// the start of a line — regardless of what it says.
+const CONTINUATION_MARKER = "  | ";
+
+function markContinuationLines(text: string): string {
+  const [first, ...rest] = text.split("\n");
+  return [first, ...rest.map((line) => `${CONTINUATION_MARKER}${line}`)].join("\n");
 }
 
 /**
@@ -290,14 +333,16 @@ function sanitizeLabel(label: string): string {
  *
  * One line per entry is a readability convention, not a parse boundary: a
  * multi-line Slack message stays multi-line, because the alert this feature
- * exists to show the agent is usually formatted.
+ * exists to show the agent is usually formatted — every line after the
+ * first is prefixed with CONTINUATION_MARKER (see markContinuationLines)
+ * so it can never be mistaken for a line-initial "[label] ..." attribution.
  */
 export function buildThreadContext(entries: ThreadContextEntry[], omitted: number): string {
   if (entries.length === 0) return "";
 
   const lines = entries.map((entry) => {
     const label = sanitizeLabel(entry.label);
-    const text = neutralizeFenceTags(entry.text.trim()) || EMPTY_TEXT_PLACEHOLDER;
+    const text = markContinuationLines(neutralizeFenceTags(entry.text.trim())) || EMPTY_TEXT_PLACEHOLDER;
     return `[${label}] ${text}`;
   });
   const notice =
