@@ -251,6 +251,25 @@ export class BoltGateway implements SlackGateway {
    * so the call rejects with a missing_scope error instead; this method does
    * not swallow that, so callers should treat a rejection as "no history
    * available" and proceed rather than fail the turn.
+   *
+   * `isBot` means specifically "this app posted it", not "some bot posted
+   * it". Per @slack/types' GenericMessageEvent (the shape of an ordinary,
+   * non-`bot_message`-subtype message — what a chat.postMessage call from
+   * this app's bot token always produces), `user` is a required field and
+   * is set to the posting bot user's id, while `bot_id` is merely optional
+   * metadata present on every bot-authored message, ours or anyone else's.
+   * So the only safe test is `user` matching this gateway's own captured
+   * bot id; `bot_id` is not read here at all. A foreign bot's message (e.g.
+   * a GitHub/Zapier/workflow-bot post) still carries its own `user` id in
+   * the returned ThreadMessage, so a consumer can resolve and label it via
+   * getUserDisplayName exactly like a human author — Slack bot users have
+   * real profiles. The one shape this deliberately does not special-case is
+   * a legacy `bot_message`-subtype event (old-style incoming-webhook
+   * integrations with no associated bot user, where `user` is absent and
+   * only a display-only `username` is provided): that message comes back
+   * with `user: ""`, `isBot: false`, and no name to resolve — the caller's
+   * existing fallback label for an unresolvable author covers it, so no
+   * extra field was added here for it.
    */
   async fetchThreadReplies(channel: string, threadTs: string, limit: number): Promise<ThreadMessage[]> {
     const collected: ThreadMessage[] = [];
@@ -262,12 +281,20 @@ export class BoltGateway implements SlackGateway {
       );
       const messages = res.messages;
       if (Array.isArray(messages)) {
-        for (const m of messages as Array<{ user?: string; text?: string; ts?: string; bot_id?: string }>) {
+        for (const m of messages as Array<{ user?: string; text?: string; ts?: string }>) {
           collected.push({
             user: m.user ?? "",
             text: m.text ?? "",
             ts: m.ts ?? "",
-            isBot: Boolean(m.bot_id) || (this.botId !== undefined && m.user === this.botId),
+            // Strictly "this app's own bot user", not "any bot". A message
+            // this app posts through chat.postMessage always comes back as
+            // a plain message event with `user` set to this gateway's own
+            // bot user id (see the round-1 fix note above the method for
+            // the evidence). `bot_id` alone is not a safe signal: it is set
+            // on every bot-authored message, including a GitHub/Zapier/
+            // workflow-bot post, and treating any bot_id as "self" would
+            // present a third party's words to the agent as its own.
+            isBot: this.botId !== undefined && m.user === this.botId,
           });
         }
       }

@@ -131,16 +131,20 @@ describe("BoltGateway (against a mocked @slack/bolt App)", () => {
 
   it("fetchThreadReplies maps a conversations.replies payload to ThreadMessage[]", async () => {
     const gateway = await makeGateway();
+    await gateway.start(); // captures user_id "UBOT" from auth.test
     appInstances[0]!.client.conversations.replies.mockResolvedValueOnce({
       ok: true,
       messages: [
-        { user: "U9", text: "Action needed: claimable subdomain", ts: "1.1", bot_id: "B1" },
+        // A message this app posted through slack_post_message: Slack's
+        // GenericMessageEvent sets `user` to the posting bot's own user id
+        // (matching auth.test's user_id) alongside `bot_id`.
+        { user: "UBOT", text: "Action needed: claimable subdomain", ts: "1.1", bot_id: "B1" },
         { user: "U1", text: "can you open a ticket for this?", ts: "1.2" },
       ],
     });
 
     await expect(gateway.fetchThreadReplies("C1", "1.1", 50)).resolves.toEqual([
-      { user: "U9", text: "Action needed: claimable subdomain", ts: "1.1", isBot: true },
+      { user: "UBOT", text: "Action needed: claimable subdomain", ts: "1.1", isBot: true },
       { user: "U1", text: "can you open a ticket for this?", ts: "1.2", isBot: false },
     ]);
     expect(appInstances[0]!.client.conversations.replies).toHaveBeenCalledWith({
@@ -158,6 +162,21 @@ describe("BoltGateway (against a mocked @slack/bolt App)", () => {
 
     const replies = await gateway.fetchThreadReplies("C1", "1.1", 50);
     expect(replies[0]!.isBot).toBe(true);
+  });
+
+  it("does not label a foreign bot's message as this app's own, even though it carries a bot_id", async () => {
+    // Round 1 fix: Boolean(bot_id) is true for ANY bot-authored message —
+    // GitHub, Zapier, a workflow bot, anything. Only a matching `user` (this
+    // gateway's own bot user id) means "this app said this".
+    const gateway = await makeGateway();
+    await gateway.start(); // captures user_id "UBOT" from auth.test
+    appInstances[0]!.client.conversations.replies.mockResolvedValueOnce({
+      ok: true,
+      messages: [{ user: "UGITHUB", text: "Deployed to production", ts: "1.4", bot_id: "BFOREIGN" }],
+    });
+
+    const replies = await gateway.fetchThreadReplies("C1", "1.1", 50);
+    expect(replies[0]!.isBot).toBe(false);
   });
 
   it("returns [] when the payload carries no messages array", async () => {
@@ -186,13 +205,14 @@ describe("BoltGateway (against a mocked @slack/bolt App)", () => {
     // thread's most recent messages — normally what "this issue above"
     // refers to — reach the transcript at all.
     const gateway = await makeGateway();
+    await gateway.start(); // captures user_id "UBOT" from auth.test
     appInstances[0]!.client.conversations.replies
       .mockResolvedValueOnce({
         ok: true,
         has_more: true,
         response_metadata: { next_cursor: "cursor-1" },
         messages: [
-          { user: "U9", text: "Action needed: claimable subdomain", ts: "1.1", bot_id: "B1" },
+          { user: "UBOT", text: "Action needed: claimable subdomain", ts: "1.1", bot_id: "B1" },
           { user: "U1", text: "can you open a ticket for this?", ts: "1.2" },
         ],
       })
@@ -203,7 +223,7 @@ describe("BoltGateway (against a mocked @slack/bolt App)", () => {
       });
 
     await expect(gateway.fetchThreadReplies("C1", "1.1", 200)).resolves.toEqual([
-      { user: "U9", text: "Action needed: claimable subdomain", ts: "1.1", isBot: true },
+      { user: "UBOT", text: "Action needed: claimable subdomain", ts: "1.1", isBot: true },
       { user: "U1", text: "can you open a ticket for this?", ts: "1.2", isBot: false },
       { user: "U2", text: "on it", ts: "1.3", isBot: false },
     ]);

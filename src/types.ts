@@ -141,10 +141,19 @@ export interface OutboundMessage {
 }
 
 /**
- * One message read back from a Slack thread. `isBot` is true for anything
- * this app posted — including an alert another agent run wrote through the
- * `slack_post_message` tool — so a transcript can label it as the bot's own
- * words rather than a third party's claim.
+ * One message read back from a Slack thread. `isBot` is true only for
+ * messages this app itself posted — including an alert another agent run
+ * wrote through the `slack_post_message` tool — identified by the message's
+ * Slack user id matching this gateway's own bot user id, so a transcript
+ * can label it as the bot's own words rather than a third party's claim.
+ *
+ * `isBot` is deliberately NOT set merely because a message carries Slack's
+ * `bot_id` field: any other integration (GitHub, Zapier, a workflow bot, …)
+ * posts with a `bot_id` too, and conflating "posted by some bot" with
+ * "posted by this app" would let a transcript misrepresent a third party's
+ * words as the agent's own. A foreign bot's message keeps its own `user` id
+ * in this shape, so a consumer can resolve and label it like any other
+ * author instead of an anonymous one.
  */
 export interface ThreadMessage {
   user: string;
