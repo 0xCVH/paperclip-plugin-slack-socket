@@ -567,7 +567,10 @@ export function createChat(deps: ChatDeps): Chat {
   ): Promise<{ entry: SessionEntry; created: boolean }> {
     const key = scope.key;
     const inFlight = inFlightSessions.get(key);
-    if (inFlight) return inFlight;
+    // A caller that joins an in-flight creation is NOT the creator: handing
+    // it the creator's `created: true` would make two turns each seed the
+    // thread into the one session they share.
+    if (inFlight) return { ...(await inFlight), created: false };
 
     const promise = (async (): Promise<{ entry: SessionEntry; created: boolean }> => {
       const existing = (await ctx.state.get(stateScope(key))) as SessionEntry | null;
