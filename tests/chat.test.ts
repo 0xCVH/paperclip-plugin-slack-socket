@@ -1639,3 +1639,236 @@ describe("buildThreadContext", () => {
     expect(lines.some((l) => l === "  | ")).toBe(false);
   });
 });
+
+describe("thread history seeding", () => {
+  // Replaces the gateway method outright rather than driving FakeGateway's
+  // transcript, so every test here controls the fetch and can count it —
+  // same pattern as the gateway overrides in approvals.test.ts.
+  function setupSeeding(configOverrides = {}) {
+    const bundle = setup(configOverrides);
+    const fetchThreadReplies = vi.fn(async (): Promise<ThreadMessage[]> => []);
+    bundle.gateway.fetchThreadReplies = fetchThreadReplies;
+    return { ...bundle, fetchThreadReplies };
+  }
+
+  const threadMessage = (
+    user: string,
+    text: string,
+    ts: string,
+    isBot = false,
+  ): ThreadMessage => ({ user, text, ts, isBot });
+
+  // The reported defect as a transcript: an alert the bot posted itself
+  // through slack_post_message, a reply from a third person, then the
+  // mention that triggers this turn.
+  const alertThread = (triggerTs: string): ThreadMessage[] => [
+    threadMessage("UBOT", "Action needed: claimable subdomain on polygon.technology", "1000.1", true),
+    threadMessage("U-OTHER", "confirmed, it still resolves", "1000.15"),
+    threadMessage("U-HUMAN", "<@UBOT> raise a ticket for this issue here above", triggerTs),
+  ];
+
+  const mentionInThread = (text: string, ts: string, threadTs: string): InboundMessage => ({
+    channel: "C-ALERT", channelType: "channel", user: "U-HUMAN",
+    text: `<@UBOT> ${text}`, ts, threadTs,
+  });
+
+  it("prepends the thread transcript to the first prompt of a newly created session", async () => {
+    const { ctx, chat, fetchThreadReplies } = setupSeeding();
+    fetchThreadReplies.mockResolvedValue(alertThread("1000.2"));
+
+    await chat.handleMention(
+      mentionInThread("raise a ticket for this issue here above", "1000.2", "1000.1"),
+    );
+
+    expect(fetchThreadReplies).toHaveBeenCalledWith("C-ALERT", "1000.1", THREAD_CONTEXT_MAX_MESSAGES);
+    const prompt = (ctx.agents.sessions.sendMessage as any).mock.calls[0][2].prompt as string;
+    // The fenced block goes first and the prompt proper is untouched under it.
+    expect(prompt.startsWith(THREAD_CONTEXT_OPEN_TAG)).toBe(true);
+    expect(prompt).toContain(THREAD_CONTEXT_CLOSE_TAG);
+    expect(
+      prompt.endsWith(
+        buildChatPrompt(TEST_CONFIG.chatPromptPreamble, "raise a ticket for this issue here above"),
+      ),
+    ).toBe(true);
+    // The bot's own alert is labelled "you", so it reads as its own words
+    // rather than as a third party's claim it has to take on trust.
+    expect(prompt).toContain("[you]");
+    expect(prompt).toContain("Action needed: claimable subdomain on polygon.technology");
+    // Other speakers are attributed by display name (FakeGateway: name-<id>).
+    expect(prompt).toContain("[name-U-OTHER]");
+  });
+
+  // A3.5: resolveThreadEntries is private to createChat, so this pins the
+  // load-bearing conjunct — bot vs. resolvable human vs. an id that can't be
+  // resolved — with one thread instead of relying on scattered toContain
+  // assertions in unrelated tests.
+  it("labels the bot's own message [you], a resolvable user by display name, and an unresolvable user by its stable raw id", async () => {
+    const { ctx, chat, gateway, fetchThreadReplies } = setupSeeding();
+    gateway.getUserDisplayName = vi.fn(async (userId: string) => {
+      if (userId === "U-GHOST") throw new Error("users_not_found");
+      return `name-${userId}`;
+    });
+    fetchThreadReplies.mockResolvedValue([
+      threadMessage("UBOT", "the alert", "2000.1", true),
+      threadMessage("U-OTHER", "confirmed, still resolves", "2000.15"),
+      threadMessage("U-GHOST", "a reply from a deleted account", "2000.16"),
+      threadMessage("U-HUMAN", "<@UBOT> raise a ticket for this issue here above", "2000.2"),
+    ]);
+
+    await chat.handleMention(
+      mentionInThread("raise a ticket for this issue here above", "2000.2", "2000.1"),
+    );
+
+    const prompt = (ctx.agents.sessions.sendMessage as any).mock.calls[0][2].prompt as string;
+    expect(prompt).toContain("[you] the alert");
+    expect(prompt).toContain("[name-U-OTHER] confirmed, still resolves");
+    // A lookup failure isn't worth failing the turn over: the raw id still
+    // attributes the line to a distinct speaker, and it's stable (the same
+    // id every time) rather than blank.
+    expect(prompt).toContain("[U-GHOST] a reply from a deleted account");
+  });
+
+  // A3.3: a message carrying Slack's bot_id but no accompanying user maps to
+  // ThreadMessage.user === "" (see the isBot note in types.ts). That must
+  // never reach getUserDisplayName("") and render as "[] some text" — it
+  // needs a stable fallback label instead.
+  it("gives a message with no user id at all a stable fallback label instead of rendering '[] ...'", async () => {
+    const { ctx, chat, fetchThreadReplies } = setupSeeding();
+    fetchThreadReplies.mockResolvedValue([
+      threadMessage("UBOT", "the alert", "2100.1", true),
+      threadMessage("", "posted with no user attached", "2100.15"),
+      threadMessage("U-HUMAN", "<@UBOT> raise a ticket for this issue here above", "2100.2"),
+    ]);
+
+    await chat.handleMention(
+      mentionInThread("raise a ticket for this issue here above", "2100.2", "2100.1"),
+    );
+
+    const prompt = (ctx.agents.sessions.sendMessage as any).mock.calls[0][2].prompt as string;
+    expect(prompt).not.toContain("[] posted with no user attached");
+    expect(prompt).toContain("posted with no user attached");
+    // Stable: the same fallback label every time, not the empty string.
+    const fallbackLine = prompt.split("\n").find((l) => l.includes("posted with no user attached"));
+    expect(fallbackLine).toMatch(/^\[\S+\] posted with no user attached$/);
+  });
+
+  // A3.4: the spec calls this out explicitly — a DM under dmSessionMode
+  // "thread" gets its own thread-keyed session per top-level message,
+  // indistinguishable from any other thread-scoped surface, so it inherits
+  // the generic thread path and DOES seed. Only a channel-scoped DM (the
+  // default) is exempt, because it has no thread root at all.
+  it('seeds a DM under dmSessionMode "thread", which inherits the generic thread path', async () => {
+    const { ctx, chat, fetchThreadReplies } = setupSeeding({ dmSessionMode: "thread" });
+    fetchThreadReplies.mockResolvedValue(alertThread("3000.2"));
+
+    await chat.handleMessage(dm("raise a ticket for this issue here above", "3000.2", "3000.1"));
+
+    expect(fetchThreadReplies).toHaveBeenCalledWith("D1", "3000.1", THREAD_CONTEXT_MAX_MESSAGES);
+    const prompt = (ctx.agents.sessions.sendMessage as any).mock.calls[0][2].prompt as string;
+    expect(prompt.startsWith(THREAD_CONTEXT_OPEN_TAG)).toBe(true);
+    expect(prompt).toContain("[you]");
+  });
+
+  it("does not re-seed the second turn in the same thread", async () => {
+    const { ctx, chat, fetchThreadReplies } = setupSeeding();
+    fetchThreadReplies.mockResolvedValue(alertThread("1000.2"));
+
+    await chat.handleMention(mentionInThread("first", "1000.2", "1000.1"));
+    expect(fetchThreadReplies).toHaveBeenCalledTimes(1);
+
+    await chat.handleMention(mentionInThread("second", "1000.3", "1000.1"));
+
+    // The session already holds the history; re-sending it every turn would
+    // grow the prompt without bound for no gain.
+    expect(fetchThreadReplies).toHaveBeenCalledTimes(1);
+    expect(ctx.agents.sessions.create).toHaveBeenCalledTimes(1);
+    const second = (ctx.agents.sessions.sendMessage as any).mock.calls[1][2].prompt as string;
+    expect(second).toBe(buildChatPrompt(TEST_CONFIG.chatPromptPreamble, "second"));
+  });
+
+  // A3.2: the guard has to land in the same commit as the fetch — an
+  // unwrapped conversations.replies failure must never escape into
+  // converse's outer catch and replace a working reply with an apology.
+  it("still replies normally when the thread fetch fails", async () => {
+    const { ctx, gateway, chat, fetchThreadReplies } = setupSeeding();
+    fetchThreadReplies.mockRejectedValue(new Error("channel_not_found"));
+
+    await chat.handleMention(mentionInThread("hi", "1000.2", "1000.1"));
+
+    // An answer without context beats no answer: a failed fetch must not
+    // escape into converse's catch and turn a normal turn into an apology.
+    const prompt = (ctx.agents.sessions.sendMessage as any).mock.calls[0]?.[2]?.prompt;
+    expect(prompt).toBe(buildChatPrompt(TEST_CONFIG.chatPromptPreamble, "hi"));
+    expect(gateway.updates.at(-1)?.text).toBe("Hello there!");
+    expect(gateway.posts.some((p) => p.text.includes("something went wrong"))).toBe(false);
+    const warnings = (ctx.logger.warn as any).mock.calls.map((c: unknown[]) => c[0]);
+    expect(warnings.join(" ")).toContain("thread history");
+  });
+
+  it("logs a warning and seeds nothing when the thread comes back empty", async () => {
+    const { ctx, gateway, chat, fetchThreadReplies } = setupSeeding();
+    fetchThreadReplies.mockResolvedValue([]);
+
+    await chat.handleMention(mentionInThread("hi", "1000.2", "1000.1"));
+
+    const prompt = (ctx.agents.sessions.sendMessage as any).mock.calls[0][2].prompt as string;
+    expect(prompt).toBe(buildChatPrompt(TEST_CONFIG.chatPromptPreamble, "hi"));
+    expect(gateway.updates.at(-1)?.text).toBe("Hello there!");
+    // A thread that reads back as nothing is abnormal — an unconfigured
+    // gateway, or a Slack error the gateway swallowed — and an operator has
+    // to be able to see it happened.
+    const warnings = (ctx.logger.warn as any).mock.calls.map((c: unknown[]) => c[0]);
+    expect(warnings.join(" ")).toContain("thread history");
+  });
+
+  it("seeds only once when two first messages race in the same thread", async () => {
+    const { ctx, chat, fetchThreadReplies } = setupSeeding();
+    fetchThreadReplies.mockResolvedValue(alertThread("1000.2"));
+
+    await Promise.all([
+      chat.handleMention(mentionInThread("first", "1000.2", "1000.1")),
+      chat.handleMention(mentionInThread("second", "1000.3", "1000.1")),
+    ]);
+
+    expect(ctx.agents.sessions.create).toHaveBeenCalledTimes(1);
+    // The caller that merely joined the in-flight creation is not the
+    // creator. If it reported `created` as well, both turns would seed the
+    // same thread into the same session.
+    expect(fetchThreadReplies).toHaveBeenCalledTimes(1);
+  });
+
+  it("makes no fetch and sends today's prompt byte-for-byte when seedThreadHistory is off", async () => {
+    const { ctx, chat, fetchThreadReplies } = setupSeeding({ seedThreadHistory: false });
+    fetchThreadReplies.mockResolvedValue(alertThread("1000.2"));
+
+    await chat.handleMention(mentionInThread("hi", "1000.2", "1000.1"));
+
+    expect(fetchThreadReplies).not.toHaveBeenCalled();
+    const prompt = (ctx.agents.sessions.sendMessage as any).mock.calls[0][2].prompt as string;
+    expect(prompt).toBe(buildChatPrompt(TEST_CONFIG.chatPromptPreamble, "hi"));
+  });
+
+  it("does not fetch for a channel-scoped DM session, which has no thread root", async () => {
+    // dmSessionMode "channel" (the default): every message in the DM joins
+    // one session keyed to the channel, so there is no thread root to read
+    // even when the person happens to have written inside a thread.
+    const { chat, fetchThreadReplies } = setupSeeding();
+    fetchThreadReplies.mockResolvedValue(alertThread("200.3"));
+
+    await chat.handleMessage(dm("hi", "200.3", "200.2"));
+
+    expect(fetchThreadReplies).not.toHaveBeenCalled();
+  });
+
+  it("does not fetch for a top-level mention, which is its own thread root", async () => {
+    const { chat, fetchThreadReplies } = setupSeeding();
+    fetchThreadReplies.mockResolvedValue(alertThread("400.1"));
+
+    await chat.handleMention({
+      channel: "C1", channelType: "channel", user: "U1", text: "<@UBOT> hello", ts: "400.1",
+    });
+
+    // Nothing is above the message that started the thread.
+    expect(fetchThreadReplies).not.toHaveBeenCalled();
+  });
+});

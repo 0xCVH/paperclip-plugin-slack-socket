@@ -7,6 +7,8 @@ import {
   STATE_KEYS,
   stateScope,
   THREAD_CONTEXT_CLOSE_TAG,
+  THREAD_CONTEXT_MAX_CHARS,
+  THREAD_CONTEXT_MAX_MESSAGES,
   THREAD_CONTEXT_MAX_PARENT_CHARS,
   THREAD_CONTEXT_OPEN_TAG,
 } from "./constants.js";
@@ -212,6 +214,17 @@ const THREAD_CONTEXT_FRAMING =
 // whose `text` fallback is empty — still gets a line. A blank one would
 // silently lose the turn from the transcript.
 const EMPTY_TEXT_PLACEHOLDER = "(no text)";
+
+// Label for a thread message with no Slack user id at all: Slack's bot_id
+// present but no accompanying user (see ThreadMessage's isBot note in
+// types.ts), which ThreadMessage represents as user: "". That must never
+// reach gateway.getUserDisplayName(""), and it must never render as the
+// empty string either — "[] some text" reads as a truncated or malformed
+// line, not an attribution. This is a fixed, stable label rather than the
+// raw (empty) id, unlike the fallback for a non-empty id whose lookup
+// fails — see resolveThreadEntries, which already has a stable, non-empty
+// label to fall back to in that case (the raw id itself).
+const UNKNOWN_SPEAKER_LABEL = "unknown";
 
 function escapeFenceTag(tag: string): string {
   return tag.replaceAll("<", "&lt;").replaceAll(">", "&gt;");
@@ -508,7 +521,7 @@ export function createChat(deps: ChatDeps): Chat {
 
   // Guards against two concurrent "first messages" in the same thread both
   // passing the "no existing session" check and creating duplicate sessions.
-  const inFlightSessions = new Map<string, Promise<SessionEntry>>();
+  const inFlightSessions = new Map<string, Promise<{ entry: SessionEntry; created: boolean }>>();
 
   function stripMention(text: string): string {
     const botId = gateway.botUserId();
@@ -551,23 +564,23 @@ export function createChat(deps: ChatDeps): Chat {
     cfg: SlackSocketConfig,
     channel: string,
     scope: SessionScope,
-  ): Promise<SessionEntry> {
+  ): Promise<{ entry: SessionEntry; created: boolean }> {
     const key = scope.key;
     const inFlight = inFlightSessions.get(key);
     if (inFlight) return inFlight;
 
-    const promise = (async (): Promise<SessionEntry> => {
+    const promise = (async (): Promise<{ entry: SessionEntry; created: boolean }> => {
       const existing = (await ctx.state.get(stateScope(key))) as SessionEntry | null;
       if (existing) {
         const updated = { ...existing, lastActivityAt: new Date().toISOString() };
         await ctx.state.set(stateScope(key), updated);
-        return updated;
+        return { entry: updated, created: false };
       }
-      const created = await ctx.agents.sessions.create(cfg.defaultAgentId, cfg.companyId, {
+      const session = await ctx.agents.sessions.create(cfg.defaultAgentId, cfg.companyId, {
         reason: "slack-thread",
       });
       const entry: SessionEntry = {
-        sessionId: created.sessionId,
+        sessionId: session.sessionId,
         channel,
         // NOT a key round-trip. `scope.replyThreadTs` mirrors wherever the
         // triggering message actually landed — for a channel-scoped DM
@@ -590,7 +603,7 @@ export function createChat(deps: ChatDeps): Chat {
       await updateIndex(ctx, STATE_KEYS.sessionIndex, (current) =>
         current.includes(key) ? current : [...current, key],
       );
-      return entry;
+      return { entry, created: true };
     })();
 
     inFlightSessions.set(key, promise);
@@ -598,6 +611,92 @@ export function createChat(deps: ChatDeps): Chat {
       return await promise;
     } finally {
       inFlightSessions.delete(key);
+    }
+  }
+
+  /**
+   * Turns fetched thread messages into rendering entries by resolving a
+   * speaker label for each one.
+   *
+   * The bot's own messages are labelled exactly "you" so the agent reads its
+   * own alert as its own words rather than as a third party's claim. `isBot`
+   * alone is not enough for that — another app's messages are a third party,
+   * so the id has to match this bot's. `names` is per-turn, so a 40-message
+   * thread between three people costs three users.info calls, not 40.
+   *
+   * A message with no user id at all (Slack's bot_id present but no
+   * accompanying user — see ThreadMessage's isBot note in types.ts) never
+   * reaches gateway.getUserDisplayName(""); it gets UNKNOWN_SPEAKER_LABEL
+   * directly, so the line still reads as "[unknown] ..." instead of
+   * "[] ...".
+   */
+  async function resolveThreadEntries(messages: ThreadMessage[]): Promise<ThreadContextEntry[]> {
+    const botId = gateway.botUserId();
+    const names = new Map<string, string>();
+    const entries: ThreadContextEntry[] = [];
+    for (const message of messages) {
+      if (message.isBot && botId !== undefined && message.user === botId) {
+        entries.push({ label: "you", text: message.text });
+        continue;
+      }
+      if (!message.user) {
+        entries.push({ label: UNKNOWN_SPEAKER_LABEL, text: message.text });
+        continue;
+      }
+      let label = names.get(message.user);
+      if (label === undefined) {
+        // A name we can't resolve isn't worth failing a turn over: the raw
+        // user id still attributes the line to a distinct speaker.
+        label = await gateway.getUserDisplayName(message.user).catch(() => message.user);
+        names.set(message.user, label);
+      }
+      entries.push({ label, text: message.text });
+    }
+    return entries;
+  }
+
+  /**
+   * Renders the thread this message landed in as a <thread_context> block,
+   * or "" when there is nothing to prepend.
+   *
+   * Never throws. A thread we cannot read has to degrade to exactly today's
+   * behavior — an answer with no history — rather than escaping into
+   * converse's catch and replacing a perfectly good turn with ":warning:
+   * Sorry — something went wrong". An answer without context beats no answer.
+   */
+  async function buildSeedBlock(msg: InboundMessage, scope: SessionScope): Promise<string> {
+    const threadTs = scope.replyThreadTs;
+    if (threadTs === undefined) return "";
+    try {
+      const fetched = await gateway.fetchThreadReplies(
+        msg.channel,
+        threadTs,
+        THREAD_CONTEXT_MAX_MESSAGES,
+      );
+      if (fetched.length === 0) {
+        // Not the same as "nothing survived selection" below, which is
+        // normal: an empty fetch means the parent didn't come back either.
+        ctx.logger.warn("Slack thread history came back empty; continuing without it", {
+          channel: msg.channel,
+          threadTs,
+        });
+        return "";
+      }
+      const { kept, omitted } = selectThreadMessages(
+        fetched,
+        msg.ts,
+        THREAD_CONTEXT_MAX_CHARS,
+        THREAD_CONTEXT_MAX_MESSAGES,
+      );
+      if (kept.length === 0) return "";
+      return buildThreadContext(await resolveThreadEntries(kept), omitted);
+    } catch (err) {
+      ctx.logger.warn("Slack thread history fetch failed; continuing without it", {
+        err: errString(err),
+        channel: msg.channel,
+        threadTs,
+      });
+      return "";
     }
   }
 
@@ -822,8 +921,14 @@ export function createChat(deps: ChatDeps): Chat {
       replyThreadTs = scope.replyThreadTs;
       const text = stripMention(msg.text);
       if (!text) return;
-      const prompt = buildChatPrompt(cfg.chatPromptPreamble, text);
-      const entry = await getOrCreateSession(cfg, msg.channel, scope);
+      const { entry, created } = await getOrCreateSession(cfg, msg.channel, scope);
+      // Seed once, on this session's first turn only. Every later turn in the
+      // same thread already has the history in the session, so re-sending it
+      // would re-send the same text repeatedly and grow without bound.
+      const seed = created ? await buildSeedBlock(msg, scope) : "";
+      const prompt = seed
+        ? `${seed}\n\n${buildChatPrompt(cfg.chatPromptPreamble, text)}`
+        : buildChatPrompt(cfg.chatPromptPreamble, text);
       await streamReply(cfg, entry, msg.channel, scope.replyThreadTs, prompt);
     } catch (err) {
       const reason = describeHostError(err);
