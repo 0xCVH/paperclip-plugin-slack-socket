@@ -6,6 +6,7 @@ import {
   RESET_KEYWORD,
   STATE_KEYS,
   stateScope,
+  THREAD_CONTEXT_MAX_PARENT_CHARS,
 } from "./constants.js";
 import { escapeMrkdwn } from "./formatters.js";
 import { markdownToMrkdwn } from "./mrkdwn.js";
@@ -18,6 +19,7 @@ import type {
   SessionEntry,
   SlackGateway,
   SlackSocketConfig,
+  ThreadMessage,
 } from "./types.js";
 import { MAX_MESSAGE_LENGTH, splitIntoChunks } from "./slack-text.js";
 
@@ -116,6 +118,74 @@ export function extractReply(text: string): string {
 export function buildChatPrompt(preamble: string, text: string): string {
   if (!preamble.trim()) return text;
   return `${preamble}\n\nSlack message:\n${text}`;
+}
+
+// Marks a parent message's text as cut short by THREAD_CONTEXT_MAX_PARENT_CHARS.
+// Visible rather than silent: a truncated parent is still what "this issue
+// here above" points at, and the agent must be able to tell it is reading a
+// partial version of it rather than the whole thing.
+function truncateParentText(text: string): string {
+  if (text.length <= THREAD_CONTEXT_MAX_PARENT_CHARS) return text;
+  const dropped = text.length - THREAD_CONTEXT_MAX_PARENT_CHARS;
+  return `${text.slice(0, THREAD_CONTEXT_MAX_PARENT_CHARS)}\n… [truncated, ${dropped} more characters omitted] …`;
+}
+
+/**
+ * Picks which messages of a Slack thread to put in front of the agent, and
+ * how many were left out. Pure — four arguments, no `ctx`, no gateway, no
+ * clock — so the whole bounds rule is unit-testable without host plumbing.
+ *
+ * `messages` is chronological, oldest first (the order
+ * `conversations.replies` returns).
+ *
+ * - The triggering message is dropped by `ts`: it arrives as the prompt
+ *   proper (see buildChatPrompt), and keeping it here would double it.
+ * - The oldest remaining message — the thread parent — is always kept,
+ *   whatever the bounds say. It is what "this issue here above" points at,
+ *   and it is the message this whole feature exists to show the agent. Its
+ *   own text is separately capped at THREAD_CONTEXT_MAX_PARENT_CHARS with a
+ *   visible marker (see truncateParentText) — a single Slack message can
+ *   carry ~40,000 characters, and without this cap the parent alone could
+ *   blow past the overall budget several times over before a single reply
+ *   is even considered. The (possibly truncated) parent length is what
+ *   seeds the budget below, so unlike its presence in `kept`, its length is
+ *   NOT exempt from `maxChars`.
+ * - The rest are taken most-recent-first and stop at the first message that
+ *   would breach either bound, then go back into chronological order.
+ *   Stopping rather than skipping-and-continuing keeps the kept replies
+ *   contiguous, so the agent reads an unbroken tail of the conversation
+ *   instead of a sampled one it cannot tell has holes in it.
+ * - `omitted` is what was dropped, so the caller can say so in-band.
+ *   Silent truncation would let the agent answer confidently from a
+ *   partial thread.
+ */
+export function selectThreadMessages(
+  messages: ThreadMessage[],
+  triggeringTs: string,
+  maxChars: number,
+  maxMessages: number,
+): { kept: ThreadMessage[]; omitted: number } {
+  const candidates = messages.filter((m) => m.ts !== triggeringTs);
+  if (candidates.length === 0) return { kept: [], omitted: 0 };
+
+  const rawParent = candidates[0]!;
+  const parentText = truncateParentText(rawParent.text);
+  const parent: ThreadMessage = parentText === rawParent.text ? rawParent : { ...rawParent, text: parentText };
+
+  const tail: ThreadMessage[] = [];
+  let chars = parent.text.length;
+  let count = 1;
+  for (let i = candidates.length - 1; i >= 1; i -= 1) {
+    const msg = candidates[i]!;
+    if (count >= maxMessages) break;
+    if (chars + msg.text.length > maxChars) break;
+    tail.push(msg);
+    chars += msg.text.length;
+    count += 1;
+  }
+
+  const kept = [parent, ...tail.reverse()];
+  return { kept, omitted: candidates.length - kept.length };
 }
 
 // Floor for a single chat turn's watchdog timeout. The manifest schema's

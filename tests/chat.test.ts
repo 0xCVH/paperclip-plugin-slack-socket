@@ -6,6 +6,7 @@ import {
   extractReply,
   filterRuntimeNoticeLines,
   resolveSessionScope,
+  selectThreadMessages,
 } from "../src/chat.js";
 import {
   CHANNEL_SESSION_TS,
@@ -13,8 +14,11 @@ import {
   REPLY_CLOSE_TAG,
   REPLY_OPEN_TAG,
   STATE_KEYS,
+  THREAD_CONTEXT_MAX_CHARS,
+  THREAD_CONTEXT_MAX_MESSAGES,
+  THREAD_CONTEXT_MAX_PARENT_CHARS,
 } from "../src/constants.js";
-import type { InboundMessage } from "../src/types.js";
+import type { InboundMessage, ThreadMessage } from "../src/types.js";
 import { FakeGateway, makeCtx, TEST_CONFIG } from "./helpers.js";
 
 function setup(configOverrides = {}) {
@@ -1210,5 +1214,141 @@ describe("reset keyword", () => {
     expect(ctx.agents.sessions.close).not.toHaveBeenCalled();
     expect(stateStore.get(key)).toBeTruthy();
     expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledWith("sess-dm", "co-1", expect.anything());
+  });
+});
+
+describe("selectThreadMessages", () => {
+  // Chronological, oldest first — the order conversations.replies returns.
+  const msg = (ts: string, text: string, isBot = false): ThreadMessage => ({
+    user: isBot ? "UBOT" : `U-${ts}`,
+    text,
+    ts,
+    isBot,
+  });
+
+  it("drops the triggering message — it arrives as the prompt proper, so keeping it would double it", () => {
+    const { kept, omitted } = selectThreadMessages(
+      [msg("1.0", "Action needed: claimable subdomain", true), msg("2.0", "<@UBOT> raise a ticket for this")],
+      "2.0",
+      1000,
+      50,
+    );
+    expect(kept.map((m) => m.ts)).toEqual(["1.0"]);
+    expect(omitted).toBe(0);
+  });
+
+  it("returns nothing when the triggering message is the whole thread", () => {
+    // A top-level @mention that starts its own thread: the parent IS the
+    // trigger, so there is no history and the prompt must stay unseeded.
+    expect(selectThreadMessages([msg("1.0", "<@UBOT> hi")], "1.0", 1000, 50)).toEqual({
+      kept: [],
+      omitted: 0,
+    });
+  });
+
+  it("returns nothing for an empty transcript", () => {
+    expect(selectThreadMessages([], "1.0", 1000, 50)).toEqual({ kept: [], omitted: 0 });
+  });
+
+  it("keeps every message, in chronological order, when the whole thread fits", () => {
+    const { kept, omitted } = selectThreadMessages(
+      [msg("1.0", "the alert", true), msg("2.0", "seen it"), msg("3.0", "same here"), msg("4.0", "<@UBOT> ticket?")],
+      "4.0",
+      1000,
+      50,
+    );
+    expect(kept.map((m) => m.ts)).toEqual(["1.0", "2.0", "3.0"]);
+    expect(omitted).toBe(0);
+  });
+
+  it("under the message cap, keeps the parent plus the most recent replies, chronologically", () => {
+    const { kept, omitted } = selectThreadMessages(
+      [
+        msg("1.0", "the alert", true),
+        msg("2.0", "a"),
+        msg("3.0", "b"),
+        msg("4.0", "c"),
+        msg("5.0", "<@UBOT> ticket?"),
+      ],
+      "5.0",
+      1000,
+      3,
+    );
+    // Parent (always) + the two newest, back in the order they were said.
+    expect(kept.map((m) => m.ts)).toEqual(["1.0", "3.0", "4.0"]);
+    expect(omitted).toBe(1);
+  });
+
+  it("under the char cap, counts the parent against the budget and stops at the first reply that would breach it", () => {
+    const { kept, omitted } = selectThreadMessages(
+      [msg("1.0", "aaaa", true), msg("2.0", "bbbb"), msg("3.0", "cccc"), msg("4.0", "<@UBOT> ticket?")],
+      "4.0",
+      8,
+      50,
+    );
+    // 4 (parent) + 4 (newest) exactly fills 8; the next would make 12.
+    expect(kept.map((m) => m.ts)).toEqual(["1.0", "3.0"]);
+    expect(omitted).toBe(1);
+  });
+
+  it("keeps the parent even when it alone exceeds the char cap — it is what 'this issue here above' points at", () => {
+    const { kept, omitted } = selectThreadMessages(
+      [msg("1.0", "x".repeat(500), true), msg("2.0", "short"), msg("3.0", "<@UBOT> ticket?")],
+      "3.0",
+      10,
+      50,
+    );
+    expect(kept.map((m) => m.ts)).toEqual(["1.0"]);
+    expect(omitted).toBe(1);
+  });
+
+  it("truncates a parent that alone exceeds THREAD_CONTEXT_MAX_PARENT_CHARS, but still keeps it and marks the cut visibly", () => {
+    // A single Slack message can carry ~40,000 characters — this is the
+    // amendment that stops that alone from blowing the overall budget.
+    const hugeParent = "x".repeat(THREAD_CONTEXT_MAX_PARENT_CHARS + 5_000);
+    const { kept, omitted } = selectThreadMessages(
+      [msg("1.0", hugeParent, true), msg("2.0", "seen it"), msg("3.0", "<@UBOT> ticket?")],
+      "3.0",
+      THREAD_CONTEXT_MAX_CHARS,
+      50,
+    );
+    expect(kept[0]!.ts).toBe("1.0");
+    // Still present, still capped, and visibly marked as cut short — not
+    // silently dropped and not silently truncated.
+    expect(kept[0]!.text.length).toBeLessThan(hugeParent.length);
+    expect(kept[0]!.text.length).toBeLessThan(THREAD_CONTEXT_MAX_PARENT_CHARS + 100);
+    expect(kept[0]!.text).toContain("truncated");
+    expect(kept[0]!.text.startsWith("x".repeat(100))).toBe(true);
+    // The truncated (not the original 40,000-char) length is what counts
+    // against the overall budget, so the reply that follows still fits.
+    expect(kept.map((m) => m.ts)).toEqual(["1.0", "2.0"]);
+    expect(omitted).toBe(0);
+  });
+
+  it("keeps an ordinary thread whole under the shipped bounds", () => {
+    expect(THREAD_CONTEXT_MAX_CHARS).toBe(12_000);
+    expect(THREAD_CONTEXT_MAX_MESSAGES).toBe(50);
+    const messages = Array.from({ length: 20 }, (_, i) => msg(`${i + 1}.0`, "y".repeat(100)));
+    const { kept, omitted } = selectThreadMessages(
+      [...messages, msg("99.0", "<@UBOT> ticket?")],
+      "99.0",
+      THREAD_CONTEXT_MAX_CHARS,
+      THREAD_CONTEXT_MAX_MESSAGES,
+    );
+    expect(kept).toHaveLength(20);
+    expect(omitted).toBe(0);
+  });
+
+  it("is pure: four arguments, mutates nothing, stable across calls", () => {
+    const messages = [msg("1.0", "the alert", true), msg("2.0", "a"), msg("3.0", "<@UBOT> ticket?")];
+    const snapshot = JSON.stringify(messages);
+    const first = selectThreadMessages(messages, "3.0", 1000, 50);
+    const second = selectThreadMessages(messages, "3.0", 1000, 50);
+    expect(second).toEqual(first);
+    expect(JSON.stringify(messages)).toBe(snapshot);
+    // No PluginContext, no gateway, no clock — the bounds rule must stay
+    // unit-testable without any host plumbing (same contract as
+    // resolveSessionScope above).
+    expect(selectThreadMessages.length).toBe(4);
   });
 });

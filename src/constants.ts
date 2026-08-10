@@ -105,6 +105,33 @@ export const POST_MESSAGE_TOOL_DECLARATION: PluginToolDeclaration = {
 export const REPLY_OPEN_TAG = "<slack_reply>";
 export const REPLY_CLOSE_TAG = "</slack_reply>";
 
+// The fence a seeded thread transcript is wrapped in (see buildThreadContext
+// in chat.ts). Seeding puts messages written by people who never addressed
+// the bot in front of an agent holding slack_post_message, ask_human and
+// issue-creation tools. The fence, plus the framing line inside it, is what
+// tells the agent where that untrusted background starts and stops — so any
+// literal occurrence of the close tag in a message must be neutralised
+// before it is rendered, or content could close the fence early and continue
+// in instruction position.
+export const THREAD_CONTEXT_OPEN_TAG = "<thread_context>";
+export const THREAD_CONTEXT_CLOSE_TAG = "</thread_context>";
+
+// Bounds on how much thread history is seeded. Deliberately module
+// constants, not config: nobody can tune these usefully until someone
+// actually hits them, and every config field is a permanent support
+// surface. The parent message's own text is separately capped at
+// THREAD_CONTEXT_MAX_PARENT_CHARS and that truncated length counts against
+// this overall budget — see selectThreadMessages.
+export const THREAD_CONTEXT_MAX_CHARS = 12_000;
+export const THREAD_CONTEXT_MAX_MESSAGES = 50;
+
+// A single Slack message can carry up to ~40,000 characters. Without this,
+// a maximal parent alone could blow past THREAD_CONTEXT_MAX_CHARS by more
+// than 3x before a single reply is even considered — the parent is always
+// kept (see selectThreadMessages), so unlike every other message it needs
+// its own cap rather than relying on the overall budget to bound it.
+export const THREAD_CONTEXT_MAX_PARENT_CHARS = 4_000;
+
 // Prepended to every Slack chat message sent to the agent (see chat.ts's
 // buildChatPrompt) to frame the turn as a conversation rather than
 // autonomous work. Paperclip's heartbeat scaffolding frames every wake as
