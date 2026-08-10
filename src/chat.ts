@@ -669,7 +669,13 @@ export function createChat(deps: ChatDeps): Chat {
    */
   async function buildSeedBlock(msg: InboundMessage, scope: SessionScope): Promise<string> {
     const threadTs = scope.replyThreadTs;
-    if (threadTs === undefined) return "";
+    // Whether there is a thread to read is resolveSessionScope's answer, not
+    // a second guess at channel types here: a channel-scoped DM session
+    // (scope "channel") has no thread root at all, and a message that IS its
+    // own thread root has nothing above it to fetch. A DM under
+    // dmSessionMode "thread" resolves to scope "thread" and seeds like any
+    // other thread.
+    if (scope.scope !== "thread" || threadTs === undefined || threadTs === msg.ts) return "";
     try {
       const fetched = await gateway.fetchThreadReplies(
         msg.channel,
@@ -928,7 +934,7 @@ export function createChat(deps: ChatDeps): Chat {
       // Seed once, on this session's first turn only. Every later turn in the
       // same thread already has the history in the session, so re-sending it
       // would re-send the same text repeatedly and grow without bound.
-      const seed = created ? await buildSeedBlock(msg, scope) : "";
+      const seed = created && cfg.seedThreadHistory ? await buildSeedBlock(msg, scope) : "";
       const prompt = seed
         ? `${seed}\n\n${buildChatPrompt(cfg.chatPromptPreamble, text)}`
         : buildChatPrompt(cfg.chatPromptPreamble, text);
