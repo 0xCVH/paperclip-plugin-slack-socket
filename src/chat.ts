@@ -226,34 +226,41 @@ const EMPTY_TEXT_PLACEHOLDER = "(no text)";
 // label to fall back to in that case (the raw id itself).
 const UNKNOWN_SPEAKER_LABEL = "unknown";
 
-// CRITICAL (fix round 1): the bot's own messages are labelled exactly the
-// literal string "you" (see resolveThreadEntries), and nothing before this
-// reserves that value. A Slack display name is fully attacker-controlled —
-// BoltGateway.getUserDisplayName falls back display_name || real_name ||
-// real_name, none of them unique or reserved — so anyone can name
-// themselves "you" (or a case/whitespace variant) and have their message
-// render as "[you] ..." exactly like the bot's own alert. sanitizeLabel
-// does not help here: it neutralises "]", line breaks and control tags, but
-// it never lowercases or trims, so it does not by itself stop a resolved
-// label from reading as "you" to a person or a model. This has to be
-// caught where the label is resolved, before it ever reaches rendering.
+// CRITICAL (fix round 2 — structural, replacing rounds 1 and its
+// predecessors' pattern-matching): the bot's own messages are labelled
+// exactly the literal string "you" (see resolveThreadEntries), and every
+// other (non-bot) label carries its speaker's own Slack user id in a
+// trailing "(id)", UNCONDITIONALLY — not only when it happens to collide
+// with something.
 //
-// Comparison is case-insensitive and trims surrounding whitespace: both
-// survive sanitizeLabel completely untouched, so a raw variant that *reads*
-// as "you" — "You", " you ", "YOU" — must be caught here even though it
-// isn't a byte-for-byte match.
-function isReservedYouLabel(label: string): boolean {
-  return label.trim().toLowerCase() === "you";
-}
-
-// Disambiguates a resolved label that collides with the reserved "you" by
-// folding in the speaker's own Slack user id. A Slack user id can never
-// equal the literal string "you", so the result can never re-trigger
-// isReservedYouLabel and can never be mistaken for the bot's own line.
-function disambiguateReservedLabel(label: string, userId: string): string {
-  return `${label} (${userId})`;
-}
-
+// Rounds before this one tried to reserve "you" by pattern-matching the
+// display name itself, and each fix narrowed but did not close the class:
+// first "]" injection, then embedded newlines, then six Unicode
+// line-break separators, then case and whitespace on the literal "you".
+// Each of those left the next Unicode trick open — a zero-width or other
+// Cf-category format character survives `.trim()` (it isn't in
+// ECMAScript's WhiteSpace set) and renders invisibly, and a homoglyph
+// (Cyrillic "u" for "y", fullwidth forms, …) was never even attempted
+// against. There is no enumerable set of "characters that look like
+// nothing" to strip or normalise away — a display name is attacker-
+// controlled free text (BoltGateway.getUserDisplayName falls back
+// display_name || real_name || real_name, none of them unique or
+// reserved), and content-based comparison against it is an arms race that
+// cannot be won by adding one more rule.
+//
+// Appending the real id sidesteps the class entirely: bare "[you]" —
+// exactly, with nothing else inside the brackets — is now provably the
+// bot, because every other rendered line's label always has a trailing
+// "(<id>)". No display name, whatever characters it contains, can produce
+// a bracket with nothing else in it. This is structural, not a string
+// comparison: there's nothing left to normalise, because the display
+// name's content no longer decides whether the line can be confused with
+// the bot's. (It does not stop a message from *claiming*, in its own
+// prose, "I am the bot" — only from forging the attribution bracket
+// itself. sanitizeLabel's neutralisation of "]" and line breaks in the
+// label is a separate, still-necessary guard against a different forgery —
+// a label closing its own bracket early or opening a fake line — and is
+// unaffected by this.)
 function escapeFenceTag(tag: string): string {
   return tag.replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
@@ -649,21 +656,38 @@ export function createChat(deps: ChatDeps): Chat {
    * Turns fetched thread messages into rendering entries by resolving a
    * speaker label for each one.
    *
-   * The bot's own messages are labelled exactly "you" so the agent reads its
-   * own alert as its own words rather than as a third party's claim. `isBot`
-   * alone is not enough for that — another app's messages are a third party,
-   * so the id has to match this bot's.
+   * The bot's own messages are labelled exactly "you", nothing appended, so
+   * the agent reads its own alert as its own words rather than as a third
+   * party's claim. `isBot` alone is not enough for that — another app's
+   * messages are a third party, so the id has to match this bot's.
+   *
+   * Every OTHER (non-bot) label carries its speaker's own Slack user id in
+   * a trailing "(id)", unconditionally — a resolved display name renders as
+   * "Christopher Von Hessert (U01ABC2DEF)", never bare. This is what makes
+   * a bare "[you]" line provably the bot's rather than a display name that
+   * merely failed to trip a content filter (see the CRITICAL comment on
+   * escapeFenceTag above for the history of why this is structural rather
+   * than pattern-matched). It also gives the agent something it needs
+   * anyway: a concrete id to target with ask_human or a DM.
    *
    * A message with no user id at all (Slack's bot_id present but no
    * accompanying user — see ThreadMessage's isBot note in types.ts) never
    * reaches gateway.getUserDisplayName(""); it gets UNKNOWN_SPEAKER_LABEL
-   * directly, so the line still reads as "[unknown] ..." instead of
-   * "[] ...".
+   * directly, with nothing appended — there is no id to append, and the
+   * constant is fixed by this code, never derived from a display name, so
+   * it is already, trivially, never "you".
    *
-   * IMPORTANT 2 (fix round 1): resolution is dedupe-then-resolve, not one id
-   * at a time. Every distinct non-bot, non-empty user id in the thread is
-   * collected first, then all of them are looked up CONCURRENTLY. This runs
-   * before the caller's turn watchdog has even started (see buildSeedBlock /
+   * A speaker whose id fails to resolve isn't a special case either: the
+   * raw id fills in for the missing display name, and the same
+   * unconditional "(id)" still gets appended on top of that — a stable,
+   * distinct label ("U-GHOST (U-GHOST)") covered by exactly the same
+   * structural argument as a resolved one, not a second mechanism that
+   * could itself grow a gap.
+   *
+   * Resolution is dedupe-then-resolve, not one id at a time (fix round 1):
+   * every distinct non-bot, non-empty user id in the thread is collected
+   * first, then all of them are looked up CONCURRENTLY. This runs before
+   * the caller's turn watchdog has even started (see buildSeedBlock /
    * converse), so a sequential await-per-speaker on a busy thread could
    * leave a person staring at total silence for as long as it takes N
    * users.info calls to finish one after another. The per-turn cache this
@@ -686,14 +710,13 @@ export function createChat(deps: ChatDeps): Chat {
     await Promise.all(
       Array.from(idsToResolve, async (userId) => {
         // A name we can't resolve isn't worth failing a turn over: the raw
-        // user id still attributes the line to a distinct speaker.
-        let label = await gateway.getUserDisplayName(userId).catch(() => userId);
-        // CRITICAL: a resolved display name that reads as the reserved "you"
-        // (case/whitespace-insensitively — see isReservedYouLabel) must never
-        // reach rendering unchanged, or this speaker's line becomes
-        // indistinguishable from the bot's own "[you] ..." line above.
-        if (isReservedYouLabel(label)) label = disambiguateReservedLabel(label, userId);
-        names.set(userId, label);
+        // id fills in for the missing display name, and the unconditional
+        // append below still runs on top of it either way.
+        const displayName = await gateway.getUserDisplayName(userId).catch(() => userId);
+        // Structural, not a content check: every non-bot label carries its
+        // own id, so no display name — whatever it contains — can produce a
+        // bare "[you]" line. See the CRITICAL comment above escapeFenceTag.
+        names.set(userId, `${displayName} (${userId})`);
       }),
     );
 
@@ -701,8 +724,10 @@ export function createChat(deps: ChatDeps): Chat {
       if (isBotsOwn(message)) return { label: "you", text: message.text };
       if (!message.user) return { label: UNKNOWN_SPEAKER_LABEL, text: message.text };
       // Always present: every non-bot, non-empty user id was added to
-      // idsToResolve above and resolved (or fell back to itself) there.
-      return { label: names.get(message.user) ?? message.user, text: message.text };
+      // idsToResolve above and resolved there. The fallback mirrors the
+      // same "<id> (<id>)" shape purely as a defensive last resort — this
+      // branch should be unreachable by construction.
+      return { label: names.get(message.user) ?? `${message.user} (${message.user})`, text: message.text };
     });
   }
 
