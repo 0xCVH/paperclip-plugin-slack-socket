@@ -226,6 +226,34 @@ const EMPTY_TEXT_PLACEHOLDER = "(no text)";
 // label to fall back to in that case (the raw id itself).
 const UNKNOWN_SPEAKER_LABEL = "unknown";
 
+// CRITICAL (fix round 1): the bot's own messages are labelled exactly the
+// literal string "you" (see resolveThreadEntries), and nothing before this
+// reserves that value. A Slack display name is fully attacker-controlled —
+// BoltGateway.getUserDisplayName falls back display_name || real_name ||
+// real_name, none of them unique or reserved — so anyone can name
+// themselves "you" (or a case/whitespace variant) and have their message
+// render as "[you] ..." exactly like the bot's own alert. sanitizeLabel
+// does not help here: it neutralises "]", line breaks and control tags, but
+// it never lowercases or trims, so it does not by itself stop a resolved
+// label from reading as "you" to a person or a model. This has to be
+// caught where the label is resolved, before it ever reaches rendering.
+//
+// Comparison is case-insensitive and trims surrounding whitespace: both
+// survive sanitizeLabel completely untouched, so a raw variant that *reads*
+// as "you" — "You", " you ", "YOU" — must be caught here even though it
+// isn't a byte-for-byte match.
+function isReservedYouLabel(label: string): boolean {
+  return label.trim().toLowerCase() === "you";
+}
+
+// Disambiguates a resolved label that collides with the reserved "you" by
+// folding in the speaker's own Slack user id. A Slack user id can never
+// equal the literal string "you", so the result can never re-trigger
+// isReservedYouLabel and can never be mistaken for the bot's own line.
+function disambiguateReservedLabel(label: string, userId: string): string {
+  return `${label} (${userId})`;
+}
+
 function escapeFenceTag(tag: string): string {
   return tag.replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
@@ -651,6 +679,11 @@ export function createChat(deps: ChatDeps): Chat {
         // A name we can't resolve isn't worth failing a turn over: the raw
         // user id still attributes the line to a distinct speaker.
         label = await gateway.getUserDisplayName(message.user).catch(() => message.user);
+        // CRITICAL: a resolved display name that reads as the reserved "you"
+        // (case/whitespace-insensitively — see isReservedYouLabel) must never
+        // reach rendering unchanged, or this speaker's line becomes
+        // indistinguishable from the bot's own "[you] ..." line above.
+        if (isReservedYouLabel(label)) label = disambiguateReservedLabel(label, message.user);
         names.set(message.user, label);
       }
       entries.push({ label, text: message.text });
