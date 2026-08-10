@@ -37,6 +37,15 @@ export interface SlackSocketConfig {
   streamPartialReplies: boolean;
   chatPromptPreamble: string;
   dmSessionMode: DmSessionMode;
+  /**
+   * Seed a newly created session with the Slack thread it was mentioned in
+   * (see buildSeedBlock in chat.ts). Default true: without it the agent
+   * cannot answer "this issue here above" when the thread root was posted by
+   * a different run through the slack_post_message tool and so was never
+   * seen by this session. Off is the conservative setting — the agent then
+   * only ever reads text addressed to it, at the cost of that question.
+   */
+  seedThreadHistory: boolean;
   allowedSlackUserIds: string[];
   // --- Agent-initiated posting (the slack_post_message tool) ---------
   //

@@ -176,6 +176,13 @@ const manifest: PaperclipPluginManifestV1 = {
           "How a 1:1 DM with the bot is scoped. \"channel\" (the default) treats the whole DM as one continuous conversation: the bot remembers your previous messages and replies at the top level, like a chat window. \"thread\" starts a fresh conversation for every top-level DM message and posts the reply in a thread under it — the pre-0.10.0 behavior. Channels, private channels and group DMs are always thread-scoped and are unaffected by this setting.",
         default: DEFAULT_CONFIG.dmSessionMode,
       },
+      seedThreadHistory: {
+        type: "boolean",
+        title: "Seed new conversations with the Slack thread",
+        description:
+          "When on (the default), the first message of a new conversation also carries the thread the bot was mentioned in, fenced as background, so it can answer questions about messages posted above it. This means the agent reads messages from people who never addressed it: anyone who can post in a channel the bot is in can put text in front of it. Turn it off to send only the message addressed to the bot.",
+        default: DEFAULT_CONFIG.seedThreadHistory,
+      },
       allowedSlackUserIds: {
         type: "array",
         items: { type: "string" },

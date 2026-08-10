@@ -166,6 +166,11 @@ export const DEFAULT_CONFIG: SlackSocketConfig = {
   // Default chosen because today's behavior is the defect: nothing depends
   // on the bot forgetting the previous line of a DM.
   dmSessionMode: "channel",
+  // Default on: the defect it fixes is the common case. The switch exists
+  // because the feature moves a trust boundary (the agent starts reading
+  // messages from people who never addressed it) and some operators will
+  // decline it — see the Security section of the design doc.
+  seedThreadHistory: true,
   allowedSlackUserIds: [],
   agentPostMessageEnabled: false,
   agentPostToChannelsEnabled: false,
