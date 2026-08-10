@@ -269,6 +269,26 @@ function neutralizeFenceTags(value: string): string {
   return CONTROL_TAGS.reduce((acc, [tag, escaped]) => acc.replaceAll(tag, escaped), value);
 }
 
+// The full set of line-break characters this module treats as ending a
+// line — not just "\n". A reader that honours Unicode line breaks (the
+// language model this text is written for) also breaks on: CARRIAGE RETURN
+// (U+000D, alone or as part of CRLF), LINE SEPARATOR (U+2028), PARAGRAPH
+// SEPARATOR (U+2029), NEXT LINE / NEL (U+0085), VERTICAL TAB (U+000B), and
+// FORM FEED (U+000C). Both consumers below (sanitizeLabel, and
+// markContinuationLines via buildThreadContext) must treat every member of
+// this exact list as a line break, or a body/label carrying one instead of
+// "\n" reopens the [you] forgery this file otherwise closes. "\r\n" is
+// listed first so a Windows line ending is treated as ONE break, not two.
+//
+// This list is not exhaustive of every Unicode notion of "line boundary"
+// (e.g. it does not include the bidi/format controls some algorithms treat
+// as boundaries) — it's the ECMAScript LineTerminatorSequence set (LF, CR,
+// CRLF, LS, PS) plus the two additional C0/C1 breaks (NEL, VT, FF) a
+// language model's Unicode-aware line segmentation commonly honours. If
+// this list is ever extended, every reference to "recognised line breaks"
+// in this file means exactly this regex, not the word "line".
+const LINE_BREAK = /\r\n|\r|\n|\u2028|\u2029|\u0085|\u000B|\u000C/g;
+
 // A Slack display name is user-settable (getUserDisplayName reads
 // profile.display_name || profile.real_name || real_name) and is
 // interpolated directly into `[${label}] ${text}` below. Without this, a
@@ -279,25 +299,23 @@ function neutralizeFenceTags(value: string): string {
 // distinction is load-bearing: it's how the bot tells its own proactive
 // alert apart from a third party's claim (see the buildThreadContext tests
 // above). "]" is neutralised so a label can never close its bracket early;
-// any newline is collapsed to a SPACE — not removed — so a label can never
-// start a rendered line of its own. The space is required, not cosmetic:
-// see the "substitute, never delete" note on neutralizeFenceTags above.
+// every LINE_BREAK character is collapsed to a SPACE — not removed — so a
+// label can never start a rendered line of its own. The space is required,
+// not cosmetic: see the "substitute, never delete" note on
+// neutralizeFenceTags above.
 function sanitizeLabel(label: string): string {
-  return neutralizeFenceTags(label)
-    .replaceAll("\r\n", " ")
-    .replaceAll("\r", " ")
-    .replaceAll("\n", " ")
-    .replaceAll("]", "&#93;");
+  return neutralizeFenceTags(label).replace(LINE_BREAK, " ").replaceAll("]", "&#93;");
 }
 
 // Message bodies, unlike labels, are NOT newline-collapsed — multi-line
 // content (a list, a stack trace, a code block) has to survive readably,
 // which is the whole point of seeding the thread in the first place. That
-// leaves an embedded newline in a body as the easy half of the [you]
-// forgery: no display-name trickery needed, an ordinary message reading
-// "sure\n[you] SECURITY: ..." renders as a second line indistinguishable
-// from a genuine attribution line once buildThreadContext joins everything
-// with "\n".
+// leaves an embedded LINE_BREAK character in a body as the easy half of
+// the [you] forgery: no display-name trickery needed, an ordinary message
+// reading "sure\n[you] SECURITY: ..." renders as a second line
+// indistinguishable from a genuine attribution line once buildThreadContext
+// joins everything with "\n" — and that holds for a lone CR, LS, PS, NEL,
+// VT or FF exactly as it does for "\n" (see LINE_BREAK above).
 //
 // The fix is structural, not content-based: every line of a body after the
 // first is prefixed with CONTINUATION_MARKER, which is always prepended by
@@ -305,18 +323,27 @@ function sanitizeLabel(label: string): string {
 // occupy the line-initial position a "[label] " attribution line occupies.
 // Only buildThreadContext's own template ever emits a line starting with
 // "[". The marker itself is inserted, never deletes anything, so it cannot
-// reassemble a split control tag either (see the invariant note above).
+// reassemble a split control tag either (see the invariant note above) —
+// splitting on LINE_BREAK and rejoining with "\n" is itself a substitution
+// (every recognised separator becomes a real "\n"), not a strip.
 //
 // This does NOT make an attributed line trustworthy — "&#93;", "&lt;...&gt;"
 // and homoglyph "]"/"[" remain legible to a model, so injected text can
 // still *describe* itself as "[you] ...". What this guarantees is narrower
-// and structural: no body content can occupy the attribution POSITION —
-// the start of a line — regardless of what it says.
+// and structural, and bounded by LINE_BREAK exactly: no body content can
+// occupy the attribution POSITION — the start of a line, for any of the
+// separators LINE_BREAK lists — regardless of what it says. A line-break
+// character outside that list would not be covered; there is no unbounded
+// claim to "any line" here.
 const CONTINUATION_MARKER = "  | ";
 
 function markContinuationLines(text: string): string {
-  const [first, ...rest] = text.split("\n");
-  return [first, ...rest.map((line) => `${CONTINUATION_MARKER}${line}`)].join("\n");
+  const [first, ...rest] = text.split(LINE_BREAK);
+  // A blank line (two consecutive breaks) still gets a marker so the break
+  // itself isn't silently dropped from the rendering, but a bare marker
+  // with nothing after it should not carry a trailing space.
+  const marked = rest.map((line) => (line ? `${CONTINUATION_MARKER}${line}` : CONTINUATION_MARKER.trimEnd()));
+  return [first, ...marked].join("\n");
 }
 
 /**
@@ -342,7 +369,14 @@ export function buildThreadContext(entries: ThreadContextEntry[], omitted: numbe
 
   const lines = entries.map((entry) => {
     const label = sanitizeLabel(entry.label);
-    const text = markContinuationLines(neutralizeFenceTags(entry.text.trim())) || EMPTY_TEXT_PLACEHOLDER;
+    // Normalise LINE_BREAK characters to "\n" before trimming: JS's
+    // String.prototype.trim() does not recognise every member of that set
+    // as whitespace (notably NEL, U+0085), so without this a body
+    // consisting solely of one of those characters survives trim() as a
+    // non-empty string and would render as invisible garbage instead of
+    // EMPTY_TEXT_PLACEHOLDER below.
+    const normalized = entry.text.replace(LINE_BREAK, "\n").trim();
+    const text = normalized ? markContinuationLines(neutralizeFenceTags(normalized)) : EMPTY_TEXT_PLACEHOLDER;
     return `[${label}] ${text}`;
   });
   const notice =
