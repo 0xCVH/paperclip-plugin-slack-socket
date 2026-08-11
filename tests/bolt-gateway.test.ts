@@ -115,6 +115,22 @@ describe("BoltGateway (against a mocked @slack/bolt App)", () => {
     expect(received[0]!.channelType).toBe("channel");
   });
 
+  it("constructs the App with a bounded per-request timeout AND no automatic retries", async () => {
+    // The two belong together: timeout: 10_000 makes the WebClient abort a
+    // slow request client-side, and the default retry policy
+    // (~10 retries over ~30 minutes) then re-sends it. For a non-idempotent
+    // call like chat.postMessage whose first attempt actually landed
+    // server-side, that retry is a duplicate message in the channel.
+    // retries: 0 removes that layer; 429 rate-limit handling is separate
+    // (the WebClient re-queues only requests Slack rejected) and unaffected.
+    await makeGateway();
+    const opts = appInstances[0]!.opts as {
+      clientOptions?: { timeout?: number; retryConfig?: { retries?: number } };
+    };
+    expect(opts.clientOptions?.timeout).toBe(10_000);
+    expect(opts.clientOptions?.retryConfig).toEqual({ retries: 0 });
+  });
+
   it("probe() returns true when auth.test resolves ok", async () => {
     const gateway = await makeGateway();
     await expect(gateway.probe()).resolves.toBe(true);
