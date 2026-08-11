@@ -37,6 +37,15 @@ export interface SlackSocketConfig {
   streamPartialReplies: boolean;
   chatPromptPreamble: string;
   dmSessionMode: DmSessionMode;
+  /**
+   * Seed a newly created session with the Slack thread it was mentioned in
+   * (see buildSeedBlock in chat.ts). Default true: without it the agent
+   * cannot answer "this issue here above" when the thread root was posted by
+   * a different run through the slack_post_message tool and so was never
+   * seen by this session. Off is the conservative setting — the agent then
+   * only ever reads text addressed to it, at the cost of that question.
+   */
+  seedThreadHistory: boolean;
   allowedSlackUserIds: string[];
   // --- Agent-initiated posting (the slack_post_message tool) ---------
   //
@@ -66,6 +75,18 @@ export interface SessionEntry {
   threadTs: string;
   scope: "channel" | "thread";
   lastActivityAt: string; // ISO 8601
+  /**
+   * True from session creation until the thread-history seed block has
+   * actually been delivered in a prompt (or there was structurally nothing
+   * to seed). Persisted on the session rather than derived from an
+   * ephemeral "was this the creating turn?" flag so that a first turn which
+   * dies after the session is created — a failed placeholder post, a
+   * transient fetch error, a process restart — is retried on a later turn
+   * instead of leaving the thread permanently unseeded. Absent on sessions
+   * created before this field existed, which read as "not pending" (they
+   * are past their first turn and must not suddenly seed).
+   */
+  seedPending?: boolean;
 }
 
 // Links a Slack message we posted to the entity it represents, so a later
@@ -140,6 +161,28 @@ export interface OutboundMessage {
   threadTs?: string;
 }
 
+/**
+ * One message read back from a Slack thread. `isBot` is true only for
+ * messages this app itself posted — including an alert another agent run
+ * wrote through the `slack_post_message` tool — identified by the message's
+ * Slack user id matching this gateway's own bot user id, so a transcript
+ * can label it as the bot's own words rather than a third party's claim.
+ *
+ * `isBot` is deliberately NOT set merely because a message carries Slack's
+ * `bot_id` field: any other integration (GitHub, Zapier, a workflow bot, …)
+ * posts with a `bot_id` too, and conflating "posted by some bot" with
+ * "posted by this app" would let a transcript misrepresent a third party's
+ * words as the agent's own. A foreign bot's message keeps its own `user` id
+ * in this shape, so a consumer can resolve and label it like any other
+ * author instead of an anonymous one.
+ */
+export interface ThreadMessage {
+  user: string;
+  text: string;
+  ts: string;
+  isBot: boolean;
+}
+
 export interface SlackGateway {
   start(): Promise<void>;
   stop(): Promise<void>;
@@ -159,6 +202,26 @@ export interface SlackGateway {
   postEphemeral(msg: { channel: string; user: string; text: string }): Promise<void>;
   openDm(userId: string): Promise<string>;
   getUserDisplayName(userId: string): Promise<string>;
+  /**
+   * The messages of one thread, oldest first. `conversations.replies`
+   * returns the parent plus only the oldest page of replies, so a single
+   * call would seed a long thread with its opening and miss the recent
+   * discussion — normally the part a person means by "this issue above".
+   * Implementations page on `response_metadata.next_cursor` until Slack
+   * reports no more pages or a hard cap of requests is reached, so a
+   * runaway thread cannot hang a turn; bounding the returned transcript to
+   * something a chat turn can use is the caller's job, not this method's.
+   * `limit` is the page size passed to each underlying request, not a cap
+   * on the total number of messages returned.
+   *
+   * Needs no OAuth scope beyond the `channels:history` / `groups:history` /
+   * `im:history` already granted in slack-app-manifest.json, so this works
+   * in public channels, private channels and 1:1 DMs. A multi-person group
+   * DM (mpim) needs `mpim:history`, which this app does not grant; there
+   * the call rejects with `missing_scope`, and callers should treat that as
+   * "no history available" and proceed rather than fail the turn.
+   */
+  fetchThreadReplies(channel: string, threadTs: string, limit: number): Promise<ThreadMessage[]>;
   onMessage(handler: (msg: InboundMessage) => Promise<void>): void;
   onMention(handler: (msg: InboundMessage) => Promise<void>): void;
   onReaction(handler: (reaction: InboundReaction) => Promise<void>): void;

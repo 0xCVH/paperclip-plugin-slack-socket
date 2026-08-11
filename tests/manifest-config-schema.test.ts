@@ -256,4 +256,37 @@ describe("instanceConfigSchema vs the host settings form", () => {
     expect(schema.properties.dmSessionMode?.default).toBe("channel");
     expect(schema.properties.dmSessionMode?.enum).toEqual(["channel", "thread"]);
   });
+
+  it("accepts seedThreadHistory and defaults it to true", () => {
+    const result = validateInstanceConfig({
+      ...baseConfig,
+      slackBotTokenRef: SECRET_REF,
+      slackAppTokenRef: SECRET_REF,
+      seedThreadHistory: false,
+    });
+    expect(result.errors).toEqual([]);
+    expect(result.valid).toBe(true);
+
+    const schema = manifest.instanceConfigSchema as {
+      properties: Record<string, { type?: unknown; default?: unknown }>;
+    };
+    // Default on: the defect it fixes — a thread the agent was mentioned in
+    // but has never seen — is the common case, not the exception.
+    expect(schema.properties.seedThreadHistory?.type).toBe("boolean");
+    expect(schema.properties.seedThreadHistory?.default).toBe(true);
+  });
+
+  it("rejects a non-boolean seedThreadHistory", () => {
+    const result = validateInstanceConfig({
+      ...baseConfig,
+      slackBotTokenRef: SECRET_REF,
+      slackAppTokenRef: SECRET_REF,
+      seedThreadHistory: "true",
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContainEqual({
+      field: "/seedThreadHistory",
+      message: "must be boolean",
+    });
+  });
 });

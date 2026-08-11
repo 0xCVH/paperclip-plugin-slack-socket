@@ -120,6 +120,15 @@ export function createGatewayProxy(
       return gateway.getUserDisplayName(userId);
     },
 
+    async fetchThreadReplies(channel: string, threadTs: string, limit: number) {
+      const gateway = getGateway();
+      if (!gateway) {
+        warnUnconfigured("fetchThreadReplies");
+        return [];
+      }
+      return gateway.fetchThreadReplies(channel, threadTs, limit);
+    },
+
     onMessage(handler: (msg: InboundMessage) => Promise<void>) {
       const gateway = getGateway();
       if (!gateway) {

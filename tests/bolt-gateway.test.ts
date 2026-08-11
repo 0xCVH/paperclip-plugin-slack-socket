@@ -68,7 +68,10 @@ const { appInstances, MockApp } = vi.hoisted(() => {
   const instances: InstanceType<typeof MockApp>[] = [];
   class MockApp {
     handlers = new Map<string, (arg: unknown) => Promise<void>>();
-    client = { auth: { test: vi.fn().mockResolvedValue({ ok: true, user_id: "UBOT" }) } };
+    client = {
+      auth: { test: vi.fn().mockResolvedValue({ ok: true, user_id: "UBOT" }) },
+      conversations: { replies: vi.fn().mockResolvedValue({ ok: true, messages: [] }) },
+    };
     constructor(public opts: unknown) {
       instances.push(this);
     }
@@ -140,5 +143,154 @@ describe("BoltGateway (against a mocked @slack/bolt App)", () => {
     const gateway = await makeGateway();
     appInstances[0]!.client.auth.test.mockRejectedValueOnce(new Error("revoked"));
     await expect(gateway.probe()).resolves.toBe(false);
+  });
+
+  it("fetchThreadReplies maps a conversations.replies payload to ThreadMessage[]", async () => {
+    const gateway = await makeGateway();
+    await gateway.start(); // captures user_id "UBOT" from auth.test
+    appInstances[0]!.client.conversations.replies.mockResolvedValueOnce({
+      ok: true,
+      messages: [
+        // A message this app posted through slack_post_message: Slack's
+        // GenericMessageEvent sets `user` to the posting bot's own user id
+        // (matching auth.test's user_id) alongside `bot_id`.
+        { user: "UBOT", text: "Action needed: claimable subdomain", ts: "1.1", bot_id: "B1" },
+        { user: "U1", text: "can you open a ticket for this?", ts: "1.2" },
+      ],
+    });
+
+    await expect(gateway.fetchThreadReplies("C1", "1.1", 50)).resolves.toEqual([
+      { user: "UBOT", text: "Action needed: claimable subdomain", ts: "1.1", isBot: true },
+      { user: "U1", text: "can you open a ticket for this?", ts: "1.2", isBot: false },
+    ]);
+    expect(appInstances[0]!.client.conversations.replies).toHaveBeenCalledWith({
+      channel: "C1", ts: "1.1", limit: 50,
+    });
+  });
+
+  it("marks the bot's own user id as isBot even when Slack sends no bot_id", async () => {
+    const gateway = await makeGateway();
+    await gateway.start(); // captures user_id "UBOT" from auth.test
+    appInstances[0]!.client.conversations.replies.mockResolvedValueOnce({
+      ok: true,
+      messages: [{ user: "UBOT", text: "posted through slack_post_message", ts: "1.1" }],
+    });
+
+    const replies = await gateway.fetchThreadReplies("C1", "1.1", 50);
+    expect(replies[0]!.isBot).toBe(true);
+  });
+
+  it("does not label a foreign bot's message as this app's own, even though it carries a bot_id", async () => {
+    // Round 1 fix: Boolean(bot_id) is true for ANY bot-authored message —
+    // GitHub, Zapier, a workflow bot, anything. Only a matching `user` (this
+    // gateway's own bot user id) means "this app said this".
+    const gateway = await makeGateway();
+    await gateway.start(); // captures user_id "UBOT" from auth.test
+    appInstances[0]!.client.conversations.replies.mockResolvedValueOnce({
+      ok: true,
+      messages: [{ user: "UGITHUB", text: "Deployed to production", ts: "1.4", bot_id: "BFOREIGN" }],
+    });
+
+    const replies = await gateway.fetchThreadReplies("C1", "1.1", 50);
+    expect(replies[0]!.isBot).toBe(false);
+  });
+
+  it("returns [] when the payload carries no messages array", async () => {
+    const gateway = await makeGateway();
+    appInstances[0]!.client.conversations.replies.mockResolvedValueOnce({ ok: true });
+    await expect(gateway.fetchThreadReplies("C1", "1.1", 50)).resolves.toEqual([]);
+  });
+
+  it("defaults absent user/text to empty strings without mistaking them for the bot", async () => {
+    // start() was not called, so botUserId() is undefined. A naive
+    // `m.user === this.botId` would make undefined === undefined true and
+    // label a file-only post as the bot's own words.
+    const gateway = await makeGateway();
+    appInstances[0]!.client.conversations.replies.mockResolvedValueOnce({
+      ok: true,
+      messages: [{ ts: "1.3" }],
+    });
+    await expect(gateway.fetchThreadReplies("C1", "1.1", 50)).resolves.toEqual([
+      { user: "", text: "", ts: "1.3", isBot: false },
+    ]);
+  });
+
+  it("stitches two conversations.replies pages into one transcript, oldest first", async () => {
+    // A1.1: a single conversations.replies call returns the parent plus only
+    // the OLDEST page of replies. Paging on next_cursor is what lets a long
+    // thread's most recent messages — normally what "this issue above"
+    // refers to — reach the transcript at all.
+    const gateway = await makeGateway();
+    await gateway.start(); // captures user_id "UBOT" from auth.test
+    appInstances[0]!.client.conversations.replies
+      .mockResolvedValueOnce({
+        ok: true,
+        has_more: true,
+        response_metadata: { next_cursor: "cursor-1" },
+        messages: [
+          { user: "UBOT", text: "Action needed: claimable subdomain", ts: "1.1", bot_id: "B1" },
+          { user: "U1", text: "can you open a ticket for this?", ts: "1.2" },
+        ],
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        has_more: false,
+        messages: [{ user: "U2", text: "on it", ts: "1.3" }],
+      });
+
+    await expect(gateway.fetchThreadReplies("C1", "1.1", 200)).resolves.toEqual([
+      { user: "UBOT", text: "Action needed: claimable subdomain", ts: "1.1", isBot: true },
+      { user: "U1", text: "can you open a ticket for this?", ts: "1.2", isBot: false },
+      { user: "U2", text: "on it", ts: "1.3", isBot: false },
+    ]);
+    expect(appInstances[0]!.client.conversations.replies).toHaveBeenCalledTimes(2);
+    expect(appInstances[0]!.client.conversations.replies).toHaveBeenNthCalledWith(1, {
+      channel: "C1", ts: "1.1", limit: 200,
+    });
+    expect(appInstances[0]!.client.conversations.replies).toHaveBeenNthCalledWith(2, {
+      channel: "C1", ts: "1.1", limit: 200, cursor: "cursor-1",
+    });
+  });
+
+  it("stops paging after 5 requests so a runaway thread cannot hang a turn, and warns that the tail was not read", async () => {
+    // The page cap is a safety bound, but stopping with has_more still true
+    // means the NEWEST messages were never fetched — selection then presents
+    // a stale mid-thread window as the recent discussion. That must not be
+    // silent: a warning is the signal that the seeded transcript is missing
+    // its tail. (With THREAD_FETCH_PAGE_SIZE = 1000 the cap is ~5000
+    // messages, so in practice this only fires on a pathological thread.)
+    const warn = vi.fn();
+    appInstances.length = 0;
+    const { BoltGateway } = await import("../src/bolt-gateway.js");
+    const gateway = new BoltGateway({ botToken: "xoxb", appToken: "xapp", logger: { warn } });
+    appInstances[0]!.client.conversations.replies.mockResolvedValue({
+      ok: true,
+      has_more: true,
+      response_metadata: { next_cursor: "cursor-more" },
+      messages: [{ user: "U1", text: "msg", ts: "1.1" }],
+    });
+
+    const replies = await gateway.fetchThreadReplies("C1", "1.1", 200);
+    expect(replies).toHaveLength(5);
+    expect(appInstances[0]!.client.conversations.replies).toHaveBeenCalledTimes(5);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("page cap"),
+      expect.objectContaining({ channel: "C1", threadTs: "1.1" }),
+    );
+  });
+
+  it("does not warn when a thread ends within the page cap", async () => {
+    const warn = vi.fn();
+    appInstances.length = 0;
+    const { BoltGateway } = await import("../src/bolt-gateway.js");
+    const gateway = new BoltGateway({ botToken: "xoxb", appToken: "xapp", logger: { warn } });
+    appInstances[0]!.client.conversations.replies.mockResolvedValueOnce({
+      ok: true,
+      has_more: false,
+      messages: [{ user: "U1", text: "only page", ts: "1.1" }],
+    });
+
+    await gateway.fetchThreadReplies("C1", "1.1", 200);
+    expect(warn).not.toHaveBeenCalled();
   });
 });

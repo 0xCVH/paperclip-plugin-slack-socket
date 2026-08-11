@@ -8,6 +8,7 @@ import type {
   InboundReaction,
   OutboundMessage,
   SlackGateway,
+  ThreadMessage,
 } from "./types.js";
 
 const { App } = boltPkg;
@@ -19,6 +20,12 @@ const { App } = boltPkg;
 // Every other subtype (message_changed, message_deleted, channel_join,
 // bot_message, …) is not a live human message and stays filtered.
 const PASSTHROUGH_SUBTYPES = new Set(["thread_broadcast", "file_share"]);
+
+// conversations.replies returns the parent plus one page of replies per
+// call. Paging past the first page is bounded by a hard request count, not
+// just Slack's has_more/next_cursor signals, so a runaway thread (or a
+// pathological cursor loop) cannot hang a turn indefinitely.
+const THREAD_REPLIES_MAX_PAGES = 5;
 
 /**
  * True when an inbound Slack message event is a live human message that chat
@@ -237,6 +244,92 @@ export class BoltGateway implements SlackGateway {
   async openDm(userId: string): Promise<string> {
     const res = await this.app.client.conversations.open({ users: userId });
     return (res.channel as { id?: string })?.id ?? userId;
+  }
+
+  /**
+   * Reads a thread back from Slack, oldest first. A single
+   * conversations.replies call returns only the oldest page, which on a
+   * long thread would seed the opening and miss the recent discussion — the
+   * opposite of useful for "raise a ticket for this issue above". So this
+   * pages on `response_metadata.next_cursor` until `has_more` is false, no
+   * cursor comes back, or THREAD_REPLIES_MAX_PAGES requests have been made,
+   * then concatenates the pages in order. `limit` is the page size sent on
+   * each request, not a cap on the total transcript returned — trimming the
+   * transcript to what a chat turn can use is the caller's job.
+   *
+   * Needs channels:history, groups:history or im:history (already granted),
+   * so this works in public channels, private channels and 1:1 DMs. In a
+   * multi-person group DM the required mpim:history scope is not granted,
+   * so the call rejects with a missing_scope error instead; this method does
+   * not swallow that, so callers should treat a rejection as "no history
+   * available" and proceed rather than fail the turn.
+   *
+   * `isBot` means specifically "this app posted it", not "some bot posted
+   * it". Per @slack/types' GenericMessageEvent (the shape of an ordinary,
+   * non-`bot_message`-subtype message — what a chat.postMessage call from
+   * this app's bot token always produces), `user` is a required field and
+   * is set to the posting bot user's id, while `bot_id` is merely optional
+   * metadata present on every bot-authored message, ours or anyone else's.
+   * So the only safe test is `user` matching this gateway's own captured
+   * bot id; `bot_id` is not read here at all. A foreign bot's message (e.g.
+   * a GitHub/Zapier/workflow-bot post) still carries its own `user` id in
+   * the returned ThreadMessage, so a consumer can resolve and label it via
+   * getUserDisplayName exactly like a human author — Slack bot users have
+   * real profiles. The one shape this deliberately does not special-case is
+   * a legacy `bot_message`-subtype event (old-style incoming-webhook
+   * integrations with no associated bot user, where `user` is absent and
+   * only a display-only `username` is provided): that message comes back
+   * with `user: ""`, `isBot: false`, and no name to resolve — the caller's
+   * existing fallback label for an unresolvable author covers it, so no
+   * extra field was added here for it.
+   */
+  async fetchThreadReplies(channel: string, threadTs: string, limit: number): Promise<ThreadMessage[]> {
+    const collected: ThreadMessage[] = [];
+    let cursor: string | undefined;
+
+    for (let page = 0; page < THREAD_REPLIES_MAX_PAGES; page++) {
+      const res = await this.app.client.conversations.replies(
+        cursor ? { channel, ts: threadTs, limit, cursor } : { channel, ts: threadTs, limit },
+      );
+      const messages = res.messages;
+      if (Array.isArray(messages)) {
+        for (const m of messages as Array<{ user?: string; text?: string; ts?: string }>) {
+          collected.push({
+            user: m.user ?? "",
+            text: m.text ?? "",
+            ts: m.ts ?? "",
+            // Strictly "this app's own bot user", not "any bot". A message
+            // this app posts through chat.postMessage always comes back as
+            // a plain message event with `user` set to this gateway's own
+            // bot user id (see the round-1 fix note above the method for
+            // the evidence). `bot_id` alone is not a safe signal: it is set
+            // on every bot-authored message, including a GitHub/Zapier/
+            // workflow-bot post, and treating any bot_id as "self" would
+            // present a third party's words to the agent as its own.
+            isBot: this.botId !== undefined && m.user === this.botId,
+          });
+        }
+      }
+
+      const nextCursor = (res as { response_metadata?: { next_cursor?: string } }).response_metadata?.next_cursor;
+      if (!res.has_more || !nextCursor) return collected;
+      cursor = nextCursor;
+    }
+
+    // Fell out of the loop with the cursor still live: the thread is longer
+    // than THREAD_REPLIES_MAX_PAGES × limit, so pages oldest-first means the
+    // NEWEST messages were never read. The caller keeps the most recent of
+    // what it was given (selectThreadMessages), so it would silently present
+    // a stale mid-thread window as the recent discussion. This is not silent:
+    // warn so a truncated seed is diagnosable. With THREAD_FETCH_PAGE_SIZE
+    // (1000) that cap is ~5000 messages — a pathological thread in practice.
+    this.logger.warn("Slack thread exceeded the fetch page cap; its most recent messages were not read", {
+      channel,
+      threadTs,
+      pagesFetched: THREAD_REPLIES_MAX_PAGES,
+      messagesFetched: collected.length,
+    });
+    return collected;
   }
 
   async getUserDisplayName(userId: string): Promise<string> {

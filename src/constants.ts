@@ -2,7 +2,7 @@ import type { PluginToolDeclaration, ScopeKey } from "@paperclipai/plugin-sdk";
 import type { SlackSocketConfig } from "./types.js";
 
 export const PLUGIN_ID = "cvh.slack-socket";
-export const PLUGIN_VERSION = "0.10.0";
+export const PLUGIN_VERSION = "0.11.0";
 
 export const ACTION_IDS = {
   approvalApprove: "approval_approve",
@@ -105,6 +105,48 @@ export const POST_MESSAGE_TOOL_DECLARATION: PluginToolDeclaration = {
 export const REPLY_OPEN_TAG = "<slack_reply>";
 export const REPLY_CLOSE_TAG = "</slack_reply>";
 
+// The fence a seeded thread transcript is wrapped in (see buildThreadContext
+// in chat.ts). Seeding puts messages written by people who never addressed
+// the bot in front of an agent holding slack_post_message, ask_human and
+// issue-creation tools. The fence, plus the framing line inside it, is what
+// tells the agent where that untrusted background starts and stops — so any
+// literal occurrence of the close tag in a message must be neutralised
+// before it is rendered, or content could close the fence early and continue
+// in instruction position.
+export const THREAD_CONTEXT_OPEN_TAG = "<thread_context>";
+export const THREAD_CONTEXT_CLOSE_TAG = "</thread_context>";
+
+// Bounds on how much thread history is seeded. Deliberately module
+// constants, not config: nobody can tune these usefully until someone
+// actually hits them, and every config field is a permanent support
+// surface. The parent message's own text is separately capped at
+// THREAD_CONTEXT_MAX_PARENT_CHARS and that truncated length counts against
+// this overall budget — see selectThreadMessages.
+export const THREAD_CONTEXT_MAX_CHARS = 12_000;
+export const THREAD_CONTEXT_MAX_MESSAGES = 50;
+
+// The per-request page size for reading a thread back (the `limit` passed to
+// fetchThreadReplies), deliberately DECOUPLED from the selection cap above.
+// conversations.replies pages oldest-first, so if the page size equalled the
+// 50-message selection cap, a thread longer than THREAD_REPLIES_MAX_PAGES ×
+// 50 = 250 messages would return only its oldest 250 — and selection, which
+// keeps the most RECENT of what it was given, would then present a stale
+// mid-thread window as "the recent discussion", the exact opposite of what
+// "raise a ticket for this issue above" needs. Slack allows up to 1000 per
+// page, so one page size of 1000 moves that cliff from 250 to 5000 messages
+// (THREAD_REPLIES_MAX_PAGES × 1000) — beyond any realistic thread — while
+// selection still trims the fetched transcript down to the 50-message /
+// 12,000-char budget. The two numbers answer different questions: this is
+// "how much can we read", THREAD_CONTEXT_MAX_MESSAGES is "how much do we keep".
+export const THREAD_FETCH_PAGE_SIZE = 1_000;
+
+// A single Slack message can carry up to ~40,000 characters. Without this,
+// a maximal parent alone could blow past THREAD_CONTEXT_MAX_CHARS by more
+// than 3x before a single reply is even considered — the parent is always
+// kept (see selectThreadMessages), so unlike every other message it needs
+// its own cap rather than relying on the overall budget to bound it.
+export const THREAD_CONTEXT_MAX_PARENT_CHARS = 4_000;
+
 // Prepended to every Slack chat message sent to the agent (see chat.ts's
 // buildChatPrompt) to frame the turn as a conversation rather than
 // autonomous work. Paperclip's heartbeat scaffolding frames every wake as
@@ -139,6 +181,11 @@ export const DEFAULT_CONFIG: SlackSocketConfig = {
   // Default chosen because today's behavior is the defect: nothing depends
   // on the bot forgetting the previous line of a DM.
   dmSessionMode: "channel",
+  // Default on: the defect it fixes is the common case. The switch exists
+  // because the feature moves a trust boundary (the agent starts reading
+  // messages from people who never addressed it) and some operators will
+  // decline it — see the Security section of the design doc.
+  seedThreadHistory: true,
   allowedSlackUserIds: [],
   agentPostMessageEnabled: false,
   agentPostToChannelsEnabled: false,
