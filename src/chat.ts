@@ -346,20 +346,38 @@ const CONTROL_TAG_PATTERN = /<(\s*\/?\s*(?:thread_context|slack_reply)\s*)>/gi;
 // preserve — it MUST remain a substitution, never a deletion, for exactly
 // that reason.
 //
-// A second, easy-to-miss invariant this depends on: ANY later pass over
-// this same text — sanitizeLabel's newline collapse below, or anything
-// added after it — must SUBSTITUTE characters, never DELETE them. A tag
-// split across two fragments by, say, an embedded newline (e.g.
-// "</thread_cont" + "\n" + "ext>") does not match here (the regex has no
-// line-break tolerance, deliberately — see LINE_BREAK below for the
+// A second, easy-to-miss invariant this depends on: no pass over this
+// text — whatever runs before this function, or after it — may ever
+// DELETE a character; every pass must SUBSTITUTE. A tag split across two
+// fragments by, say, an embedded newline (e.g. "</thread_cont" + "\n" +
+// "ext>") does not match here (the regex has no line-break tolerance
+// WITHIN the tag name, deliberately — see LINE_BREAK below for the
 // separate, much larger set this file treats as a line break) and is left
-// unescaped on both sides, which is fine as long as the split persists. But
-// if a later pass ever replaces that newline with "" instead of a
-// character, the fragments rejoin into a live, unescaped tag — this
-// function already ran and won't run again. sanitizeLabel's newline
-// collapse below substitutes a SPACE for exactly this reason; if that ever
-// became "", or a future "strip zero-width/control characters" pass did,
-// this invariant would be the thing it broke.
+// unescaped on both sides, which is fine as long as the split persists. If
+// any pass ever replaced that newline with "" instead of a character, the
+// fragments would rejoin into a live, unescaped tag with no further pass
+// left to catch it.
+//
+// Both callers below get this right, in the same shape, by construction:
+// buildThreadContext normalises LINE_BREAK to "\n" BEFORE ever calling
+// this function on a message body, and sanitizeLabel collapses LINE_BREAK
+// to a SPACE BEFORE calling this function on a label. Collapsing first and
+// neutralising second — rather than the reverse — also matters for a
+// second, narrower reason specific to sanitizeLabel: this function's own
+// pattern tolerates \s in specific positions (around the optional slash,
+// and right before the closing ">"), and JavaScript's \s class does not
+// include every character LINE_BREAK does — notably NEL (U+0085). A tag
+// carrying one of those characters in a tolerated position fails to match
+// here as long as the character is still there. Collapsing first turns it
+// into an ordinary space (which \s does recognise) before this function's
+// pattern ever runs, so the tag is caught in the one pass this function
+// gets. Neutralising first and collapsing second — the order sanitizeLabel
+// used before this fix — gets it backwards: the un-recognised separator
+// survives this function unescaped, and the later collapse then completes
+// it into a live tag with nothing left to re-escape it. Do not "fix" that
+// class by adding NEL to a regex's whitespace tolerance instead of fixing
+// the ordering — that closes the one character reported, not every
+// current and future member of LINE_BREAK.
 //
 // This is deliberately NOT escapeMrkdwn: that guards text on its way OUT to
 // Slack. This text travels IN, to the agent — applying Slack's escaping here
@@ -403,8 +421,21 @@ const LINE_BREAK = /\r\n|\r|\n|\u2028|\u2029|\u0085|\u000B|\u000C/g;
 // label can never start a rendered line of its own. The space is required,
 // not cosmetic: see the "substitute, never delete" note on
 // neutralizeFenceTags above.
+//
+// ORDER (fixed by the residual review — was reversed before): the
+// LINE_BREAK collapse runs FIRST, neutralizeFenceTags runs SECOND, on the
+// already-collapsed text — this is the same order buildThreadContext's
+// body path already uses (normalise breaks, then neutralise; see below),
+// and neutralizeFenceTags's own comment above explains why that order,
+// not the reverse, is the one that closes the whole LINE_BREAK class
+// rather than just the one Unicode separator (NEL) a display name was
+// found abusing. Running the collapse first also means neutralizeFenceTags
+// is the LAST transformation applied to a label — its escaped output is
+// never touched again, so the "no two escaped fragments can rejoin"
+// property it documents holds trivially for labels, with nothing left to
+// re-run.
 function sanitizeLabel(label: string): string {
-  return neutralizeFenceTags(label).replace(LINE_BREAK, " ").replaceAll("]", "&#93;");
+  return neutralizeFenceTags(label.replace(LINE_BREAK, " ")).replaceAll("]", "&#93;");
 }
 
 // Message bodies, unlike labels, are NOT newline-collapsed — multi-line
