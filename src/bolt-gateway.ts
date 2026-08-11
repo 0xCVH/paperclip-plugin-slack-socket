@@ -58,7 +58,19 @@ export class BoltGateway implements SlackGateway {
       // call through `this.app.client` — including the `auth.test()` used by
       // both `start()` and `probe()` — could otherwise hang far longer than
       // this plugin's 60s watchdog tick interval.
-      clientOptions: { timeout: 10_000 },
+      //
+      // retries: 0 is the necessary complement of that timeout. A client-
+      // side abort proves nothing about the server: a chat.postMessage that
+      // merely responded slowly DID land, and the default retry policy would
+      // re-send it — a duplicate message in the channel, and for an approval
+      // prompt a second set of live Approve/Reject buttons of which only the
+      // retry's copy gets linked for later retirement. No call this gateway
+      // makes is safe to blind-retry, so the retry layer is off; transient
+      // failures surface to callers (which already handle and report them)
+      // and to the watchdog. Slack's 429 rate-limit queueing is a separate
+      // WebClient mechanism that only re-queues requests Slack REJECTED —
+      // that one is duplicate-safe and stays on.
+      clientOptions: { timeout: 10_000, retryConfig: { retries: 0 } },
     });
 
     this.app.event("app_mention", async ({ event }) => {
