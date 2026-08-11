@@ -66,6 +66,27 @@ describe("approvals", () => {
     expect(ctx.activity.log).toHaveBeenCalled();
   });
 
+  it("does not report a decided approval as failed when only the activity log throws afterward", async () => {
+    // The REST decision succeeded and the message was rewritten — the
+    // approval IS decided. A telemetry failure after that must not post
+    // ':x: Failed to approve … It may already be decided.' under a message
+    // that shows it succeeded, prompting a pointless re-decide/escalation.
+    const { ctx, gateway, approvals } = setup();
+    (ctx.activity.log as any).mockRejectedValue(new Error("activity backend down"));
+    await approvals.handleAction(approveAction);
+    expect(gateway.updates[0]!.text).toContain("Approved");
+    expect(gateway.ephemerals).toHaveLength(0);
+    expect(ctx.logger.warn).toHaveBeenCalled();
+  });
+
+  it("does not report a decided approval as failed when only the metrics write throws afterward", async () => {
+    const { ctx, gateway, approvals } = setup();
+    (ctx.metrics.write as any).mockRejectedValue(new Error("metrics backend down"));
+    await approvals.handleAction(approveAction);
+    expect(gateway.updates[0]!.text).toContain("Approved");
+    expect(gateway.ephemerals).toHaveLength(0);
+  });
+
   it("sends decisionNote (not decidedByUserId) in the request body — the server ignores decidedByUserId", async () => {
     const { ctx, approvals } = setup();
     await approvals.handleAction(approveAction);
