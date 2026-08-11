@@ -252,8 +252,17 @@ describe("BoltGateway (against a mocked @slack/bolt App)", () => {
     });
   });
 
-  it("stops paging after 5 requests so a runaway thread cannot hang a turn", async () => {
-    const gateway = await makeGateway();
+  it("stops paging after 5 requests so a runaway thread cannot hang a turn, and warns that the tail was not read", async () => {
+    // The page cap is a safety bound, but stopping with has_more still true
+    // means the NEWEST messages were never fetched — selection then presents
+    // a stale mid-thread window as the recent discussion. That must not be
+    // silent: a warning is the signal that the seeded transcript is missing
+    // its tail. (With THREAD_FETCH_PAGE_SIZE = 1000 the cap is ~5000
+    // messages, so in practice this only fires on a pathological thread.)
+    const warn = vi.fn();
+    appInstances.length = 0;
+    const { BoltGateway } = await import("../src/bolt-gateway.js");
+    const gateway = new BoltGateway({ botToken: "xoxb", appToken: "xapp", logger: { warn } });
     appInstances[0]!.client.conversations.replies.mockResolvedValue({
       ok: true,
       has_more: true,
@@ -264,5 +273,24 @@ describe("BoltGateway (against a mocked @slack/bolt App)", () => {
     const replies = await gateway.fetchThreadReplies("C1", "1.1", 200);
     expect(replies).toHaveLength(5);
     expect(appInstances[0]!.client.conversations.replies).toHaveBeenCalledTimes(5);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("page cap"),
+      expect.objectContaining({ channel: "C1", threadTs: "1.1" }),
+    );
+  });
+
+  it("does not warn when a thread ends within the page cap", async () => {
+    const warn = vi.fn();
+    appInstances.length = 0;
+    const { BoltGateway } = await import("../src/bolt-gateway.js");
+    const gateway = new BoltGateway({ botToken: "xoxb", appToken: "xapp", logger: { warn } });
+    appInstances[0]!.client.conversations.replies.mockResolvedValueOnce({
+      ok: true,
+      has_more: false,
+      messages: [{ user: "U1", text: "only page", ts: "1.1" }],
+    });
+
+    await gateway.fetchThreadReplies("C1", "1.1", 200);
+    expect(warn).not.toHaveBeenCalled();
   });
 });

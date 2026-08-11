@@ -75,6 +75,18 @@ export interface SessionEntry {
   threadTs: string;
   scope: "channel" | "thread";
   lastActivityAt: string; // ISO 8601
+  /**
+   * True from session creation until the thread-history seed block has
+   * actually been delivered in a prompt (or there was structurally nothing
+   * to seed). Persisted on the session rather than derived from an
+   * ephemeral "was this the creating turn?" flag so that a first turn which
+   * dies after the session is created — a failed placeholder post, a
+   * transient fetch error, a process restart — is retried on a later turn
+   * instead of leaving the thread permanently unseeded. Absent on sessions
+   * created before this field existed, which read as "not pending" (they
+   * are past their first turn and must not suddenly seed).
+   */
+  seedPending?: boolean;
 }
 
 // Links a Slack message we posted to the entity it represents, so a later

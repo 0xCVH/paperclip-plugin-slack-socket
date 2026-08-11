@@ -125,6 +125,21 @@ export const THREAD_CONTEXT_CLOSE_TAG = "</thread_context>";
 export const THREAD_CONTEXT_MAX_CHARS = 12_000;
 export const THREAD_CONTEXT_MAX_MESSAGES = 50;
 
+// The per-request page size for reading a thread back (the `limit` passed to
+// fetchThreadReplies), deliberately DECOUPLED from the selection cap above.
+// conversations.replies pages oldest-first, so if the page size equalled the
+// 50-message selection cap, a thread longer than THREAD_REPLIES_MAX_PAGES ×
+// 50 = 250 messages would return only its oldest 250 — and selection, which
+// keeps the most RECENT of what it was given, would then present a stale
+// mid-thread window as "the recent discussion", the exact opposite of what
+// "raise a ticket for this issue above" needs. Slack allows up to 1000 per
+// page, so one page size of 1000 moves that cliff from 250 to 5000 messages
+// (THREAD_REPLIES_MAX_PAGES × 1000) — beyond any realistic thread — while
+// selection still trims the fetched transcript down to the 50-message /
+// 12,000-char budget. The two numbers answer different questions: this is
+// "how much can we read", THREAD_CONTEXT_MAX_MESSAGES is "how much do we keep".
+export const THREAD_FETCH_PAGE_SIZE = 1_000;
+
 // A single Slack message can carry up to ~40,000 characters. Without this,
 // a maximal parent alone could blow past THREAD_CONTEXT_MAX_CHARS by more
 // than 3x before a single reply is even considered — the parent is always

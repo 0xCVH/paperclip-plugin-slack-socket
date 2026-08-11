@@ -10,6 +10,7 @@ import {
   THREAD_CONTEXT_MAX_CHARS,
   THREAD_CONTEXT_MAX_MESSAGES,
   THREAD_CONTEXT_MAX_PARENT_CHARS,
+  THREAD_FETCH_PAGE_SIZE,
   THREAD_CONTEXT_OPEN_TAG,
 } from "./constants.js";
 import { escapeMrkdwn } from "./formatters.js";
@@ -166,8 +167,16 @@ export function buildChatPrompt(preamble: string, text: string, seed = ""): stri
 // partial version of it rather than the whole thing.
 function truncateParentText(text: string): string {
   if (text.length <= THREAD_CONTEXT_MAX_PARENT_CHARS) return text;
-  const dropped = text.length - THREAD_CONTEXT_MAX_PARENT_CHARS;
-  return `${text.slice(0, THREAD_CONTEXT_MAX_PARENT_CHARS)}\n… [truncated, ${dropped} more characters omitted] …`;
+  let end = THREAD_CONTEXT_MAX_PARENT_CHARS;
+  // Don't split a surrogate pair: THREAD_CONTEXT_MAX_PARENT_CHARS is a
+  // UTF-16 code-unit index, so if the cut lands right after a high surrogate
+  // (the first half of an astral character — an emoji — whose second half is
+  // at `end`), back off one unit. A lone surrogate otherwise serialises to
+  // U+FFFD or trips a strict JSON encoder, turning the turn into an apology.
+  const lastUnit = text.charCodeAt(end - 1);
+  if (lastUnit >= 0xd800 && lastUnit <= 0xdbff) end -= 1;
+  const dropped = text.length - end;
+  return `${text.slice(0, end)}\n… [truncated, ${dropped} more characters omitted] …`;
 }
 
 /**
@@ -321,7 +330,21 @@ const UNKNOWN_SPEAKER_LABEL = "unknown";
 // close, tolerating whitespace around the optional "/" and before the
 // closing ">" — matching the loose way a model actually reads the tag,
 // rather than the strict way a byte comparison does.
-const CONTROL_TAG_PATTERN = /<(\s*\/?\s*(?:thread_context|slack_reply)\s*)>/gi;
+//
+// IMPORTANT 3, fix round 3: the round-1 pattern only tolerated whitespace
+// between the tag name and ">", so any tag carrying an ATTRIBUTE
+// (</thread_context foo=bar>, <thread_context id="x">) or a SELF-CLOSING
+// slash (<thread_context/>, </thread_context/>) slipped through un-
+// neutralised — and a model reads an XML-ish tag by its name, ignoring
+// attributes and a trailing slash, so those close the fence exactly as
+// effectively as the bare tag. The name is now followed by a boundary
+// assertion (?=[\s/>]) — so "thread_contextual" (a longer word) still does
+// NOT match — and then [^<>]* swallows any attributes, whitespace or slash
+// up to the closing ">". [^<>]* is the load-bearing safety choice: it can
+// never consume a "<" or ">", so the captured group still contains no angle
+// bracket and the "&lt;$1&gt;" replacement below preserves the same "no
+// pass can emit a live tag" invariant the bare-name version had.
+const CONTROL_TAG_PATTERN = /<(\s*\/?\s*(?:thread_context|slack_reply)(?=[\s/>])[^<>]*)>/gi;
 
 // Load-bearing. A message containing a literal (or case/whitespace-varied)
 // </thread_context> would otherwise close the fence early, and everything
@@ -434,8 +457,21 @@ const LINE_BREAK = /\r\n|\r|\n|\u2028|\u2029|\u0085|\u000B|\u000C/g;
 // never touched again, so the "no two escaped fragments can rejoin"
 // property it documents holds trivially for labels, with nothing left to
 // re-run.
+// NFKC FIRST, before the collapse and the escape: a model reads the
+// fullwidth right bracket "］" (U+FF3D) as a closing bracket and "＜"/"＞"
+// (U+FF1C/U+FF1E) as angle brackets, so a display name like "you］ …" would
+// close its own bracket early — forging a bare "[you]" — exactly like an
+// ASCII "]", and "Mal＜/thread_context＞" would close the fence, both
+// unreached by the ASCII-only "]" escape and CONTROL_TAG_PATTERN. NFKC
+// folds those (and the rest of the fullwidth/compatibility block) to their
+// ASCII forms, so the existing "]" escape and neutralizeFenceTags then
+// catch them. It runs before the LINE_BREAK collapse for the same reason
+// the collapse runs before neutralizeFenceTags: any character NFKC folds
+// into a "]", "<", ">" or a line break must still be seen by the pass that
+// handles it. NFKC never introduces a line terminator, so it cannot
+// reopen the LINE_BREAK class it precedes.
 function sanitizeLabel(label: string): string {
-  return neutralizeFenceTags(label.replace(LINE_BREAK, " ")).replaceAll("]", "&#93;");
+  return neutralizeFenceTags(label.normalize("NFKC").replace(LINE_BREAK, " ")).replaceAll("]", "&#93;");
 }
 
 // Message bodies, unlike labels, are NOT newline-collapsed — multi-line
@@ -500,13 +536,17 @@ export function buildThreadContext(entries: ThreadContextEntry[], omitted: numbe
 
   const lines = entries.map((entry) => {
     const label = sanitizeLabel(entry.label);
-    // Normalise LINE_BREAK characters to "\n" before trimming: JS's
+    // NFKC first — same reasoning as sanitizeLabel: a fullwidth
+    // "＜/thread_context＞" in a message BODY reads as a live fence close to
+    // the model just as it would in a label, and would otherwise pass
+    // neutralizeFenceTags below unfolded. Then normalise LINE_BREAK
+    // characters to "\n" before trimming, because JS's
     // String.prototype.trim() does not recognise every member of that set
     // as whitespace (notably NEL, U+0085), so without this a body
     // consisting solely of one of those characters survives trim() as a
     // non-empty string and would render as invisible garbage instead of
     // EMPTY_TEXT_PLACEHOLDER below.
-    const normalized = entry.text.replace(LINE_BREAK, "\n").trim();
+    const normalized = entry.text.normalize("NFKC").replace(LINE_BREAK, "\n").trim();
     const text = normalized ? markContinuationLines(neutralizeFenceTags(normalized)) : EMPTY_TEXT_PLACEHOLDER;
     return `[${label}] ${text}`;
   });
@@ -597,6 +637,10 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
     const timer = setTimeout(() => {
       reject(new SeedTimeoutError(`timed out after ${ms}ms`));
     }, ms);
+    // Bookkeeping timer only; never let a pending 15s seed timeout hold the
+    // process (or a test run) open by itself — the same guard worker.ts's
+    // probeWithTimeout applies to its own race timer.
+    timer.unref();
     promise.then(
       (value) => {
         clearTimeout(timer);
@@ -725,7 +769,20 @@ export function createChat(deps: ChatDeps): Chat {
 
   // Guards against two concurrent "first messages" in the same thread both
   // passing the "no existing session" check and creating duplicate sessions.
-  const inFlightSessions = new Map<string, Promise<{ entry: SessionEntry; created: boolean }>>();
+  const inFlightSessions = new Map<string, Promise<SessionEntry>>();
+
+  // Session keys whose seed is being delivered by a turn IN THIS PROCESS
+  // right now. The persisted `seedPending` flag decides across turns and
+  // restarts whether a session still needs seeding; this in-memory claim
+  // closes the narrow window where two overlapping turns both read
+  // seedPending: true before either has cleared it (a second mention
+  // arriving while the creating turn is still mid-seed) and would each
+  // deliver the transcript into the one shared session. The claim is taken
+  // synchronously right after getOrCreateSession resolves — before the next
+  // await — so at most one concurrent turn ever wins it. Released when the
+  // seeding turn finishes; a turn that failed to deliver leaves seedPending
+  // true, so a later turn still retries.
+  const seedInFlight = new Set<string>();
 
   function stripMention(text: string): string {
     const botId = gateway.botUserId();
@@ -785,20 +842,23 @@ export function createChat(deps: ChatDeps): Chat {
     cfg: SlackSocketConfig,
     channel: string,
     scope: SessionScope,
-  ): Promise<{ entry: SessionEntry; created: boolean }> {
+  ): Promise<SessionEntry> {
     const key = scope.key;
     const inFlight = inFlightSessions.get(key);
-    // A caller that joins an in-flight creation is NOT the creator: handing
-    // it the creator's `created: true` would make two turns each seed the
-    // thread into the one session they share.
-    if (inFlight) return { ...(await inFlight), created: false };
+    // A caller that joins an in-flight creation gets the same entry the
+    // creator built (seedPending and all). Whether either turn actually
+    // seeds is decided separately, by the seedInFlight claim in converse —
+    // so two racing first-mentions never both deliver the transcript.
+    if (inFlight) return inFlight;
 
-    const promise = (async (): Promise<{ entry: SessionEntry; created: boolean }> => {
+    const promise = (async (): Promise<SessionEntry> => {
       const existing = (await ctx.state.get(stateScope(key))) as SessionEntry | null;
       if (existing) {
+        // Spread preserves seedPending: a session created but not yet
+        // seeded (a failed first turn) stays pending until a turn delivers.
         const updated = { ...existing, lastActivityAt: new Date().toISOString() };
         await ctx.state.set(stateScope(key), updated);
-        return { entry: updated, created: false };
+        return updated;
       }
       const session = await ctx.agents.sessions.create(cfg.defaultAgentId, cfg.companyId, {
         reason: "slack-thread",
@@ -822,12 +882,17 @@ export function createChat(deps: ChatDeps): Chat {
         // in resolveSessionScope, not in re-deriving it from a stored entry.
         scope: scope.scope,
         lastActivityAt: new Date().toISOString(),
+        // Pending until a turn actually delivers the seed (see converse).
+        // Kept on the persisted entry, not derived from "is this the
+        // creating turn", so a first turn that dies after this write is
+        // retried rather than leaving the thread unseeded forever.
+        seedPending: true,
       };
       await ctx.state.set(stateScope(key), entry);
       await updateIndex(ctx, STATE_KEYS.sessionIndex, (current) =>
         current.includes(key) ? current : [...current, key],
       );
-      return { entry, created: true };
+      return entry;
     })();
 
     inFlightSessions.set(key, promise);
@@ -835,6 +900,17 @@ export function createChat(deps: ChatDeps): Chat {
       return await promise;
     } finally {
       inFlightSessions.delete(key);
+    }
+  }
+
+  // Durably records that this session's thread history has been delivered,
+  // so no later turn re-seeds it. Re-reads the current entry before writing
+  // so a concurrent lastActivityAt update isn't clobbered — only the
+  // seedPending flag flips (true -> false), which is idempotent.
+  async function markSeedDelivered(key: string): Promise<void> {
+    const current = (await ctx.state.get(stateScope(key))) as SessionEntry | null;
+    if (current && current.seedPending) {
+      await ctx.state.set(stateScope(key), { ...current, seedPending: false });
     }
   }
 
@@ -887,9 +963,14 @@ export function createChat(deps: ChatDeps): Chat {
    * earlier thread costs zero further calls here.
    */
   async function resolveThreadEntries(messages: ThreadMessage[]): Promise<ThreadContextEntry[]> {
-    const botId = gateway.botUserId();
-    const isBotsOwn = (message: ThreadMessage): boolean =>
-      message.isBot && botId !== undefined && message.user === botId;
+    // Trust ThreadMessage.isBot, which the gateway stamped at FETCH time as
+    // "this app's own bot user" (see fetchThreadReplies) — do NOT re-derive
+    // it from gateway.botUserId() here. Re-reading botUserId() at resolve
+    // time can disagree: worker.ts nulls the gateway proxy during every
+    // config re-apply, so botUserId() briefly returns undefined mid-turn,
+    // which would relabel the bot's own alert as a third party and pin it
+    // into displayNameCache. isBot is the single source of truth for this.
+    const isBotsOwn = (message: ThreadMessage): boolean => message.isBot;
 
     const idsToResolve = new Set<string>();
     for (const message of messages) {
@@ -918,11 +999,23 @@ export function createChat(deps: ChatDeps): Chat {
         // tries the lookup again instead of reusing today's failure.
         try {
           const displayName = await gateway.getUserDisplayName(userId);
-          // Structural, not a content check: every non-bot label carries
-          // its own id, so no display name — whatever it contains — can
-          // produce a bare "[you]" line. See the CRITICAL, fix-round-2
-          // comment near sanitizeLabel.
-          cacheDisplayLabel(userId, `${displayName} (${userId})`);
+          // The real BoltGateway.getUserDisplayName never rejects: on a
+          // rate limit or network blip it catches internally and RESOLVES
+          // the raw userId unchanged (see src/bolt-gateway.ts). So a result
+          // equal to the id is not a resolved name — it is that failure
+          // shape, and caching it would pin this speaker to "<id> (<id>)"
+          // for the whole process, exactly the memoised-failure bug this
+          // guard exists to prevent (the catch below only covers a custom
+          // gateway that rejects). Either way the map phase's own fallback
+          // supplies the same "<id> (<id>)" label for THIS turn, uncached,
+          // so the next thread that sees this speaker tries the lookup
+          // again. Structural, not a content check: every non-bot label
+          // carries its own id, so no display name can produce a bare
+          // "[you]" line — see the CRITICAL, fix-round-2 comment near
+          // sanitizeLabel.
+          if (displayName !== userId) {
+            cacheDisplayLabel(userId, `${displayName} (${userId})`);
+          }
         } catch {
           // Nothing to cache; the map phase below falls back to the raw
           // id for this turn.
@@ -972,30 +1065,72 @@ export function createChat(deps: ChatDeps): Chat {
    * rather than escaping into converse's catch and replacing a perfectly
    * good turn with ":warning: Sorry — something went wrong". An answer
    * without context beats no answer.
+   *
+   * Returns `{ block, retryable }`. `retryable` is true ONLY when a fetch
+   * failure or timeout means the history exists but could not be read this
+   * time — the caller leaves the session's seedPending flag set so a later
+   * turn tries again. It is false when there is genuinely nothing to seed
+   * (not a thread, an empty thread, nothing survived selection) or the
+   * block was built successfully: in all of those the seeding attempt is
+   * complete and must not be retried.
    */
   async function buildSeedBlock(
     msg: InboundMessage,
     scope: SessionScope,
     placeholderTs: string,
-  ): Promise<string> {
+  ): Promise<{ block: string; retryable: boolean }> {
     const threadTs = scope.replyThreadTs;
     // Whether there is a thread to read is resolveSessionScope's answer, not
     // a second guess at channel types here: a channel-scoped DM session
     // (scope "channel") has no thread root at all, and a message that IS its
     // own thread root has nothing above it to fetch. A DM under
     // dmSessionMode "thread" resolves to scope "thread" and seeds like any
-    // other thread.
-    if (scope.scope !== "thread" || threadTs === undefined || threadTs === msg.ts) return "";
-    const excludeTs = new Set([msg.ts, placeholderTs]);
+    // other thread. Nothing to seed, ever — not retryable.
+    if (scope.scope !== "thread" || threadTs === undefined || threadTs === msg.ts) {
+      return { block: "", retryable: false };
+    }
+    // Exact-ts exclusions: the triggering mention (it arrives as the prompt
+    // proper) and this turn's own "_Thinking…_" placeholder. A falsy ts is
+    // Slack's missing-ts sentinel — dropped here so it can never become an
+    // exclusion key that silently matches every fetched message whose own ts
+    // also defaulted to "" (see the class filter below for the same guard on
+    // the fetched side).
+    const excludeTs = new Set([msg.ts, placeholderTs].filter((ts) => ts !== ""));
+    const triggerTsNum = Number(msg.ts);
     try {
-      return await withTimeout(
+      const block = await withTimeout(
         (async () => {
           const fetched = await gateway.fetchThreadReplies(
             msg.channel,
             threadTs,
-            THREAD_CONTEXT_MAX_MESSAGES,
+            // Page SIZE, not the selection cap: conversations.replies pages
+            // oldest-first, so a page size equal to THREAD_CONTEXT_MAX_MESSAGES
+            // would fetch only the oldest ~250 messages of a long thread and
+            // drop the recent tail this feature exists to show. See
+            // THREAD_FETCH_PAGE_SIZE.
+            THREAD_FETCH_PAGE_SIZE,
           );
-          if (fetched.length === 0) {
+          // Drop the bot's OWN turn machinery as a class, not just this
+          // turn's placeholder by its exact ts: any own-bot message posted
+          // AT OR AFTER the triggering mention is a placeholder/ack/echo for
+          // this turn or a racing sibling turn, never thread history — so a
+          // concurrent second mention's "_Thinking…_" can't be seeded as a
+          // bare "[you]" line. An own-bot message with no ts can't be
+          // positioned against the trigger, so it is treated as machinery
+          // too. A ts BEFORE the trigger (the genuine earlier bot alert this
+          // feature exists to show) is kept.
+          const history = fetched.filter((m) => {
+            if (m.ts !== "" && excludeTs.has(m.ts)) return false;
+            if (m.isBot) {
+              if (m.ts === "") return false;
+              const tsNum = Number(m.ts);
+              if (Number.isFinite(tsNum) && Number.isFinite(triggerTsNum) && tsNum >= triggerTsNum) {
+                return false;
+              }
+            }
+            return true;
+          });
+          if (history.length === 0) {
             // Not the same as "nothing survived selection" below, which is
             // normal: an empty fetch means the parent didn't come back
             // either.
@@ -1006,7 +1141,7 @@ export function createChat(deps: ChatDeps): Chat {
             return "";
           }
           const { kept, omitted } = selectThreadMessages(
-            fetched,
+            history,
             excludeTs,
             THREAD_CONTEXT_MAX_CHARS,
             THREAD_CONTEXT_MAX_MESSAGES,
@@ -1016,18 +1151,22 @@ export function createChat(deps: ChatDeps): Chat {
         })(),
         seedTimeoutMs,
       );
+      // Reached the fetch and got an answer (a block, or a considered
+      // "nothing to seed") — the attempt is complete, don't retry it.
+      return { block, retryable: false };
     } catch (err) {
       // Covers both a genuine fetch failure and SEED_FETCH_TIMEOUT_MS
       // expiring (withTimeout rejects with SeedTimeoutError in that case) —
       // deliberately the same branch, so a throttled/stuck Slack call
       // degrades exactly like any other fetch failure: log it, seed
-      // nothing, let the turn continue.
+      // nothing, let the turn continue. The history does exist but wasn't
+      // read, so this IS retryable — the caller keeps seedPending set.
       ctx.logger.warn("Slack thread history fetch failed; continuing without it", {
         err: errString(err),
         channel: msg.channel,
         threadTs,
       });
-      return "";
+      return { block: "", retryable: true };
     }
   }
 
@@ -1248,13 +1387,34 @@ export function createChat(deps: ChatDeps): Chat {
     // reply somewhere sane when getConfig() itself rejects. A reply under
     // the user's own message is always safe to post.
     let replyThreadTs: string | undefined = msg.threadTs ?? msg.ts;
+    // The "_Thinking…_" message, once posted. Held in the outer scope so the
+    // catch can rewrite IT with the error rather than leaving it dangling
+    // and posting a separate message beside it (see the catch).
+    let placeholder: { channel: string; ts: string } | undefined;
+    // The session key this turn claimed the seed for, if any — released in
+    // the finally so a turn that failed to deliver leaves seedPending set
+    // for a later retry.
+    let claimedSeedKey: string | undefined;
     try {
       const cfg = await getConfig();
       const scope = resolveSessionScope(msg, cfg.dmSessionMode);
       replyThreadTs = scope.replyThreadTs;
       const text = stripMention(msg.text);
       if (!text) return;
-      const { entry, created } = await getOrCreateSession(cfg, msg.channel, scope);
+      const entry = await getOrCreateSession(cfg, msg.channel, scope);
+
+      // Seed decision: gated on the session's PERSISTED seedPending (so a
+      // failed first turn retries — see SessionEntry.seedPending) and
+      // claimed synchronously here, before the next await, so two
+      // overlapping first-mentions never both deliver the transcript into
+      // the one shared session (see seedInFlight).
+      const wantSeed =
+        cfg.seedThreadHistory && entry.seedPending === true && !seedInFlight.has(scope.key);
+      if (wantSeed) {
+        seedInFlight.add(scope.key);
+        claimedSeedKey = scope.key;
+      }
+
       // Posted BEFORE any thread-history fetch, not after. Seeding can cost
       // several sequential Slack API calls — paginated conversations.replies
       // plus a users.info lookup per distinct speaker — and the turn
@@ -1262,34 +1422,57 @@ export function createChat(deps: ChatDeps): Chat {
       // ordering, the very first turn in a busy thread could leave a person
       // staring at total silence for as long as those calls take, with
       // nothing armed yet to rescue them (see buildSeedBlock / streamReply).
-      const placeholder = await gateway.postMessage({
+      placeholder = await gateway.postMessage({
         channel: msg.channel,
         threadTs: scope.replyThreadTs,
         text: "_Thinking…_",
       });
-      // Seed once, on this session's first turn only. Every later turn in the
-      // same thread already has the history in the session, so re-sending it
-      // would re-send the same text repeatedly and grow without bound.
+
       // `placeholder.ts` is threaded through so buildSeedBlock can exclude
       // the placeholder message itself from the transcript it reads back —
       // see the BLOCKER 1 note on buildSeedBlock.
-      const seed = created && cfg.seedThreadHistory ? await buildSeedBlock(msg, scope, placeholder.ts) : "";
+      let seed = "";
+      let seedComplete = false;
+      if (wantSeed) {
+        const result = await buildSeedBlock(msg, scope, placeholder.ts);
+        seed = result.block;
+        // A retryable failure (fetch error/timeout) leaves seedPending set;
+        // anything else — a delivered block, or nothing to seed — completes.
+        seedComplete = !result.retryable;
+      }
       const prompt = buildChatPrompt(cfg.chatPromptPreamble, text, seed);
       await streamReply(cfg, entry, scope.replyThreadTs, prompt, placeholder);
+
+      // Cleared only now — after the prompt carrying the seed actually
+      // reached the agent (streamReply resolved) and only when the attempt
+      // was complete. "Seed once" is thus "once delivered", not "once
+      // attempted": a first turn that threw before here leaves seedPending
+      // set for the next mention to retry.
+      if (wantSeed && seedComplete) {
+        await markSeedDelivered(scope.key);
+      }
     } catch (err) {
       const reason = describeHostError(err);
       ctx.logger.error("Slack chat failed", { err: reason, channel: msg.channel });
-      await gateway
-        .postMessage({
-          channel: msg.channel,
-          threadTs: replyThreadTs,
-          // Surface the reason in Slack, not just in the plugin log: an
-          // operator reading the thread is usually the only person who sees
-          // this, and a bare "something went wrong" makes the plugin
-          // undiagnosable from the outside. errString() redacts tokens.
-          text: `:warning: Sorry — something went wrong talking to the agent: ${reason.slice(0, 500)}`,
-        })
-        .catch(() => {});
+      const text = `:warning: Sorry — something went wrong talking to the agent: ${reason.slice(0, 500)}`;
+      // Surface the reason in Slack, not just in the plugin log: an operator
+      // reading the thread is usually the only person who sees this, and a
+      // bare "something went wrong" makes the plugin undiagnosable from the
+      // outside. errString() (via describeHostError) redacts tokens. If the
+      // placeholder was already posted, rewrite IT — otherwise the throw
+      // (e.g. a bad preamble, or streamReply never reached) would leave
+      // "_Thinking…_" in the thread forever beside this separate message.
+      if (placeholder) {
+        await gateway
+          .updateMessage({ channel: placeholder.channel, ts: placeholder.ts, text })
+          .catch(() => {});
+      } else {
+        await gateway
+          .postMessage({ channel: msg.channel, threadTs: replyThreadTs, text })
+          .catch(() => {});
+      }
+    } finally {
+      if (claimedSeedKey) seedInFlight.delete(claimedSeedKey);
     }
   }
 

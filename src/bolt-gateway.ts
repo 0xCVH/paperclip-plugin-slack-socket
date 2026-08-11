@@ -312,10 +312,23 @@ export class BoltGateway implements SlackGateway {
       }
 
       const nextCursor = (res as { response_metadata?: { next_cursor?: string } }).response_metadata?.next_cursor;
-      if (!res.has_more || !nextCursor) break;
+      if (!res.has_more || !nextCursor) return collected;
       cursor = nextCursor;
     }
 
+    // Fell out of the loop with the cursor still live: the thread is longer
+    // than THREAD_REPLIES_MAX_PAGES × limit, so pages oldest-first means the
+    // NEWEST messages were never read. The caller keeps the most recent of
+    // what it was given (selectThreadMessages), so it would silently present
+    // a stale mid-thread window as the recent discussion. This is not silent:
+    // warn so a truncated seed is diagnosable. With THREAD_FETCH_PAGE_SIZE
+    // (1000) that cap is ~5000 messages — a pathological thread in practice.
+    this.logger.warn("Slack thread exceeded the fetch page cap; its most recent messages were not read", {
+      channel,
+      threadTs,
+      pagesFetched: THREAD_REPLIES_MAX_PAGES,
+      messagesFetched: collected.length,
+    });
     return collected;
   }
 
