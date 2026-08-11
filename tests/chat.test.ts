@@ -2303,4 +2303,43 @@ describe("thread history seeding", () => {
     const otherCalls = getUserDisplayName.mock.calls.filter((c) => c[0] === "U-OTHER");
     expect(otherCalls).toHaveLength(1);
   });
+
+  // CORRECTNESS FIX (residual review): resolveThreadEntries used to write
+  // a failed lookup's fallback (the raw id) into displayNameCache exactly
+  // like a successful one — so one transient failure (a rate limit, a
+  // network blip) pinned that speaker to "<id> (<id>)" for the rest of the
+  // process, with no retry. Only a SUCCESSFUL resolution may be memoised;
+  // a failure must still fall back to the raw id for the current turn
+  // without being cached, so the next thread gets a fresh attempt.
+  it("does not memoise a failed display-name lookup, so a later thread can still resolve the same speaker", async () => {
+    const { ctx, chat, gateway, fetchThreadReplies } = setupSeeding();
+    const getUserDisplayName = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("rate limited"))
+      .mockResolvedValueOnce("Christopher Von Hessert");
+    gateway.getUserDisplayName = getUserDisplayName;
+    fetchThreadReplies
+      .mockResolvedValueOnce(alertThread("1000.2"))
+      .mockResolvedValueOnce([
+        threadMessage("UBOT", "a second alert", "2000.1", true),
+        threadMessage("U-OTHER", "seen this one too", "2000.15"),
+        threadMessage("U-HUMAN", "<@UBOT> raise a ticket for this issue here above", "2000.2"),
+      ]);
+
+    await chat.handleMention(mentionInThread("first thread", "1000.2", "1000.1"));
+    await chat.handleMention({
+      channel: "C-ALERT", channelType: "channel", user: "U-HUMAN",
+      text: "<@UBOT> second thread", ts: "2000.2", threadTs: "2000.1",
+    });
+
+    // The first turn's failed lookup must not have been cached: the second
+    // turn, for the same speaker, has to try again rather than reuse a
+    // pinned "U-OTHER (U-OTHER)" fallback.
+    const otherCalls = getUserDisplayName.mock.calls.filter((c) => c[0] === "U-OTHER");
+    expect(otherCalls).toHaveLength(2);
+
+    const secondPrompt = (ctx.agents.sessions.sendMessage as any).mock.calls[1][2].prompt as string;
+    expect(secondPrompt).toContain("[Christopher Von Hessert (U-OTHER)] seen this one too");
+    expect(secondPrompt).not.toContain("[U-OTHER (U-OTHER)]");
+  });
 });

@@ -877,26 +877,41 @@ export function createChat(deps: ChatDeps): Chat {
 
     await Promise.all(
       Array.from(idsToResolve, async (userId) => {
-        // A name we can't resolve isn't worth failing a turn over: the raw
-        // id fills in for the missing display name, and the unconditional
-        // append below still runs on top of it either way.
-        const displayName = await gateway.getUserDisplayName(userId).catch(() => userId);
-        // Structural, not a content check: every non-bot label carries its
-        // own id, so no display name — whatever it contains — can produce a
-        // bare "[you]" line. See the CRITICAL, fix-round-2 comment near
-        // sanitizeLabel.
-        cacheDisplayLabel(userId, `${displayName} (${userId})`);
+        // Fix 2 (residual review): a lookup failure must NOT be memoised.
+        // The old code did `.catch(() => userId)` and then unconditionally
+        // cached the result either way, so one transient failure (a rate
+        // limit, a network blip — exactly the pressure this cache exists
+        // to relieve) pinned that speaker to the raw-id fallback for the
+        // rest of the process, with no retry. Only a successful lookup is
+        // worth remembering across threads; a failed one isn't worth
+        // failing THIS turn over, but it also isn't worth trusting for
+        // every turn after it. Leaving it uncached means the id simply
+        // isn't in displayNameCache below, and the map phase's own
+        // fallback (see its comment) supplies the same "<id> (<id>)" shape
+        // for this turn only — the next thread that sees this speaker
+        // tries the lookup again instead of reusing today's failure.
+        try {
+          const displayName = await gateway.getUserDisplayName(userId);
+          // Structural, not a content check: every non-bot label carries
+          // its own id, so no display name — whatever it contains — can
+          // produce a bare "[you]" line. See the CRITICAL, fix-round-2
+          // comment near sanitizeLabel.
+          cacheDisplayLabel(userId, `${displayName} (${userId})`);
+        } catch {
+          // Nothing to cache; the map phase below falls back to the raw
+          // id for this turn.
+        }
       }),
     );
 
     return messages.map((message) => {
       if (isBotsOwn(message)) return { label: "you", text: message.text };
       if (!message.user) return { label: UNKNOWN_SPEAKER_LABEL, text: message.text };
-      // Always present: every non-bot, non-empty user id was added to
-      // idsToResolve above and resolved there (or was already cached from
-      // an earlier thread). The fallback mirrors the same "<id> (<id>)"
-      // shape purely as a defensive last resort — this branch should be
-      // unreachable by construction.
+      // Present for every id that resolved successfully (this turn or an
+      // earlier thread). Absent, by design (see Fix 2 above), for an id
+      // whose lookup just failed — this fallback is exactly what supplies
+      // this turn's "<id> (<id>)" label in that case, not a purely
+      // defensive last resort.
       return {
         label: displayNameCache.get(message.user) ?? `${message.user} (${message.user})`,
         text: message.text,
