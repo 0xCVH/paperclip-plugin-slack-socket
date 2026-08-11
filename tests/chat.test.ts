@@ -1660,6 +1660,56 @@ describe("buildThreadContext", () => {
   });
 });
 
+// BLOCKER 2: sanitizeLabel is private to chat.ts, and its LINE_BREAK collapse
+// (`.replace(LINE_BREAK, " ")`) had no test that actually discriminated on
+// it — every test that looked like coverage asserted `startsWith("[you]")`,
+// which the separate, independent "]" → "&#93;" escape already guarantees
+// on its own (a label containing "[you]" always has its "]" escaped, so it
+// can never start a line with "[you]" regardless of whether the line break
+// itself was ever collapsed). Deleting the LINE_BREAK replace entirely left
+// all 135 chat tests green.
+//
+// These tests assert the thing that actually matters: a line-break
+// character embedded in a LABEL must contribute NO extra line to the
+// rendered block. A baseline label with an ordinary space in the same
+// position is the control — if the separator is genuinely collapsed to a
+// space, the two renders are identical; if the replace is missing, the
+// separator's raw character survives into the label, buildThreadContext's
+// per-entry line ends up carrying an embedded break, and splitting the
+// whole block on "\n" produces one extra line, changing the count (and, for
+// every separator here, the content).
+describe("sanitizeLabel's line-break collapse (tripwire)", () => {
+  // The same set LINE_BREAK recognises (see chat.ts) — every character this
+  // module treats as ending a line, not just "\n".
+  const LABEL_LINE_BREAKS: Array<[name: string, char: string]> = [
+    ["LF (\\n)", "\n"],
+    ["CR", "\r"],
+    ["CRLF", "\r\n"],
+    ["LINE SEPARATOR (U+2028)", "\u2028"],
+    ["PARAGRAPH SEPARATOR (U+2029)", "\u2029"],
+    ["NEL (U+0085)", "\u0085"],
+    ["VERTICAL TAB (U+000B)", "\u000B"],
+    ["FORM FEED (U+000C)", "\u000C"],
+  ];
+
+  it.each(LABEL_LINE_BREAKS)(
+    "a %s inside a label collapses to a space — contributing no extra line and no extra content",
+    (_name, sep) => {
+      const baseline = buildThreadContext([{ label: "Mallory harmless", text: "hi" }], 0);
+      const withBreak = buildThreadContext([{ label: `Mallory${sep}harmless`, text: "hi" }], 0);
+      // The discriminating assertion: line count is unchanged. Under the
+      // mutation (LINE_BREAK replace deleted), the label's raw separator
+      // character survives into the rendered block and splitting on "\n"
+      // produces at least one extra line for every separator in this list.
+      expect(withBreak.split("\n").length).toBe(baseline.split("\n").length);
+      // Stronger than line-count alone: the rendered block is byte-for-byte
+      // identical to the space-separated baseline, proving the separator
+      // became exactly one space, not merely "some non-newline character".
+      expect(withBreak).toBe(baseline);
+    },
+  );
+});
+
 describe("thread history seeding", () => {
   // Replaces the gateway method outright rather than driving FakeGateway's
   // transcript, so every test here controls the fetch and can count it —
