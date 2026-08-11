@@ -130,11 +130,20 @@ export function buildChatPrompt(preamble: string, text: string): string {
 // reinterpreted as "time out instantly".
 export const MIN_TURN_TIMEOUT_MINUTES = 1;
 
-/** Clamps a possibly-invalid `turnTimeoutMinutes` to a safe, positive floor. */
+// Ceiling for the same delay, needed because the floor alone leaves the
+// other overflow open: setTimeout's delay is a 32-bit signed int
+// (2^31-1 ms ≈ 35,791 minutes), and Node clamps anything larger to 1ms —
+// so an operator typing 999999 as "effectively no timeout" would instead
+// fire the watchdog INSTANTLY on every turn, with every real answer
+// arriving as a late reply. 35,000 minutes (~24 days) sits comfortably
+// under the overflow while being far beyond any real turn. The manifest
+// schema's `maximum` mirrors this for the settings form.
+export const MAX_TURN_TIMEOUT_MINUTES = 35_000;
+
+/** Clamps a possibly-invalid `turnTimeoutMinutes` to the safe [floor, ceiling] range. */
 export function clampTurnTimeoutMinutes(minutes: number): number {
-  return Number.isFinite(minutes) && minutes >= MIN_TURN_TIMEOUT_MINUTES
-    ? minutes
-    : MIN_TURN_TIMEOUT_MINUTES;
+  if (!Number.isFinite(minutes) || minutes < MIN_TURN_TIMEOUT_MINUTES) return MIN_TURN_TIMEOUT_MINUTES;
+  return Math.min(minutes, MAX_TURN_TIMEOUT_MINUTES);
 }
 
 // Prefix on a reply that lands after the turn watchdog already gave up. By
@@ -244,30 +253,47 @@ export function createChat(deps: ChatDeps): Chat {
   // Returns true when it handled the message, meaning no agent turn runs.
   async function tryHandleReset(msg: InboundMessage): Promise<boolean> {
     if (stripMention(msg.text).trim().toLowerCase() !== RESET_KEYWORD) return false;
+    let cleared: boolean;
+    let replyThreadTs: string | undefined;
     try {
       const cfg = await getConfig();
       const scope = resolveSessionScope(msg, cfg.dmSessionMode);
-      const cleared = await resetSession(ctx, cfg, scope.key, "mention");
-      await gateway.postMessage({
-        channel: msg.channel,
-        threadTs: scope.replyThreadTs,
-        text: cleared
-          ? ":broom: Conversation reset — the next message starts fresh."
-          : "Nothing to reset — this conversation is already fresh.",
-      });
+      replyThreadTs = scope.replyThreadTs;
+      cleared = await resetSession(ctx, cfg, scope.key, "mention");
     } catch (err) {
       // Report failures truthfully rather than confirming a reset that did
-      // not happen (the precedent at src/commands.ts:52).
+      // not happen (the precedent at src/commands.ts:52). Only the reset
+      // itself is inside this try — see below for why the confirmation post
+      // must not share it.
       const reason = describeHostError(err);
       ctx.logger.error("Slack reset failed", { err: reason, channel: msg.channel });
       await gateway
         .postMessage({
           channel: msg.channel,
-          threadTs: msg.threadTs ?? msg.ts,
+          threadTs: replyThreadTs ?? msg.threadTs ?? msg.ts,
           text: `:warning: Sorry — couldn't reset this conversation: ${reason.slice(0, 500)}`,
         })
         .catch(() => {});
+      return true;
     }
+    // The reset succeeded — the session is closed and its state gone. The
+    // truthful-reporting rule cuts both ways: a failed *confirmation* post
+    // must not claim the reset failed, so it gets its own catch instead of
+    // falling into the ":warning: couldn't reset" branch above.
+    await gateway
+      .postMessage({
+        channel: msg.channel,
+        threadTs: replyThreadTs,
+        text: cleared
+          ? ":broom: Conversation reset — the next message starts fresh."
+          : "Nothing to reset — this conversation is already fresh.",
+      })
+      .catch((err) => {
+        ctx.logger.warn("Slack reset confirmation post failed (the reset itself succeeded)", {
+          err: errString(err),
+          channel: msg.channel,
+        });
+      });
     return true;
   }
 

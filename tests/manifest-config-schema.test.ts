@@ -159,6 +159,17 @@ describe("instanceConfigSchema vs the host settings form", () => {
     expect(result.errors).toContainEqual({ field: "/turnTimeoutMinutes", message: "must be >= 1" });
   });
 
+  it("rejects a turnTimeoutMinutes past Node's 32-bit setTimeout ceiling — the overflow would fire the watchdog instantly, the opposite of the intended 'no timeout'", () => {
+    const result = validateInstanceConfig({
+      ...baseConfig,
+      slackBotTokenRef: SECRET_REF,
+      slackAppTokenRef: SECRET_REF,
+      turnTimeoutMinutes: 999_999,
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContainEqual({ field: "/turnTimeoutMinutes", message: "must be <= 35000" });
+  });
+
   it("still rejects a config missing required fields", () => {
     const result = validateInstanceConfig({ slackBotTokenRef: SECRET_REF });
     expect(result.valid).toBe(false);
