@@ -41,6 +41,12 @@ export interface ChatDeps {
    * operator configured and the only one meaningful to a reader in Slack.
    */
   turnTimeoutMs?: number;
+  /**
+   * Overrides the thread-history seeding step's timeout, in ms. Tests pass
+   * small values for the same reason as `turnTimeoutMs`; production leaves
+   * it unset and SEED_FETCH_TIMEOUT_MS applies (see buildSeedBlock).
+   */
+  seedTimeoutMs?: number;
 }
 
 export interface Chat {
@@ -482,6 +488,58 @@ export function clampTurnTimeoutMinutes(minutes: number): number {
 // say which turn it belongs to instead of arriving as a bare answer.
 const LATE_REPLY_PREFIX = "⏳ _Late reply to your earlier message:_\n\n";
 
+// IMPORTANT 4: bounds the whole thread-history seeding step (buildSeedBlock),
+// independently of streamReply's turn watchdog, which does not arm until
+// AFTER buildSeedBlock returns (see the ordering comment in converse). The
+// gateway's WebClient sets clientOptions: { timeout: 10_000 } (see
+// bolt-gateway.ts), but that bounds a single HTTP request, not the retries
+// Slack's client wraps around one: a rate-limited conversations.replies can
+// still retry for roughly ten attempts over up to ~30 minutes, and
+// fetchThreadReplies can issue up to THREAD_REPLIES_MAX_PAGES (5) such
+// requests sequentially, plus a users.info call per distinct speaker — all
+// inside this one `await`, with nothing armed yet to rescue it and the
+// person watching "_Thinking…_" the whole time.
+//
+// 15s: comfortably longer than one throttled WebClient call plus a retry or
+// two (10s + slack), so a seeding step that is merely slow — a big thread,
+// a cold connection — still gets to finish; short enough that a genuinely
+// stuck call is caught and the turn moves on with no history long before
+// turnTimeoutMinutes' 10-minute default would otherwise even be reached,
+// let alone Slack's ~30-minute retry ceiling. Do NOT "fix" a slow seed by
+// lowering the WebClient's own clientOptions.timeout instead — that bounds
+// every Slack call this plugin makes, including chat.postMessage and
+// chat.update on the critical path of every reply, not just this one.
+const SEED_FETCH_TIMEOUT_MS = 15_000;
+
+// Distinguishes "seeding timed out" from a genuine Slack/network failure in
+// logs (see buildSeedBlock's catch), even though both are handled identically
+// — log, seed nothing, let the turn continue.
+class SeedTimeoutError extends Error {}
+
+// Races `promise` against a plain timer. Deliberately does not cancel or
+// otherwise stop `promise` itself — there is no AbortController plumbed
+// through the gateway — so a fetch that later resolves after the timeout
+// fired just resolves into a promise nothing is awaiting any more; the
+// `.then`/second-arg-rejection handlers below exist so that late settlement
+// can't surface as an unhandled rejection.
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new SeedTimeoutError(`timed out after ${ms}ms`));
+    }, ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
 export interface SessionScope {
   /** Plugin-state key holding the SessionEntry for this conversation. */
   key: string;
@@ -569,6 +627,7 @@ export function createChat(deps: ChatDeps): Chat {
   const { ctx, gateway, getConfig } = deps;
   const updateIntervalMs = deps.updateIntervalMs ?? 1000;
   const turnTimeoutMsOverride = deps.turnTimeoutMs;
+  const seedTimeoutMs = deps.seedTimeoutMs ?? SEED_FETCH_TIMEOUT_MS;
 
   // Guards against two concurrent "first messages" in the same thread both
   // passing the "no existing session" check and creating duplicate sessions.
@@ -767,10 +826,15 @@ export function createChat(deps: ChatDeps): Chat {
    * triggering mention) and `placeholderTs` are excluded the same way,
    * structurally, not by filtering on content.
    *
-   * Never throws. A thread we cannot read has to degrade to exactly today's
-   * behavior — an answer with no history — rather than escaping into
-   * converse's catch and replacing a perfectly good turn with ":warning:
-   * Sorry — something went wrong". An answer without context beats no answer.
+   * Bounded by SEED_FETCH_TIMEOUT_MS (see withTimeout below): the turn
+   * watchdog does not arm until after this returns (streamReply runs next),
+   * so nothing else rescues a turn stuck here.
+   *
+   * Never throws. A thread we cannot read — or cannot read in time — has to
+   * degrade to exactly today's behavior — an answer with no history —
+   * rather than escaping into converse's catch and replacing a perfectly
+   * good turn with ":warning: Sorry — something went wrong". An answer
+   * without context beats no answer.
    */
   async function buildSeedBlock(
     msg: InboundMessage,
@@ -787,29 +851,40 @@ export function createChat(deps: ChatDeps): Chat {
     if (scope.scope !== "thread" || threadTs === undefined || threadTs === msg.ts) return "";
     const excludeTs = new Set([msg.ts, placeholderTs]);
     try {
-      const fetched = await gateway.fetchThreadReplies(
-        msg.channel,
-        threadTs,
-        THREAD_CONTEXT_MAX_MESSAGES,
+      return await withTimeout(
+        (async () => {
+          const fetched = await gateway.fetchThreadReplies(
+            msg.channel,
+            threadTs,
+            THREAD_CONTEXT_MAX_MESSAGES,
+          );
+          if (fetched.length === 0) {
+            // Not the same as "nothing survived selection" below, which is
+            // normal: an empty fetch means the parent didn't come back
+            // either.
+            ctx.logger.warn("Slack thread history came back empty; continuing without it", {
+              channel: msg.channel,
+              threadTs,
+            });
+            return "";
+          }
+          const { kept, omitted } = selectThreadMessages(
+            fetched,
+            excludeTs,
+            THREAD_CONTEXT_MAX_CHARS,
+            THREAD_CONTEXT_MAX_MESSAGES,
+          );
+          if (kept.length === 0) return "";
+          return buildThreadContext(await resolveThreadEntries(kept), omitted);
+        })(),
+        seedTimeoutMs,
       );
-      if (fetched.length === 0) {
-        // Not the same as "nothing survived selection" below, which is
-        // normal: an empty fetch means the parent didn't come back either.
-        ctx.logger.warn("Slack thread history came back empty; continuing without it", {
-          channel: msg.channel,
-          threadTs,
-        });
-        return "";
-      }
-      const { kept, omitted } = selectThreadMessages(
-        fetched,
-        excludeTs,
-        THREAD_CONTEXT_MAX_CHARS,
-        THREAD_CONTEXT_MAX_MESSAGES,
-      );
-      if (kept.length === 0) return "";
-      return buildThreadContext(await resolveThreadEntries(kept), omitted);
     } catch (err) {
+      // Covers both a genuine fetch failure and SEED_FETCH_TIMEOUT_MS
+      // expiring (withTimeout rejects with SeedTimeoutError in that case) —
+      // deliberately the same branch, so a throttled/stuck Slack call
+      // degrades exactly like any other fetch failure: log it, seed
+      // nothing, let the turn continue.
       ctx.logger.warn("Slack thread history fetch failed; continuing without it", {
         err: errString(err),
         channel: msg.channel,

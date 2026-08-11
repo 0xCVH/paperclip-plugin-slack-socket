@@ -24,7 +24,7 @@ import {
 import type { InboundMessage, ThreadMessage } from "../src/types.js";
 import { FakeGateway, makeCtx, TEST_CONFIG } from "./helpers.js";
 
-function setup(configOverrides = {}) {
+function setup(configOverrides = {}, depsOverrides: Record<string, unknown> = {}) {
   const bundle = makeCtx(configOverrides);
   const gateway = new FakeGateway();
   const chat = createChat({
@@ -32,6 +32,7 @@ function setup(configOverrides = {}) {
     gateway,
     getConfig: async () => ({ ...TEST_CONFIG, ...configOverrides }),
     updateIntervalMs: 0,
+    ...depsOverrides,
   });
   return { ...bundle, gateway, chat };
 }
@@ -1746,8 +1747,8 @@ describe("thread history seeding", () => {
   // Replaces the gateway method outright rather than driving FakeGateway's
   // transcript, so every test here controls the fetch and can count it —
   // same pattern as the gateway overrides in approvals.test.ts.
-  function setupSeeding(configOverrides = {}) {
-    const bundle = setup(configOverrides);
+  function setupSeeding(configOverrides = {}, depsOverrides: Record<string, unknown> = {}) {
+    const bundle = setup(configOverrides, depsOverrides);
     const fetchThreadReplies = vi.fn(async (): Promise<ThreadMessage[]> => []);
     bundle.gateway.fetchThreadReplies = fetchThreadReplies;
     return { ...bundle, fetchThreadReplies };
@@ -2153,5 +2154,25 @@ describe("thread history seeding", () => {
     // The genuine bot alert is still present and still labelled "you" —
     // this isn't excluding every bot message, just the placeholder's own ts.
     expect(prompt).toContain("[you] Action needed: claimable subdomain on polygon.technology");
+  });
+
+  // IMPORTANT 4: the turn watchdog (streamReply's resetTurnTimer) does not
+  // arm until AFTER buildSeedBlock returns, so a seeding step that never
+  // settles has nothing else to rescue it. seedTimeoutMs (a ChatDeps test
+  // override, mirroring turnTimeoutMs) is set small here so this test
+  // doesn't wait out the real 15s production timeout.
+  it("does not stall the turn when the thread history fetch never resolves", async () => {
+    const { ctx, gateway, chat, fetchThreadReplies } = setupSeeding({}, { seedTimeoutMs: 20 });
+    fetchThreadReplies.mockImplementation(() => new Promise<ThreadMessage[]>(() => {}));
+
+    await chat.handleMention(mentionInThread("hi", "1000.2", "1000.1"));
+
+    // The turn completed with no history rather than hanging forever —
+    // exactly the same degraded-but-working outcome as a rejected fetch.
+    const prompt = (ctx.agents.sessions.sendMessage as any).mock.calls[0]?.[2]?.prompt;
+    expect(prompt).toBe(buildChatPrompt(TEST_CONFIG.chatPromptPreamble, "hi"));
+    expect(gateway.updates.at(-1)?.text).toBe("Hello there!");
+    const warnings = (ctx.logger.warn as any).mock.calls.map((c: unknown[]) => c[0]);
+    expect(warnings.join(" ")).toContain("thread history");
   });
 });
