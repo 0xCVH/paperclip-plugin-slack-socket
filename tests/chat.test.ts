@@ -494,6 +494,16 @@ describe("clampTurnTimeoutMinutes", () => {
   it("floors NaN (e.g. from a non-numeric value that reached this call unvalidated) to the minimum", () => {
     expect(clampTurnTimeoutMinutes(NaN)).toBe(1);
   });
+
+  it("caps a huge value below Node's 32-bit setTimeout ceiling — 999999 minutes would overflow and fire the watchdog INSTANTLY on every turn", () => {
+    // setTimeout's delay is a 32-bit signed int (max ~2^31-1 ms ≈ 35,791
+    // minutes). Above that Node clamps the delay to 1ms, so an operator
+    // typing a huge number as "effectively no timeout" would get the exact
+    // opposite: every turn times out immediately.
+    expect(clampTurnTimeoutMinutes(999_999)).toBe(35_000);
+    expect(clampTurnTimeoutMinutes(35_000)).toBe(35_000);
+    expect(clampTurnTimeoutMinutes(34_999)).toBe(34_999);
+  });
 });
 
 describe("chatPromptPreamble (integration via createChat)", () => {
@@ -1213,6 +1223,39 @@ describe("reset keyword", () => {
 
     expect(ctx.agents.sessions.close).toHaveBeenCalledWith("sess-case", "co-1");
     expect(ctx.agents.sessions.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not report a failed reset when only the confirmation post fails — the reset itself succeeded", async () => {
+    // The truthful-reporting rule cuts both ways: never confirm a reset
+    // that failed, and never claim a reset failed when only the follow-up
+    // confirmation post did. The session here is already closed and its
+    // state gone by the time the post throws.
+    const { ctx, gateway, chat, stateStore } = setup();
+    const key = STATE_KEYS.session("C1", "604.1");
+    stateStore.set(key, threadEntry("sess-conf", "C1", "604.1"));
+    stateStore.set(STATE_KEYS.sessionIndex, [key]);
+
+    const attempted: string[] = [];
+    gateway.postMessage = async (msg) => {
+      attempted.push(msg.text);
+      throw new Error("slack briefly down");
+    };
+
+    await chat.handleMention({
+      channel: "C1", channelType: "channel", user: "U1",
+      text: "<@UBOT> reset", ts: "604.2", threadTs: "604.1",
+    });
+
+    expect(ctx.agents.sessions.close).toHaveBeenCalledWith("sess-conf", "co-1");
+    expect(stateStore.get(key)).toBeUndefined();
+    // Only the confirmation was attempted; no ":warning: … couldn't reset"
+    // follow-up may contradict what actually happened.
+    expect(attempted).toHaveLength(1);
+    expect(attempted.some((text) => text.includes("couldn't reset"))).toBe(false);
+    expect(ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("confirmation"),
+      expect.anything(),
+    );
   });
 
   it("is friendly, and still runs no agent turn, when the thread has no session yet", async () => {

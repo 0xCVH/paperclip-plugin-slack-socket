@@ -1,4 +1,5 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
+import { MAX_TURN_TIMEOUT_MINUTES } from "./chat.js";
 import {
   ASK_HUMAN_TOOL_DECLARATION,
   DEFAULT_CONFIG,
@@ -146,9 +147,14 @@ const manifest: PaperclipPluginManifestV1 = {
         // src/chat.ts multiplies this straight into a setTimeout delay: 0,
         // a negative number, or a non-number would produce a 0/NaN delay,
         // firing the watchdog immediately and timing out every single turn.
-        // This protects the settings form; src/chat.ts additionally clamps
-        // at the read site in case a host ever pushes an unvalidated value.
+        // The maximum guards the opposite overflow: setTimeout's delay is a
+        // 32-bit signed int, and past ~35,791 minutes Node clamps it to 1ms
+        // — a huge "effectively no timeout" value would also fire the
+        // watchdog instantly. This protects the settings form; src/chat.ts
+        // additionally clamps at the read site in case a host ever pushes
+        // an unvalidated value.
         minimum: 1,
+        maximum: MAX_TURN_TIMEOUT_MINUTES,
         title: "Turn Timeout Minutes",
         description:
           "Give up on a single chat turn after this many minutes without any output from the agent.",

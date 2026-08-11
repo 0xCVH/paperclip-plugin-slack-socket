@@ -250,6 +250,30 @@ describe("applyConfig", () => {
     expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps its dedup memory across a gateway rebuild, so an event redelivered after recovery does not run a second agent turn", async () => {
+    // Slack Socket Mode redelivers events whose envelope ack was lost —
+    // which is exactly the state a watchdog-triggered rebuild recovers from.
+    // A deduper scoped to the gateway starts empty at that moment and lets
+    // the redelivery through as a duplicate agent turn (and a duplicate
+    // reply in the thread). Dedup memory must therefore outlive the gateway.
+    const { applyConfig } = await loadWorker();
+    const { ctx } = makeCtx();
+    const gatewayA = new FakeGateway();
+    await applyConfig(ctx, cfg(), () => gatewayA);
+    const ts = (Date.now() / 1000).toFixed(6);
+    const msg = { channel: "D1", channelType: "im" as const, user: "U1", text: "hi", ts };
+    await gatewayA.emitMessage(msg);
+    expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledTimes(1);
+
+    // A watchdog-style recovery: the same config re-applied onto a fresh
+    // gateway, followed by Slack redelivering the unacked event.
+    const gatewayB = new FakeGateway();
+    await applyConfig(ctx, cfg(), () => gatewayB);
+    await gatewayB.emitMessage(msg);
+
+    expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
   it("a second applyConfig call for the SAME company stops the old gateway and starts a new one", async () => {
     const { applyConfig } = await loadWorker();
     const { ctx } = makeCtx();
@@ -864,6 +888,48 @@ describe("socket watchdog", () => {
     );
   });
 
+  it("recovers when the FIRST-ever apply failed before any config committed (e.g. a transient secrets outage)", async () => {
+    // liveConfig is only committed after validation and secrets resolution
+    // succeed, so a transient secrets failure on the very first push leaves
+    // it null — and a watchdog gated on liveConfig alone would then be
+    // permanently inert, defeating its promise to recover without an
+    // operator save.
+    const { default: plugin, socketWatchdogTick } = await loadWorker();
+    const { ctx } = makeCtx();
+    (ctx.secrets.resolve as any).mockRejectedValue(new Error("secrets backend briefly down"));
+    await plugin.definition.setup(ctx);
+    await plugin.definition.onConfigChanged!(cfg());
+    expect(boltGatewayInstances).toHaveLength(0); // failed before a gateway was ever built
+    await expect(plugin.definition.onHealth?.()).resolves.toMatchObject({ status: "degraded" });
+
+    // The outage passes. The watchdog must retry the pushed config itself.
+    (ctx.secrets.resolve as any).mockImplementation(async (ref: string) => `secret-${ref}`);
+    await socketWatchdogTick(ctx, 0); // first observation: confirm-only
+    await socketWatchdogTick(ctx, 60_000);
+
+    expect(boltGatewayInstances).toHaveLength(1);
+    expect(boltGatewayInstances[0]!.started).toBe(true);
+    await expect(plugin.definition.onHealth?.()).resolves.toEqual({ status: "ok" });
+  });
+
+  it("does not retry a config whose validation failed — missing fields cannot be fixed by re-applying", async () => {
+    const { default: plugin, socketWatchdogTick } = await loadWorker();
+    const { ctx } = makeCtx();
+    await plugin.definition.setup(ctx);
+    await plugin.definition.onConfigChanged!(cfg({ slackBotTokenRef: "" }));
+    expect(boltGatewayInstances).toHaveLength(0);
+
+    await socketWatchdogTick(ctx, 0);
+    await socketWatchdogTick(ctx, 60_000);
+
+    expect(boltGatewayInstances).toHaveLength(0);
+    expect(ctx.metrics.write).not.toHaveBeenCalledWith(
+      "slack.socket.recovery.attempted",
+      1,
+      expect.anything(),
+    );
+  });
+
   it("leaves a healthy gateway alone: connected and probing true means no recovery", async () => {
     const { default: plugin, socketWatchdogTick } = await loadWorker();
     const { ctx } = makeCtx();
@@ -897,11 +963,12 @@ describe("socket watchdog", () => {
     await plugin.definition.onConfigChanged!(cfg());
 
     boltGatewayInstances[0]!.started = false; // socket dropped for good
+    await socketWatchdogTick(ctx, 0); // first observation: confirm-only
     alsCapture.als = als;
     alsCapture.captured = "unset";
 
     await als.run({ invocationId: "watchdog-1" }, async () => {
-      await socketWatchdogTick(ctx, 0);
+      await socketWatchdogTick(ctx, 60_000);
     });
 
     expect(boltGatewayInstances).toHaveLength(2);
@@ -916,6 +983,11 @@ describe("socket watchdog", () => {
     await plugin.definition.onConfigChanged!(cfg());
     expect(boltGatewayInstances).toHaveLength(1);
 
+    // Dead socket, observed once already, so on the next tick the queue
+    // guard is the only thing that can stop the watchdog from recovering.
+    boltGatewayInstances[0]!.started = false;
+    await socketWatchdogTick(ctx, 0);
+
     // Park the next apply inside applyConfig's teardown by holding the
     // current gateway's stop() open, leaving a second job sitting in
     // applyQueue with nothing draining it.
@@ -924,9 +996,6 @@ describe("socket watchdog", () => {
       new Promise<void>((resolve) => {
         releaseStop = resolve;
       });
-    // Dead socket, so the queue guard is the only thing that can stop the
-    // watchdog from recovering.
-    boltGatewayInstances[0]!.started = false;
 
     const p1 = plugin.definition.onConfigChanged!(cfg({ defaultChannelId: "C-A" }));
     const p2 = plugin.definition.onConfigChanged!(cfg({ defaultChannelId: "C-B" }));
@@ -935,7 +1004,7 @@ describe("socket watchdog", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(boltGatewayInstances).toHaveLength(1); // parked before makeGateway
 
-    await socketWatchdogTick(ctx, 0);
+    await socketWatchdogTick(ctx, 60_000);
 
     expect(ctx.metrics.write).not.toHaveBeenCalledWith(
       "slack.socket.recovery.attempted",
@@ -945,6 +1014,57 @@ describe("socket watchdog", () => {
 
     releaseStop();
     await Promise.all([p1, p2]);
+  });
+
+  it("a single not-alive tick does not tear down the gateway — recovery requires two consecutive observations", async () => {
+    // A transient isConnected() === false is routine: Bolt drops and re-opens
+    // its socket on its own (onHealth even words this state "Bolt is
+    // reconnecting"). Tearing down on the first observation would rebuild a
+    // healthy gateway — dropping in-flight events and dedup memory — every
+    // time a tick happens to land inside such a window.
+    const { default: plugin, socketWatchdogTick } = await loadWorker();
+    const { ctx } = makeCtx();
+    await plugin.definition.setup(ctx);
+    await plugin.definition.onConfigChanged!(cfg());
+    expect(boltGatewayInstances).toHaveLength(1);
+
+    boltGatewayInstances[0]!.started = false;
+    await socketWatchdogTick(ctx, 0);
+
+    expect(boltGatewayInstances).toHaveLength(1);
+    expect(ctx.metrics.write).not.toHaveBeenCalledWith(
+      "slack.socket.recovery.attempted",
+      1,
+      expect.anything(),
+    );
+
+    // Still dead a full tick later: now it is genuinely dead, so recover.
+    await socketWatchdogTick(ctx, 60_000);
+    expect(boltGatewayInstances).toHaveLength(2);
+    expect(boltGatewayInstances[1]!.started).toBe(true);
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.socket.recovery.attempted", 1, { attempt: "1" });
+  });
+
+  it("an alive tick between two not-alive ticks resets the confirmation — an intermittent blip never causes a teardown", async () => {
+    const { default: plugin, socketWatchdogTick } = await loadWorker();
+    const { ctx } = makeCtx();
+    await plugin.definition.setup(ctx);
+    await plugin.definition.onConfigChanged!(cfg());
+    expect(boltGatewayInstances).toHaveLength(1);
+
+    boltGatewayInstances[0]!.started = false;
+    await socketWatchdogTick(ctx, 0);
+    boltGatewayInstances[0]!.started = true;
+    await socketWatchdogTick(ctx, 60_000);
+    boltGatewayInstances[0]!.started = false;
+    await socketWatchdogTick(ctx, 120_000);
+
+    expect(boltGatewayInstances).toHaveLength(1);
+    expect(ctx.metrics.write).not.toHaveBeenCalledWith(
+      "slack.socket.recovery.attempted",
+      1,
+      expect.anything(),
+    );
   });
 
   it("recovers a gateway that still claims isConnected() but fails its probe", async () => {
@@ -958,7 +1078,9 @@ describe("socket watchdog", () => {
     boltGatewayInstances[0]!.probeResult = false;
     expect(boltGatewayInstances[0]!.started).toBe(true);
 
-    await socketWatchdogTick(ctx, 0);
+    await socketWatchdogTick(ctx, 0); // first observation: confirm-only
+    expect(boltGatewayInstances).toHaveLength(1);
+    await socketWatchdogTick(ctx, 60_000);
 
     expect(boltGatewayInstances).toHaveLength(2);
     expect(boltGatewayInstances[1]!.started).toBe(true);
@@ -984,7 +1106,8 @@ describe("socket watchdog", () => {
     // That failure rolled the claim back (didClaim); the recovering apply
     // simply re-claims boundCompanyId, which is correct.
     (ctx.secrets.resolve as any).mockImplementation(async (ref: string) => `secret-${ref}`);
-    await socketWatchdogTick(ctx, 0);
+    await socketWatchdogTick(ctx, 0); // first observation: confirm-only
+    await socketWatchdogTick(ctx, 60_000);
 
     expect(boltGatewayInstances).toHaveLength(2);
     expect(boltGatewayInstances[1]!.started).toBe(true);
@@ -1002,7 +1125,11 @@ describe("socket watchdog", () => {
     await plugin.definition.onConfigChanged!(cfg());
     expect(boltGatewayInstances).toHaveLength(1);
 
-    // Attempt 1 fails -> next attempt no earlier than now + 1m.
+    // First observation only confirms; attempt 1 runs on the second
+    // consecutive not-alive tick and fails -> next attempt no earlier than
+    // now + 1m. (Ticks that stand down inside the backoff window do NOT
+    // count as observations — the streak only moves when a tick probes.)
+    await socketWatchdogTick(ctx, 0);
     await socketWatchdogTick(ctx, 0);
     expect(ctx.metrics.write).toHaveBeenCalledWith("slack.socket.recovery.attempted", 1, { attempt: "1" });
     expect(ctx.metrics.write).toHaveBeenCalledWith("slack.socket.recovery.failed", 1, { attempt: "1" });
@@ -1011,7 +1138,8 @@ describe("socket watchdog", () => {
     await socketWatchdogTick(ctx, 59_999); // still inside the 1m backoff
     expect(boltGatewayInstances).toHaveLength(2);
 
-    // Attempt 2 fails -> next attempt no earlier than 60_000 + 2m.
+    // Attempt 2 fails -> next attempt no earlier than 60_000 + 2m. The
+    // not-alive streak is already confirmed, so no extra confirm tick here.
     await socketWatchdogTick(ctx, 60_000);
     expect(ctx.metrics.write).toHaveBeenCalledWith("slack.socket.recovery.attempted", 1, { attempt: "2" });
     expect(boltGatewayInstances).toHaveLength(3);
@@ -1050,8 +1178,9 @@ describe("socket watchdog", () => {
     await plugin.definition.onConfigChanged!(cfg());
     expect(boltGatewayInstances).toHaveLength(1);
 
-    // A failed watchdog recovery attempt increments recoveryAttempts and
-    // pushes recoveryNotBefore out ~1 minute.
+    // A failed watchdog recovery attempt (confirm tick + recovery tick)
+    // increments recoveryAttempts and pushes recoveryNotBefore out ~1 minute.
+    await socketWatchdogTick(ctx, 0);
     await socketWatchdogTick(ctx, 0);
     await expect(plugin.definition.onHealth?.()).resolves.toEqual({
       status: "degraded",
@@ -1098,9 +1227,18 @@ describe("socket watchdog", () => {
     expect(probeCalls).toBe(1); // tick2 never called probe(): the guard turned it away immediately
 
     resolveProbe(false);
-    await tick1;
+    await tick1; // first not-alive observation: confirm-only, no recovery yet
 
-    expect(boltGatewayInstances).toHaveLength(2); // tick1 alone completed the recovery
+    expect(boltGatewayInstances).toHaveLength(1);
+
+    // A later, uncontended tick observes the same dead gateway and recovers.
+    (boltGatewayInstances[0] as any).probe = () => {
+      probeCalls += 1;
+      return Promise.resolve(false);
+    };
+    await socketWatchdogTick(ctx, 60_000);
+
+    expect(boltGatewayInstances).toHaveLength(2);
     expect(ctx.metrics.write).toHaveBeenCalledWith("slack.socket.recovery.attempted", 1, { attempt: "1" });
   });
 
@@ -1123,18 +1261,26 @@ describe("socket watchdog", () => {
 
     (boltGatewayInstances[0] as any).probe = () => new Promise<boolean>(() => {}); // never settles
 
-    const tick = socketWatchdogTick(ctx, 0);
-    await vi.advanceTimersByTimeAsync(10_000); // the watchdog's own probe bound
-    await tick;
+    // Two consecutive timed-out probes: the first only confirms, the second
+    // recovers — each bounded by the watchdog's own 10s probe timeout.
+    const tick1 = socketWatchdogTick(ctx, 0);
+    await vi.advanceTimersByTimeAsync(10_000);
+    await tick1;
+    expect(boltGatewayInstances).toHaveLength(1); // confirm-only, not wedged
+
+    const tick2 = socketWatchdogTick(ctx, 60_000);
+    await vi.advanceTimersByTimeAsync(10_000);
+    await tick2;
 
     expect(boltGatewayInstances).toHaveLength(2); // recovered despite the hang
     expect(boltGatewayInstances[1]!.started).toBe(true);
     expect(ctx.metrics.write).toHaveBeenCalledWith("slack.socket.recovery.succeeded", 1, { attempt: "1" });
 
-    // Not wedged: recoveryInFlight was cleared, so a fully independent later
-    // tick can still run and recover a second time.
+    // Not wedged: recoveryInFlight was cleared, so fully independent later
+    // ticks can still observe, confirm, and recover a second time.
     boltGatewayInstances[1]!.started = false;
-    await socketWatchdogTick(ctx, 60_000);
+    await socketWatchdogTick(ctx, 120_000);
+    await socketWatchdogTick(ctx, 180_000);
     expect(boltGatewayInstances).toHaveLength(3);
     expect(boltGatewayInstances[2]!.started).toBe(true);
   });
@@ -1151,13 +1297,18 @@ describe("socket watchdog", () => {
     await plugin.definition.onConfigChanged!(cfg({ defaultChannelId: "C-V1" }));
     expect(getLiveConfig().defaultChannelId).toBe("C-V1");
 
+    // One prior not-alive observation, so the held tick below is the second
+    // consecutive one and actually reaches the enqueue step.
+    boltGatewayInstances[0]!.probeResult = false;
+    await socketWatchdogTick(ctx, 0);
+
     let resolveProbe: (v: boolean) => void = () => {};
     (boltGatewayInstances[0] as any).probe = () =>
       new Promise<boolean>((resolve) => {
         resolveProbe = resolve;
       });
 
-    const tick = socketWatchdogTick(ctx, 0);
+    const tick = socketWatchdogTick(ctx, 60_000);
 
     // The operator's own save lands and fully completes — through the same
     // applyQueue + signalPump pump — while the tick above is still parked
@@ -1171,6 +1322,48 @@ describe("socket watchdog", () => {
     // the "C-V1" value captured before the probe, so it must not revert the
     // save that already landed.
     resolveProbe(false);
+    await tick;
+
+    expect(getLiveConfig().defaultChannelId).toBe("C-V2");
+  });
+
+  it("does not revert a config save that lands while the recovery tick is awaiting its metrics write", async () => {
+    // The post-probe freshness re-check alone is not enough: the tick still
+    // awaits ctx.metrics.write("slack.socket.recovery.attempted", …) before
+    // enqueueing, and an operator save can land and fully complete inside
+    // THAT await too. A config captured before the metrics write is exactly
+    // as stale as one captured before the probe — it must be re-read
+    // synchronously with the applyQueue.push.
+    const { default: plugin, socketWatchdogTick, getLiveConfig } = await loadWorker();
+    const { ctx } = makeCtx();
+    await plugin.definition.setup(ctx);
+    await plugin.definition.onConfigChanged!(cfg({ defaultChannelId: "C-V1" }));
+    expect(getLiveConfig().defaultChannelId).toBe("C-V1");
+
+    // One prior not-alive observation, so the held tick below reaches the
+    // attempt/metrics/enqueue steps.
+    boltGatewayInstances[0]!.probeResult = false;
+    await socketWatchdogTick(ctx, 0);
+
+    let releaseMetrics: () => void = () => {};
+    (ctx.metrics.write as any).mockImplementation((name: string) =>
+      name === "slack.socket.recovery.attempted"
+        ? new Promise<void>((resolve) => {
+            releaseMetrics = resolve;
+          })
+        : Promise.resolve(undefined),
+    );
+
+    const tick = socketWatchdogTick(ctx, 60_000);
+    // One macrotask lets the tick run through its (immediately-false) probe
+    // and park on the held metrics write.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // The operator's save lands and fully completes while the tick is parked.
+    await plugin.definition.onConfigChanged!(cfg({ defaultChannelId: "C-V2" }));
+    expect(getLiveConfig().defaultChannelId).toBe("C-V2");
+
+    releaseMetrics();
     await tick;
 
     expect(getLiveConfig().defaultChannelId).toBe("C-V2");
@@ -1191,6 +1384,12 @@ describe("socket watchdog", () => {
     await plugin.definition.setup(ctx);
     await plugin.definition.onConfigChanged!(cfg());
     expect(boltGatewayInstances).toHaveLength(1);
+
+    // One prior not-alive observation, so the mid-apply tick below is past
+    // the confirmation gate and only the applyInFlight guard can stop it.
+    boltGatewayInstances[0]!.probeResult = false;
+    await socketWatchdogTick(ctx, 0);
+    boltGatewayInstances[0]!.probeResult = true;
 
     // Patch the mock's shared start() so the *next* constructed instance's
     // handshake hangs. Restored by the file-level afterEach (not a local
@@ -1218,7 +1417,7 @@ describe("socket watchdog", () => {
     // applyQueue is already empty at this point — only applyInFlight can
     // still tell the watchdog an apply is genuinely in progress.
 
-    await socketWatchdogTick(ctx, 0);
+    await socketWatchdogTick(ctx, 60_000);
 
     expect(ctx.metrics.write).not.toHaveBeenCalledWith(
       "slack.socket.recovery.attempted",
