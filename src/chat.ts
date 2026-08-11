@@ -270,48 +270,55 @@ const UNKNOWN_SPEAKER_LABEL = "unknown";
 // label is a separate, still-necessary guard against a different forgery —
 // a label closing its own bracket early or opening a fake line — and is
 // unaffected by this.)
-function escapeFenceTag(tag: string): string {
-  return tag.replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-}
+// IMPORTANT 3, fix round 1: this used to match four exact string literals
+// (open/close × thread_context/slack_reply) via .replaceAll, which only
+// catches a byte-identical tag. The reader here is a language model, which
+// treats XML-ish tags loosely and case-insensitively — </THREAD_CONTEXT>,
+// </Thread_Context> and </thread_context > (note the internal whitespace
+// before ">") all read as "the close tag" to it exactly as much as the
+// exact-case literal does. A prior review measured whether this function
+// ever EMITS a live tag, not whether a case- or whitespace-varied tag
+// REACHES the model unneutralised in the first place — it does, through
+// this gap: anyone in a thread can post "</THREAD_CONTEXT>" followed by
+// instruction-shaped text and have the remainder read as outside the
+// fence. One case-insensitive regex now covers both tag families, open and
+// close, tolerating whitespace around the optional "/" and before the
+// closing ">" — matching the loose way a model actually reads the tag,
+// rather than the strict way a byte comparison does.
+const CONTROL_TAG_PATTERN = /<(\s*\/?\s*(?:thread_context|slack_reply)\s*)>/gi;
 
-// Every literal tag a seeded message could use to escape its role: either
-// the <thread_context> fence itself, or the <slack_reply>/</slack_reply>
-// pair extractReply (above) scans for in the AGENT'S OWN OUTPUT. That second
-// one is an output-path escape, not just an input one — extractReply falls
-// back to posting the whole text when no tags are present (some adapters
-// ignore the tag instruction), so a hostile thread message carrying a real
-// <slack_reply>...</slack_reply> pair, if the agent later echoes or quotes
-// it without emitting its own tags, would let extractReply find the
-// attacker's pair and post its contents to Slack as the bot's own reply.
-const CONTROL_TAGS: ReadonlyArray<readonly [tag: string, escaped: string]> = [
-  [THREAD_CONTEXT_CLOSE_TAG, escapeFenceTag(THREAD_CONTEXT_CLOSE_TAG)],
-  [THREAD_CONTEXT_OPEN_TAG, escapeFenceTag(THREAD_CONTEXT_OPEN_TAG)],
-  [REPLY_CLOSE_TAG, escapeFenceTag(REPLY_CLOSE_TAG)],
-  [REPLY_OPEN_TAG, escapeFenceTag(REPLY_OPEN_TAG)],
-];
-
-// Load-bearing. A message containing a literal </thread_context> would
-// otherwise close the fence early, and everything the sender wrote after it
-// would land outside the framing, in instruction position, in front of an
-// agent holding slack_post_message, ask_human and issue-creation tools.
-// Angle-bracket-escaping the tags (rather than deleting them) keeps the
-// content readable and lets the agent see that someone wrote a control tag.
+// Load-bearing. A message containing a literal (or case/whitespace-varied)
+// </thread_context> would otherwise close the fence early, and everything
+// the sender wrote after it would land outside the framing, in instruction
+// position, in front of an agent holding slack_post_message, ask_human and
+// issue-creation tools. Angle-bracket-escaping the tags (rather than
+// deleting them) keeps the content readable and lets the agent see that
+// someone wrote a control tag. The <slack_reply>/</slack_reply> half of the
+// pattern is an output-path escape, not just an input one — extractReply
+// (above) falls back to posting the whole text when no tags are present
+// (some adapters ignore the tag instruction), so a hostile thread message
+// carrying a real <slack_reply>...</slack_reply> pair, if the agent later
+// echoes or quotes it without emitting its own tags, would let extractReply
+// find the attacker's pair and post its contents to Slack as the bot's own
+// reply.
 //
-// The safety property here is NOT the order CONTROL_TAGS is applied in —
-// swapping it changes nothing observable. It's that every replacement's
-// output is "&lt;...&gt;", which by construction contains no "<" or ">":
-// no pass can produce a substring a later pass (or a re-run of this
-// function) would mistake for one of these tags, and no two escaped
-// fragments can rejoin into a live one. That's the invariant a change to
-// this function has to preserve.
+// The safety property here is that every replacement's output is
+// "&lt;...&gt;", which by construction contains no "<" or ">": no pass can
+// produce a substring a later pass (or a re-run of this function) would
+// mistake for one of these tags, and no two escaped fragments can rejoin
+// into a live one. That's the invariant a change to this function has to
+// preserve — it MUST remain a substitution, never a deletion, for exactly
+// that reason.
 //
 // A second, easy-to-miss invariant this depends on: ANY later pass over
 // this same text — sanitizeLabel's newline collapse below, or anything
 // added after it — must SUBSTITUTE characters, never DELETE them. A tag
 // split across two fragments by, say, an embedded newline (e.g.
-// "</thread_cont" + "\n" + "ext>") does not match here and is left
-// unescaped on both sides, which is fine as long as the split persists.
-// But if a later pass ever replaces that newline with "" instead of a
+// "</thread_cont" + "\n" + "ext>") does not match here (the regex has no
+// line-break tolerance, deliberately — see LINE_BREAK below for the
+// separate, much larger set this file treats as a line break) and is left
+// unescaped on both sides, which is fine as long as the split persists. But
+// if a later pass ever replaces that newline with "" instead of a
 // character, the fragments rejoin into a live, unescaped tag — this
 // function already ran and won't run again. sanitizeLabel's newline
 // collapse below substitutes a SPACE for exactly this reason; if that ever
@@ -323,7 +330,7 @@ const CONTROL_TAGS: ReadonlyArray<readonly [tag: string, escaped: string]> = [
 // would mangle every & < > a person legitimately typed and would not be a
 // security control on this path. Do not "fix" this by reaching for it.
 function neutralizeFenceTags(value: string): string {
-  return CONTROL_TAGS.reduce((acc, [tag, escaped]) => acc.replaceAll(tag, escaped), value);
+  return value.replace(CONTROL_TAG_PATTERN, "&lt;$1&gt;");
 }
 
 // The full set of line-break characters this module treats as ending a
@@ -674,10 +681,11 @@ export function createChat(deps: ChatDeps): Chat {
    * a trailing "(id)", unconditionally — a resolved display name renders as
    * "Christopher Von Hessert (U01ABC2DEF)", never bare. This is what makes
    * a bare "[you]" line provably the bot's rather than a display name that
-   * merely failed to trip a content filter (see the CRITICAL comment on
-   * escapeFenceTag above for the history of why this is structural rather
-   * than pattern-matched). It also gives the agent something it needs
-   * anyway: a concrete id to target with ask_human or a DM.
+   * merely failed to trip a content filter (see the CRITICAL, fix-round-2
+   * comment above, near sanitizeLabel, for the history of why this is
+   * structural rather than pattern-matched). It also gives the agent
+   * something it needs anyway: a concrete id to target with ask_human or a
+   * DM.
    *
    * A message with no user id at all (Slack's bot_id present but no
    * accompanying user — see ThreadMessage's isBot note in types.ts) never
@@ -724,7 +732,8 @@ export function createChat(deps: ChatDeps): Chat {
         const displayName = await gateway.getUserDisplayName(userId).catch(() => userId);
         // Structural, not a content check: every non-bot label carries its
         // own id, so no display name — whatever it contains — can produce a
-        // bare "[you]" line. See the CRITICAL comment above escapeFenceTag.
+        // bare "[you]" line. See the CRITICAL, fix-round-2 comment near
+        // sanitizeLabel.
         names.set(userId, `${displayName} (${userId})`);
       }),
     );
