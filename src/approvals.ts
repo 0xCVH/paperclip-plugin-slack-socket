@@ -190,13 +190,23 @@ export function createApprovals({ ctx, gateway, getConfig, companyId }: Approval
           ts: action.messageTs,
           ...formatApprovalDecided(approvalId, decision, action.userName),
         });
+        // Telemetry only, and the decision above is already recorded and the
+        // message rewritten: each write carries its own catch so a telemetry
+        // failure can never fall through to the outer catch and post
+        // ':x: Failed to approve … It may already be decided.' under a
+        // message that shows the approval succeeded.
         await ctx.activity.log({
           companyId: cfg.companyId,
           message: `Approval ${approvalId} ${decision === "approve" ? "approved" : "rejected"} via Slack by ${action.userName} (slack:${action.user})`,
           entityType: "approval",
           entityId: approvalId,
+        }).catch((err: unknown) => {
+          ctx.logger.warn("Failed to write the activity entry for a decided Slack approval", {
+            err: errString(err),
+            approvalId,
+          });
         });
-        await ctx.metrics.write("slack.approvals.decided", 1, { decision });
+        await ctx.metrics.write("slack.approvals.decided", 1, { decision }).catch(() => {});
       } catch (err) {
         ctx.logger.warn("Approval decision via Slack failed", { err: errString(err), approvalId });
         await postFailureEphemeral(action, approvalId, decision, "It may already be decided.");
