@@ -2218,4 +2218,32 @@ describe("thread history seeding", () => {
     const warnings = (ctx.logger.warn as any).mock.calls.map((c: unknown[]) => c[0]);
     expect(warnings.join(" ")).toContain("thread history");
   });
+
+  // Item 7: a process-level cache (scoped to this createChat instance, i.e.
+  // the plugin's whole lifetime, not one turn) so a busy channel doesn't
+  // cost one users.info call per distinct speaker PER THREAD.
+  // resolveThreadEntries is private, so this is exercised end-to-end across
+  // two separately-seeded threads sharing a speaker.
+  it("caches a resolved display name across threads, so a repeat speaker in a later thread costs no further users.info call", async () => {
+    const { chat, gateway, fetchThreadReplies } = setupSeeding();
+    const getUserDisplayName = vi.spyOn(gateway, "getUserDisplayName");
+    fetchThreadReplies
+      .mockResolvedValueOnce(alertThread("1000.2"))
+      .mockResolvedValueOnce([
+        threadMessage("UBOT", "a second alert", "2000.1", true),
+        threadMessage("U-OTHER", "seen this one too", "2000.15"),
+        threadMessage("U-HUMAN", "<@UBOT> raise a ticket for this issue here above", "2000.2"),
+      ]);
+
+    await chat.handleMention(mentionInThread("first thread", "1000.2", "1000.1"));
+    await chat.handleMention({
+      channel: "C-ALERT", channelType: "channel", user: "U-HUMAN",
+      text: "<@UBOT> second thread", ts: "2000.2", threadTs: "2000.1",
+    });
+
+    // U-OTHER appears in both threads; only the first thread's turn should
+    // have actually called out to Slack for its name.
+    const otherCalls = getUserDisplayName.mock.calls.filter((c) => c[0] === "U-OTHER");
+    expect(otherCalls).toHaveLength(1);
+  });
 });

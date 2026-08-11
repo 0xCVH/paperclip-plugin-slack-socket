@@ -659,6 +659,30 @@ export function createChat(deps: ChatDeps): Chat {
   const turnTimeoutMsOverride = deps.turnTimeoutMs;
   const seedTimeoutMs = deps.seedTimeoutMs ?? SEED_FETCH_TIMEOUT_MS;
 
+  // Item 7: a process-level cache of resolved "display name (id)" labels
+  // (see resolveThreadEntries), scoped to this createChat instance — i.e.
+  // the plugin's whole lifetime, not one turn. Display names rarely change
+  // and a busy channel mentions the same handful of people across many
+  // threads, so without this a busy channel costs one users.info call per
+  // distinct speaker PER THREAD — twenty threads with the same twenty
+  // people is 400 calls, which can hit Slack's Tier 4 rate limit on its
+  // own, and then compounds with SEED_FETCH_TIMEOUT_MS above (more calls
+  // queued behind the same limit means more of them are the one that's
+  // slow). Capped so a workspace with many distinct speakers over a
+  // long-lived process can't grow this without bound; a plain Map eviction
+  // (oldest inserted first) is enough here — this is a hit-rate
+  // optimisation, not a correctness-bearing cache, so it doesn't need real
+  // LRU.
+  const DISPLAY_NAME_CACHE_MAX = 2000;
+  const displayNameCache = new Map<string, string>();
+  const cacheDisplayLabel = (userId: string, label: string): void => {
+    if (displayNameCache.size >= DISPLAY_NAME_CACHE_MAX && !displayNameCache.has(userId)) {
+      const oldestKey = displayNameCache.keys().next().value;
+      if (oldestKey !== undefined) displayNameCache.delete(oldestKey);
+    }
+    displayNameCache.set(userId, label);
+  };
+
   // Guards against two concurrent "first messages" in the same thread both
   // passing the "no existing session" check and creating duplicate sessions.
   const inFlightSessions = new Map<string, Promise<{ entry: SessionEntry; created: boolean }>>();
@@ -791,16 +815,19 @@ export function createChat(deps: ChatDeps): Chat {
    * could itself grow a gap.
    *
    * Resolution is dedupe-then-resolve, not one id at a time (fix round 1):
-   * every distinct non-bot, non-empty user id in the thread is collected
-   * first, then all of them are looked up CONCURRENTLY. This runs before
-   * the caller's turn watchdog has even started (see buildSeedBlock /
-   * converse), so a sequential await-per-speaker on a busy thread could
-   * leave a person staring at total silence for as long as it takes N
-   * users.info calls to finish one after another. The per-turn cache this
-   * replaces is not lost — it becomes the resolved id set itself, so a
-   * speaker who wrote five times in the thread still costs exactly one
-   * users.info call, just concurrently with everyone else's instead of
-   * blocking them.
+   * every distinct non-bot, non-empty user id in the thread NOT ALREADY IN
+   * displayNameCache is collected first, then all of them are looked up
+   * CONCURRENTLY. This runs before the caller's turn watchdog has even
+   * started (see buildSeedBlock / converse), so a sequential await-per-
+   * speaker on a busy thread could leave a person staring at total silence
+   * for as long as it takes N users.info calls to finish one after another.
+   * The per-turn cache this replaces is not lost — it becomes the resolved
+   * id set itself, so a speaker who wrote five times in the thread still
+   * costs exactly one users.info call, just concurrently with everyone
+   * else's instead of blocking them. displayNameCache (declared in
+   * createChat, see its own comment) extends that dedup across turns and
+   * threads for the lifetime of this process, so a speaker seen in an
+   * earlier thread costs zero further calls here.
    */
   async function resolveThreadEntries(messages: ThreadMessage[]): Promise<ThreadContextEntry[]> {
     const botId = gateway.botUserId();
@@ -809,10 +836,14 @@ export function createChat(deps: ChatDeps): Chat {
 
     const idsToResolve = new Set<string>();
     for (const message of messages) {
-      if (!isBotsOwn(message) && message.user) idsToResolve.add(message.user);
+      // Item 7: skip an id already cached from an earlier thread (see
+      // displayNameCache in createChat) — no reason to call users.info
+      // again for someone this process has already resolved.
+      if (!isBotsOwn(message) && message.user && !displayNameCache.has(message.user)) {
+        idsToResolve.add(message.user);
+      }
     }
 
-    const names = new Map<string, string>();
     await Promise.all(
       Array.from(idsToResolve, async (userId) => {
         // A name we can't resolve isn't worth failing a turn over: the raw
@@ -823,7 +854,7 @@ export function createChat(deps: ChatDeps): Chat {
         // own id, so no display name — whatever it contains — can produce a
         // bare "[you]" line. See the CRITICAL, fix-round-2 comment near
         // sanitizeLabel.
-        names.set(userId, `${displayName} (${userId})`);
+        cacheDisplayLabel(userId, `${displayName} (${userId})`);
       }),
     );
 
@@ -831,10 +862,14 @@ export function createChat(deps: ChatDeps): Chat {
       if (isBotsOwn(message)) return { label: "you", text: message.text };
       if (!message.user) return { label: UNKNOWN_SPEAKER_LABEL, text: message.text };
       // Always present: every non-bot, non-empty user id was added to
-      // idsToResolve above and resolved there. The fallback mirrors the
-      // same "<id> (<id>)" shape purely as a defensive last resort — this
-      // branch should be unreachable by construction.
-      return { label: names.get(message.user) ?? `${message.user} (${message.user})`, text: message.text };
+      // idsToResolve above and resolved there (or was already cached from
+      // an earlier thread). The fallback mirrors the same "<id> (<id>)"
+      // shape purely as a defensive last resort — this branch should be
+      // unreachable by construction.
+      return {
+        label: displayNameCache.get(message.user) ?? `${message.user} (${message.user})`,
+        text: message.text,
+      };
     });
   }
 
