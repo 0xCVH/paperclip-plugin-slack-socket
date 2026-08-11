@@ -50,10 +50,38 @@ interface CoreModules {
 // live gateway here at module scope and read them everywhere else.
 let health: Health = { status: "degraded", message: "Waiting for configuration" };
 let liveConfig: SlackSocketConfig | null = null;
+// The most recent config that passed structural validation (required fields
+// present, right company), whether or not its apply then succeeded.
+// `liveConfig` is committed only after secrets resolve, so a transient
+// failure on the FIRST-ever apply leaves liveConfig null — and a watchdog
+// gated on liveConfig alone would be permanently inert, waiting on an
+// operator to re-save a config the host already pushed. The watchdog falls
+// back to this so it can retry that first apply itself. Deliberately NOT
+// set for configs that failed validation: re-applying cannot fix a missing
+// field, and a cross-tenant config is refused before this is written.
+let lastAttemptedConfig: SlackSocketConfig | null = null;
 let currentGateway: SlackGateway | null = null;
 let lastCtx: PluginContext | null = null;
 let coreModules: CoreModules | null = null;
 let approvals: Approvals | null = null;
+
+// Slack Socket Mode redelivers events at-least-once, and a reconnect can
+// replay a backlog of stale events. Dedupe/stale-filter mention and
+// message dispatch before it reaches ask-human's answer routing or chat —
+// reactions, actions, and commands are not deduped (they're not prone to
+// the same at-least-once redelivery pattern here and are already
+// effectively idempotent or externally acked). Keys are namespaced by
+// event type ("mention:"/"message:") because a single channel @mention
+// arrives as two distinct Slack events sharing the same ts (app_mention +
+// message.channels) — without the prefix, consuming one event's key would
+// shadow the other's and silently drop it as a "duplicate". Process-
+// lifetime, NOT per-gateway: events redelivered because an envelope ack was
+// lost arrive on the NEXT connection — exactly the one a watchdog rebuild
+// just created — so a deduper scoped to the gateway would start empty at
+// the one moment its memory matters, and each redelivered message would run
+// a duplicate agent turn. Keys are channel:ts, so they identify the same
+// event across connections.
+const eventDeduper = createEventDeduper();
 
 // This plugin binds to exactly one company for the lifetime of the worker
 // process: the first company whose config successfully applies. The host
@@ -229,11 +257,27 @@ const RECOVERY_BACKOFF_MS: readonly number[] = [60_000, 120_000, 240_000, 480_00
 // Well under the 60s tick interval, so a hung probe is bounded to a small
 // fraction of one tick rather than swallowing several.
 const PROBE_TIMEOUT_MS = 10_000;
+// A single not-alive observation is not proof of death: `isConnected()` is
+// false during Bolt's own routine reconnects (onHealth words that state
+// "Bolt is reconnecting"), and one slow `auth.test` fails the 10s probe
+// while the socket is fine. Tearing down on the first observation would
+// rebuild a healthy gateway — dropping its in-flight events — every time a
+// tick landed inside such a window, and a successful rebuild resets the
+// backoff, so a Slack latency incident would repeat that teardown every
+// single tick. Requiring consecutive observations one full tick apart means
+// only a condition that persists for a minute triggers recovery; a genuinely
+// dead socket just waits one extra tick.
+const NOT_ALIVE_TICKS_BEFORE_RECOVERY = 2;
 
 let watchdogStarted = false;
 let recoveryInFlight = false;
 let recoveryAttempts = 0;
 let recoveryNotBefore = 0;
+// Consecutive watchdog ticks that observed a not-alive gateway. Reset only
+// by the watchdog's own observations (an alive tick, or a recovery that
+// succeeded) — never by applyConfig, whose job is the gateway, not the
+// watchdog's memory of what it has seen.
+let notAliveStreak = 0;
 
 /** 1m -> 2m -> 4m -> 8m -> 15m, then flat at the 15m cap. */
 function backoffFor(attempt: number): number {
@@ -286,11 +330,20 @@ function probeWithTimeout(gateway: SlackGateway, timeoutMs: number): Promise<boo
  * injected clock instead of waiting out a 60s interval.
  */
 export async function socketWatchdogTick(ctx: PluginContext, now: number = Date.now()): Promise<void> {
-  // Nothing to recover to before a config has ever applied; never re-enter;
-  // never race the pump — a queued OR in-flight apply is either about to
-  // rebuild the gateway or is already mid-handshake, and in both cases this
-  // tick has nothing useful to add; and honor the backoff deadline.
-  if (!liveConfig || recoveryInFlight || applyQueue.length > 0 || applyInFlight || now < recoveryNotBefore) {
+  // Nothing to recover to before a structurally-valid config has ever been
+  // pushed (liveConfig for an apply that succeeded at least once,
+  // lastAttemptedConfig for a first apply that failed on a transient step —
+  // see its declaration); never re-enter; never race the pump — a queued OR
+  // in-flight apply is either about to rebuild the gateway or is already
+  // mid-handshake, and in both cases this tick has nothing useful to add;
+  // and honor the backoff deadline.
+  if (
+    (!liveConfig && !lastAttemptedConfig) ||
+    recoveryInFlight ||
+    applyQueue.length > 0 ||
+    applyInFlight ||
+    now < recoveryNotBefore
+  ) {
     return;
   }
 
@@ -299,31 +352,49 @@ export async function socketWatchdogTick(ctx: PluginContext, now: number = Date.
     const gateway = currentGateway;
     const alive = gateway !== null && gateway.isConnected() && (await probeWithTimeout(gateway, PROBE_TIMEOUT_MS));
     if (alive) {
+      notAliveStreak = 0;
       recoveryAttempts = 0;
       recoveryNotBefore = 0;
       return;
     }
 
-    // Re-checked here, right before enqueueing, using a fresh read of
-    // `liveConfig` — not a value captured before the probe above (see the
-    // section comment for why that was a bug). If an operator save landed
-    // and finished while we were awaiting the probe, either it already
-    // fixed things (nothing left to recover — bail silently) or another
-    // apply is now queued/in-flight that will settle things on its own;
-    // either way this tick must not push a job built from a stale config.
-    if (!liveConfig || applyQueue.length > 0 || applyInFlight) return;
-    const cfg = liveConfig;
+    // First not-alive observation: note it and stand down until the next
+    // tick — see NOT_ALIVE_TICKS_BEFORE_RECOVERY above for why one
+    // observation must never trigger a teardown.
+    notAliveStreak += 1;
+    if (notAliveStreak < NOT_ALIVE_TICKS_BEFORE_RECOVERY) {
+      ctx.logger.info("Slack Socket Mode looks dead; confirming on the next tick before recovering", {
+        observation: notAliveStreak,
+      });
+      return;
+    }
+
+    // Re-checked here, after the probe was awaited: if an operator save
+    // landed while we were probing, another apply may now be queued or
+    // in-flight that will settle things on its own — bail before counting an
+    // attempt the operator's save is already making moot.
+    if ((!liveConfig && !lastAttemptedConfig) || applyQueue.length > 0 || applyInFlight) return;
 
     const attempt = (recoveryAttempts += 1);
     ctx.logger.warn("Slack Socket Mode looks dead; re-applying the live config to recover", { attempt });
     await ctx.metrics.write("slack.socket.recovery.attempted", 1, { attempt: String(attempt) }).catch(() => {});
 
+    // The config is captured HERE, synchronously with the enqueue — never
+    // before an `await`. The metrics write above suspends this tick exactly
+    // like the probe does, and an operator save that lands and completes
+    // inside either await would be silently reverted by enqueueing a config
+    // captured before it (including access-narrowing fields like
+    // allowedSlackUserIds/agentPostChannelIds/agentPostMessageEnabled).
+    // Nothing may suspend between this re-check, the capture, and the push.
+    const cfg = liveConfig ?? lastAttemptedConfig;
+    if (!cfg || applyQueue.length > 0 || applyInFlight) return;
     await new Promise<void>((resolve) => {
       applyQueue.push({ cfg, done: resolve });
       signalPump();
     });
 
     if (health.status === "ok") {
+      notAliveStreak = 0;
       recoveryAttempts = 0;
       recoveryNotBefore = 0;
       ctx.logger.info("Slack Socket Mode recovered", { attempt });
@@ -507,6 +578,12 @@ export async function applyConfig(
     return health;
   }
 
+  // Structurally valid for the bound company: remember it so the watchdog
+  // can retry a first-ever apply that fails on a transient step below (see
+  // lastAttemptedConfig's declaration). Configs that fail the checks above
+  // are deliberately never remembered.
+  lastAttemptedConfig = cfg;
+
   let botToken: string;
   let appToken: string;
   try {
@@ -539,19 +616,6 @@ export async function applyConfig(
 
   const gateway = makeGateway({ botToken, appToken });
 
-  // Slack Socket Mode redelivers events at-least-once, and a reconnect can
-  // replay a backlog of stale events. Dedupe/stale-filter mention and
-  // message dispatch before it reaches ask-human's answer routing or chat —
-  // reactions, actions, and commands are not deduped (they're not prone to
-  // the same at-least-once redelivery pattern here and are already
-  // effectively idempotent or externally acked). Keys are namespaced by
-  // event type ("mention:"/"message:") because a single channel @mention
-  // arrives as two distinct Slack events sharing the same ts (app_mention +
-  // message.channels) — without the prefix, consuming one event's key would
-  // shadow the other's and silently drop it as a "duplicate". Rebuilt fresh
-  // per gateway, since a new Socket Mode connection means a fresh
-  // redelivery/replay risk.
-  const eventDeduper = createEventDeduper();
   gateway.onMention(async (msg) => {
     if (!(await checkAccess(ctx, msg.user, "mention"))) return;
     if (!eventDeduper.shouldProcess(`mention:${msg.channel}:${msg.ts}`)) return;
