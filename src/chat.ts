@@ -125,9 +125,39 @@ export function extractReply(text: string): string {
 // DEFAULT_CHAT_PROMPT_PREAMBLE in constants.ts for why this is necessary.
 // When `preamble` is empty/whitespace-only, the user's text is sent
 // verbatim with no framing, matching the plugin's pre-preamble behavior.
-export function buildChatPrompt(preamble: string, text: string): string {
-  if (!preamble.trim()) return text;
-  return `${preamble}\n\nSlack message:\n${text}`;
+//
+// `seed`, when non-empty, is a rendered <thread_context> block (see
+// buildThreadContext) — untrusted text written by people who never
+// addressed the bot. IMPORTANT 5: trusted framing goes on BOTH SIDES of
+// that block, not just inside it. Composition is preamble, then the seed
+// block, then the labelled real request:
+//
+//   <preamble, if any>
+//
+//   <thread_context>...</thread_context>
+//
+//   Slack message:
+//   <text>
+//
+// `chatPromptPreamble` may be configured as "" — a supported setting — and
+// without this ordering that leaves the ONE line printed INSIDE the fence
+// (see THREAD_CONTEXT_FRAMING) as the only trusted framing anywhere in the
+// prompt, which is exactly the line an injected message imitates. Putting
+// the labelled "Slack message:" request AFTER the block, always, means the
+// genuine request is never mistaken for part of the untrusted background —
+// even with an empty preamble.
+//
+// When there is no seed at all (`seedThreadHistory: false`, or a turn with
+// nothing to seed), this must stay byte-for-byte what it produced before
+// seeding existed — nothing about the untrusted-block problem applies to a
+// prompt that never had one.
+export function buildChatPrompt(preamble: string, text: string, seed = ""): string {
+  const trimmedPreamble = preamble.trim();
+  if (!seed) {
+    return trimmedPreamble ? `${preamble}\n\nSlack message:\n${text}` : text;
+  }
+  const framed = trimmedPreamble ? `${preamble}\n\n${seed}` : seed;
+  return `${framed}\n\nSlack message:\n${text}`;
 }
 
 // Marks a parent message's text as cut short by THREAD_CONTEXT_MAX_PARENT_CHARS.
@@ -1137,9 +1167,7 @@ export function createChat(deps: ChatDeps): Chat {
       // the placeholder message itself from the transcript it reads back —
       // see the BLOCKER 1 note on buildSeedBlock.
       const seed = created && cfg.seedThreadHistory ? await buildSeedBlock(msg, scope, placeholder.ts) : "";
-      const prompt = seed
-        ? `${seed}\n\n${buildChatPrompt(cfg.chatPromptPreamble, text)}`
-        : buildChatPrompt(cfg.chatPromptPreamble, text);
+      const prompt = buildChatPrompt(cfg.chatPromptPreamble, text, seed);
       await streamReply(cfg, entry, scope.replyThreadTs, prompt, placeholder);
     } catch (err) {
       const reason = describeHostError(err);

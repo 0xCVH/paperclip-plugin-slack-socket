@@ -434,6 +434,43 @@ describe("buildChatPrompt", () => {
   it("with a whitespace-only preamble, returns exactly the user text", () => {
     expect(buildChatPrompt("   \n\t  ", "help me")).toBe("help me");
   });
+
+  // IMPORTANT 5: trusted framing goes on BOTH sides of a seeded
+  // <thread_context> block — preamble first, then the block, then the
+  // labelled real request — never the block first with only the framing
+  // sentence printed inside it standing between an injected line and the
+  // model.
+  it("with a seed block, orders the preamble, then the seed, then the label, then the user text", () => {
+    const seed = `${THREAD_CONTEXT_OPEN_TAG}\nsome background\n${THREAD_CONTEXT_CLOSE_TAG}`;
+    const result = buildChatPrompt("Be conversational.", "help me", seed);
+    const preambleIdx = result.indexOf("Be conversational.");
+    const seedIdx = result.indexOf(THREAD_CONTEXT_OPEN_TAG);
+    const labelIdx = result.indexOf("Slack message:");
+    const textIdx = result.lastIndexOf("help me");
+    expect(preambleIdx).toBe(0);
+    expect(seedIdx).toBeGreaterThan(preambleIdx);
+    expect(labelIdx).toBeGreaterThan(seedIdx + seed.length - 1);
+    expect(textIdx).toBeGreaterThan(labelIdx);
+  });
+
+  // chatPromptPreamble may be configured as "" — a supported setting. With
+  // no seed this collapses to the bare user text (see the byte-identity
+  // test below), but WITH a seed, the "Slack message:" label must still
+  // separate the untrusted block from the real request — otherwise an
+  // empty preamble would leave the one line printed INSIDE the fence as the
+  // only trusted framing anywhere in the prompt.
+  it("with a seed block and an empty preamble, still labels the user text after the seed", () => {
+    const seed = `${THREAD_CONTEXT_OPEN_TAG}\nsome background\n${THREAD_CONTEXT_CLOSE_TAG}`;
+    expect(buildChatPrompt("", "help me", seed)).toBe(`${seed}\n\nSlack message:\nhelp me`);
+  });
+
+  it("with no seed, stays byte-identical to the pre-seeding two-argument form — seedThreadHistory: false must change nothing", () => {
+    expect(buildChatPrompt("Be conversational.", "help me", "")).toBe(
+      buildChatPrompt("Be conversational.", "help me"),
+    );
+    expect(buildChatPrompt("", "help me", "")).toBe(buildChatPrompt("", "help me"));
+    expect(buildChatPrompt("", "help me", "")).toBe("help me");
+  });
 });
 
 describe("clampTurnTimeoutMinutes", () => {
@@ -1785,14 +1822,18 @@ describe("thread history seeding", () => {
 
     expect(fetchThreadReplies).toHaveBeenCalledWith("C-ALERT", "1000.1", THREAD_CONTEXT_MAX_MESSAGES);
     const prompt = (ctx.agents.sessions.sendMessage as any).mock.calls[0][2].prompt as string;
-    // The fenced block goes first and the prompt proper is untouched under it.
-    expect(prompt.startsWith(THREAD_CONTEXT_OPEN_TAG)).toBe(true);
-    expect(prompt).toContain(THREAD_CONTEXT_CLOSE_TAG);
-    expect(
-      prompt.endsWith(
-        buildChatPrompt(TEST_CONFIG.chatPromptPreamble, "raise a ticket for this issue here above"),
-      ),
-    ).toBe(true);
+    // IMPORTANT 5: trusted framing on BOTH sides of the untrusted block —
+    // the preamble comes first (not the fence), then the fenced block, then
+    // the labelled real request last.
+    expect(prompt.startsWith(TEST_CONFIG.chatPromptPreamble)).toBe(true);
+    const preambleIdx = prompt.indexOf(TEST_CONFIG.chatPromptPreamble);
+    const fenceOpenIdx = prompt.indexOf(THREAD_CONTEXT_OPEN_TAG);
+    const fenceCloseIdx = prompt.indexOf(THREAD_CONTEXT_CLOSE_TAG);
+    const slackMsgIdx = prompt.indexOf("Slack message:\nraise a ticket for this issue here above");
+    expect(fenceOpenIdx).toBeGreaterThan(preambleIdx);
+    expect(fenceCloseIdx).toBeGreaterThan(fenceOpenIdx);
+    expect(slackMsgIdx).toBeGreaterThan(fenceCloseIdx);
+    expect(prompt.endsWith("Slack message:\nraise a ticket for this issue here above")).toBe(true);
     // The bot's own alert is labelled "you" with nothing appended, so it
     // reads as its own words rather than as a third party's claim it has to
     // take on trust.
@@ -1984,7 +2025,9 @@ describe("thread history seeding", () => {
 
     expect(fetchThreadReplies).toHaveBeenCalledWith("D1", "3000.1", THREAD_CONTEXT_MAX_MESSAGES);
     const prompt = (ctx.agents.sessions.sendMessage as any).mock.calls[0][2].prompt as string;
-    expect(prompt.startsWith(THREAD_CONTEXT_OPEN_TAG)).toBe(true);
+    // IMPORTANT 5: the preamble precedes the fence here too.
+    expect(prompt.startsWith(TEST_CONFIG.chatPromptPreamble)).toBe(true);
+    expect(prompt).toContain(THREAD_CONTEXT_OPEN_TAG);
     expect(prompt).toContain("[you]");
   });
 
