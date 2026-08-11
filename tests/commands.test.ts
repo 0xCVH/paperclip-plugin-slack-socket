@@ -101,6 +101,30 @@ describe("commands", () => {
     expect(ctx.metrics.write).toHaveBeenCalledWith("slack.sessions.reset", 1, { surface: "command" });
   });
 
+  it("matches subcommands case-insensitively — mobile auto-capitalization sends '/paperclip Reset'", async () => {
+    // The mention path lower-cases before comparing ('@bot ReSeT' works);
+    // the slash path must not silently fall through to help for the same
+    // word with a capital letter — no reset, no error, just the help text.
+    const { ctx, gateway, commands, stateStore } = setup();
+    const key = STATE_KEYS.session("D1", CHANNEL_SESSION_TS);
+    stateStore.set(key, entry());
+    stateStore.set(STATE_KEYS.sessionIndex, [key]);
+
+    await commands.handleCommand(dmCmd("Reset"));
+
+    expect(ctx.agents.sessions.close).toHaveBeenCalledWith("sess-dm", "co-1");
+    expect(gateway.ephemerals[0]!.text).toContain("reset");
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.commands.invoked", 1, { subcommand: "reset" });
+  });
+
+  it("matches '/paperclip Issue <title>' case-insensitively while keeping the title's own case", async () => {
+    const { ctx, commands } = setup();
+    await commands.handleCommand(cmd("Issue Fix The Login Flow"));
+    expect(ctx.issues.create).toHaveBeenCalledWith({
+      companyId: "co-1", title: "Fix The Login Flow", status: "todo",
+    });
+  });
+
   it("in a DM under dmSessionMode 'thread', points at the mention keyword and closes nothing (a slash command has no thread_ts)", async () => {
     const { ctx, gateway, commands, stateStore } = setup({ dmSessionMode: "thread" });
     // Under "thread" mode a 1:1 DM is thread-scoped exactly like a channel —

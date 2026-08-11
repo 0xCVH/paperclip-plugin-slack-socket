@@ -38,7 +38,12 @@ export function createCommands({ ctx, gateway, getConfig }: CommandDeps): Comman
   return {
     async handleCommand(cmd) {
       const cfg = await getConfig();
-      const [sub, ...rest] = cmd.text.trim().split(/\s+/);
+      // The subcommand word is matched case-insensitively (mobile keyboards
+      // auto-capitalize "/paperclip Reset"; the mention path already
+      // lower-cases its keyword) — but only the subcommand: `rest` keeps the
+      // user's own casing for things like issue titles.
+      const [subRaw, ...rest] = cmd.text.trim().split(/\s+/);
+      const sub = (subRaw ?? "").toLowerCase();
       const subcommand = sub === "issue" || sub === RESET_KEYWORD ? sub : "help";
       await ctx.metrics.write("slack.commands.invoked", 1, { subcommand }).catch(() => {});
 
