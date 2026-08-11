@@ -142,8 +142,17 @@ function truncateParentText(text: string): string {
  * `messages` is chronological, oldest first (the order
  * `conversations.replies` returns).
  *
- * - The triggering message is dropped by `ts`: it arrives as the prompt
- *   proper (see buildChatPrompt), and keeping it here would double it.
+ * - Every ts in `excludeTs` is dropped before anything else runs. This is a
+ *   SET, not a single scalar, deliberately: the triggering message's own ts
+ *   always belongs in it (it arrives as the prompt proper — see
+ *   buildChatPrompt — and keeping it here would double it), and so does the
+ *   "_Thinking…_" placeholder's ts (see buildSeedBlock) — Slack really did
+ *   post that message into this same thread, BEFORE the fetch that reads it
+ *   back, so a naive single-ts exclusion would seed the bot's own
+ *   placeholder into its own transcript, labelled "[you]" — the highest-
+ *   trust attribution in the format. A set means a third exclusion, if one
+ *   is ever needed, is a caller-side change, not another signature change
+ *   here.
  * - The oldest remaining message — the thread parent — is always kept,
  *   whatever the bounds say. It is what "this issue here above" points at,
  *   and it is the message this whole feature exists to show the agent. Its
@@ -165,11 +174,11 @@ function truncateParentText(text: string): string {
  */
 export function selectThreadMessages(
   messages: ThreadMessage[],
-  triggeringTs: string,
+  excludeTs: ReadonlySet<string>,
   maxChars: number,
   maxMessages: number,
 ): { kept: ThreadMessage[]; omitted: number } {
-  const candidates = messages.filter((m) => m.ts !== triggeringTs);
+  const candidates = messages.filter((m) => !excludeTs.has(m.ts));
   if (candidates.length === 0) return { kept: [], omitted: 0 };
 
   const rawParent = candidates[0]!;
@@ -735,12 +744,30 @@ export function createChat(deps: ChatDeps): Chat {
    * Renders the thread this message landed in as a <thread_context> block,
    * or "" when there is nothing to prepend.
    *
+   * `placeholderTs` is the ts of the "_Thinking…_" message `converse` posts
+   * BEFORE calling this function (see the call site) — into the SAME thread
+   * this function then reads back with `fetchThreadReplies`. Slack really
+   * does return it: the placeholder is posted first specifically so the
+   * turn watchdog and the person both get something immediately, which
+   * means by the time the fetch below runs, the thread already contains a
+   * message this bot itself just posted. Without excluding it, it would be
+   * labelled "[you]" — bare, the one bracket this whole format reserves as
+   * provably the bot's own words (see resolveThreadEntries) — as the LAST
+   * line of the transcript, ahead of the real request. `excludeTs` — see
+   * selectThreadMessages — is why this is a set: both `msg.ts` (the
+   * triggering mention) and `placeholderTs` are excluded the same way,
+   * structurally, not by filtering on content.
+   *
    * Never throws. A thread we cannot read has to degrade to exactly today's
    * behavior — an answer with no history — rather than escaping into
    * converse's catch and replacing a perfectly good turn with ":warning:
    * Sorry — something went wrong". An answer without context beats no answer.
    */
-  async function buildSeedBlock(msg: InboundMessage, scope: SessionScope): Promise<string> {
+  async function buildSeedBlock(
+    msg: InboundMessage,
+    scope: SessionScope,
+    placeholderTs: string,
+  ): Promise<string> {
     const threadTs = scope.replyThreadTs;
     // Whether there is a thread to read is resolveSessionScope's answer, not
     // a second guess at channel types here: a channel-scoped DM session
@@ -749,6 +776,7 @@ export function createChat(deps: ChatDeps): Chat {
     // dmSessionMode "thread" resolves to scope "thread" and seeds like any
     // other thread.
     if (scope.scope !== "thread" || threadTs === undefined || threadTs === msg.ts) return "";
+    const excludeTs = new Set([msg.ts, placeholderTs]);
     try {
       const fetched = await gateway.fetchThreadReplies(
         msg.channel,
@@ -766,7 +794,7 @@ export function createChat(deps: ChatDeps): Chat {
       }
       const { kept, omitted } = selectThreadMessages(
         fetched,
-        msg.ts,
+        excludeTs,
         THREAD_CONTEXT_MAX_CHARS,
         THREAD_CONTEXT_MAX_MESSAGES,
       );
@@ -1021,7 +1049,10 @@ export function createChat(deps: ChatDeps): Chat {
       // Seed once, on this session's first turn only. Every later turn in the
       // same thread already has the history in the session, so re-sending it
       // would re-send the same text repeatedly and grow without bound.
-      const seed = created && cfg.seedThreadHistory ? await buildSeedBlock(msg, scope) : "";
+      // `placeholder.ts` is threaded through so buildSeedBlock can exclude
+      // the placeholder message itself from the transcript it reads back —
+      // see the BLOCKER 1 note on buildSeedBlock.
+      const seed = created && cfg.seedThreadHistory ? await buildSeedBlock(msg, scope, placeholder.ts) : "";
       const prompt = seed
         ? `${seed}\n\n${buildChatPrompt(cfg.chatPromptPreamble, text)}`
         : buildChatPrompt(cfg.chatPromptPreamble, text);

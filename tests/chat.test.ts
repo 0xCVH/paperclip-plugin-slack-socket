@@ -1232,7 +1232,7 @@ describe("selectThreadMessages", () => {
   it("drops the triggering message — it arrives as the prompt proper, so keeping it would double it", () => {
     const { kept, omitted } = selectThreadMessages(
       [msg("1.0", "Action needed: claimable subdomain", true), msg("2.0", "<@UBOT> raise a ticket for this")],
-      "2.0",
+      new Set(["2.0"]),
       1000,
       50,
     );
@@ -1243,20 +1243,40 @@ describe("selectThreadMessages", () => {
   it("returns nothing when the triggering message is the whole thread", () => {
     // A top-level @mention that starts its own thread: the parent IS the
     // trigger, so there is no history and the prompt must stay unseeded.
-    expect(selectThreadMessages([msg("1.0", "<@UBOT> hi")], "1.0", 1000, 50)).toEqual({
+    expect(selectThreadMessages([msg("1.0", "<@UBOT> hi")], new Set(["1.0"]), 1000, 50)).toEqual({
       kept: [],
       omitted: 0,
     });
   });
 
   it("returns nothing for an empty transcript", () => {
-    expect(selectThreadMessages([], "1.0", 1000, 50)).toEqual({ kept: [], omitted: 0 });
+    expect(selectThreadMessages([], new Set(["1.0"]), 1000, 50)).toEqual({ kept: [], omitted: 0 });
+  });
+
+  // BLOCKER 1 regression, at this layer: excludeTs is a SET, not a single
+  // scalar, specifically so the triggering message's ts and the
+  // "_Thinking…_" placeholder's ts can both be excluded the same way — see
+  // buildSeedBlock, which builds this set from msg.ts and placeholderTs.
+  it("excludes every ts in the given set, not just one", () => {
+    const { kept, omitted } = selectThreadMessages(
+      [
+        msg("1.0", "the alert", true),
+        msg("2.0", "a reply"),
+        msg("3.0", "_Thinking…_", true),
+        msg("4.0", "<@UBOT> ticket?"),
+      ],
+      new Set(["3.0", "4.0"]),
+      1000,
+      50,
+    );
+    expect(kept.map((m) => m.ts)).toEqual(["1.0", "2.0"]);
+    expect(omitted).toBe(0);
   });
 
   it("keeps every message, in chronological order, when the whole thread fits", () => {
     const { kept, omitted } = selectThreadMessages(
       [msg("1.0", "the alert", true), msg("2.0", "seen it"), msg("3.0", "same here"), msg("4.0", "<@UBOT> ticket?")],
-      "4.0",
+      new Set(["4.0"]),
       1000,
       50,
     );
@@ -1273,7 +1293,7 @@ describe("selectThreadMessages", () => {
         msg("4.0", "c"),
         msg("5.0", "<@UBOT> ticket?"),
       ],
-      "5.0",
+      new Set(["5.0"]),
       1000,
       3,
     );
@@ -1285,7 +1305,7 @@ describe("selectThreadMessages", () => {
   it("under the char cap, counts the parent against the budget and stops at the first reply that would breach it", () => {
     const { kept, omitted } = selectThreadMessages(
       [msg("1.0", "aaaa", true), msg("2.0", "bbbb"), msg("3.0", "cccc"), msg("4.0", "<@UBOT> ticket?")],
-      "4.0",
+      new Set(["4.0"]),
       8,
       50,
     );
@@ -1297,7 +1317,7 @@ describe("selectThreadMessages", () => {
   it("keeps the parent even when it alone exceeds the char cap — it is what 'this issue here above' points at", () => {
     const { kept, omitted } = selectThreadMessages(
       [msg("1.0", "x".repeat(500), true), msg("2.0", "short"), msg("3.0", "<@UBOT> ticket?")],
-      "3.0",
+      new Set(["3.0"]),
       10,
       50,
     );
@@ -1311,7 +1331,7 @@ describe("selectThreadMessages", () => {
     const hugeParent = "x".repeat(THREAD_CONTEXT_MAX_PARENT_CHARS + 5_000);
     const { kept, omitted } = selectThreadMessages(
       [msg("1.0", hugeParent, true), msg("2.0", "seen it"), msg("3.0", "<@UBOT> ticket?")],
-      "3.0",
+      new Set(["3.0"]),
       THREAD_CONTEXT_MAX_CHARS,
       50,
     );
@@ -1343,7 +1363,7 @@ describe("selectThreadMessages", () => {
     const reply = "r".repeat(7_000);
     const { kept, omitted } = selectThreadMessages(
       [msg("1.0", hugeParent, true), msg("2.0", reply), msg("3.0", "<@UBOT> ticket?")],
-      "3.0",
+      new Set(["3.0"]),
       THREAD_CONTEXT_MAX_CHARS,
       50,
     );
@@ -1357,7 +1377,7 @@ describe("selectThreadMessages", () => {
     const messages = Array.from({ length: 20 }, (_, i) => msg(`${i + 1}.0`, "y".repeat(100)));
     const { kept, omitted } = selectThreadMessages(
       [...messages, msg("99.0", "<@UBOT> ticket?")],
-      "99.0",
+      new Set(["99.0"]),
       THREAD_CONTEXT_MAX_CHARS,
       THREAD_CONTEXT_MAX_MESSAGES,
     );
@@ -1368,8 +1388,8 @@ describe("selectThreadMessages", () => {
   it("is pure: four arguments, mutates nothing, stable across calls", () => {
     const messages = [msg("1.0", "the alert", true), msg("2.0", "a"), msg("3.0", "<@UBOT> ticket?")];
     const snapshot = JSON.stringify(messages);
-    const first = selectThreadMessages(messages, "3.0", 1000, 50);
-    const second = selectThreadMessages(messages, "3.0", 1000, 50);
+    const first = selectThreadMessages(messages, new Set(["3.0"]), 1000, 50);
+    const second = selectThreadMessages(messages, new Set(["3.0"]), 1000, 50);
     expect(second).toEqual(first);
     expect(JSON.stringify(messages)).toBe(snapshot);
     // No PluginContext, no gateway, no clock — the bounds rule must stay
@@ -2014,5 +2034,42 @@ describe("thread history seeding", () => {
 
     // Nothing is above the message that started the thread.
     expect(fetchThreadReplies).not.toHaveBeenCalled();
+  });
+
+  // BLOCKER 1: the placeholder is posted BEFORE buildSeedBlock runs (see the
+  // ordering test above), into the SAME thread fetchThreadReplies then
+  // reads back. Every fixture elsewhere in this file is a static array
+  // built before the turn runs — a thread shape that can no longer occur in
+  // production, where Slack really has already recorded the placeholder by
+  // fetch time. This test models it as it actually exists at fetch time:
+  // the mock reads gateway.posts (which already contains the placeholder,
+  // because postMessage happens first) instead of being handed a fixed
+  // array up front.
+  it("excludes the _Thinking… placeholder itself from the seeded transcript, modelled as it exists at fetch time", async () => {
+    const { ctx, chat, gateway, fetchThreadReplies } = setupSeeding();
+    fetchThreadReplies.mockImplementation(async () => {
+      // The placeholder gateway.posts[0] holds a real ts by the time this
+      // runs, exactly like a real Slack thread would if fetched now.
+      const placeholder = gateway.posts[0]!;
+      return [
+        ...alertThread("1000.2"),
+        { user: "UBOT", text: "_Thinking…_", ts: placeholder.ts, isBot: true },
+      ];
+    });
+
+    await chat.handleMention(
+      mentionInThread("raise a ticket for this issue here above", "1000.2", "1000.1"),
+    );
+
+    const prompt = (ctx.agents.sessions.sendMessage as any).mock.calls[0][2].prompt as string;
+    // No line of the rendered block may be the placeholder — in particular
+    // not as a bare "[you]" line, the highest-trust attribution in the
+    // format.
+    const lines = prompt.split("\n");
+    expect(lines).not.toContain("[you] _Thinking…_");
+    expect(prompt).not.toContain("Thinking");
+    // The genuine bot alert is still present and still labelled "you" —
+    // this isn't excluding every bot message, just the placeholder's own ts.
+    expect(prompt).toContain("[you] Action needed: claimable subdomain on polygon.technology");
   });
 });
