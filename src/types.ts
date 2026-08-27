@@ -87,6 +87,20 @@ export interface SessionEntry {
    * are past their first turn and must not suddenly seed).
    */
   seedPending?: boolean;
+  /**
+   * Watermark for thread delta hydration: the highest thread ts already
+   * delivered to this session — by the initial seed, by a later delta
+   * block, or as a turn's own triggering message. A later turn fetches
+   * only messages strictly newer than this and prepends them as a
+   * <thread_context> delta, so re-mentions see what happened in between.
+   * Only ever advanced after a prompt actually reached the agent, and only
+   * monotonically (see advanceWatermark in chat.ts): a failed delta fetch
+   * leaves it alone so the gap stays fetchable. Absent on sessions from
+   * before this field existed — the next delivered turn initialises it to
+   * its own trigger ts, deliberately skipping older history the session
+   * lived through.
+   */
+  seededUpTo?: string;
 }
 
 // Links a Slack message we posted to the entity it represents, so a later

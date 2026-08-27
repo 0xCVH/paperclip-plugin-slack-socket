@@ -19,6 +19,7 @@ import {
 import {
   buildThreadContext,
   selectThreadMessages,
+  THREAD_DELTA_FRAMING,
   type ThreadContextEntry,
   UNKNOWN_SPEAKER_LABEL,
 } from "./thread-transcript.js";
@@ -516,14 +517,42 @@ export function createChat(deps: ChatDeps): Chat {
     }
   }
 
+  // Numeric max of two Slack ts strings, either possibly undefined. Slack
+  // ts values are decimal strings; comparing them as numbers is what the
+  // dedup/staleness code does too.
+  function latestTs(a: string | undefined, b: string | undefined): string | undefined {
+    if (a === undefined) return b;
+    if (b === undefined) return a;
+    return Number(b) > Number(a) ? b : a;
+  }
+
   // Durably records that this session's thread history has been delivered,
-  // so no later turn re-seeds it. Re-reads the current entry before writing
-  // so a concurrent lastActivityAt update isn't clobbered — only the
-  // seedPending flag flips (true -> false), which is idempotent.
-  async function markSeedDelivered(key: string): Promise<void> {
+  // so no later turn re-seeds it, and stamps the watermark the delivered
+  // transcript covered (see SessionEntry.seededUpTo). Re-reads the current
+  // entry before writing so a concurrent lastActivityAt update isn't
+  // clobbered — the seedPending flip (true -> false) is idempotent and the
+  // watermark merge is monotonic.
+  async function markSeedDelivered(key: string, seededUpTo: string | undefined): Promise<void> {
     const current = (await ctx.state.get(stateScope(key))) as SessionEntry | null;
     if (current && current.seedPending) {
-      await ctx.state.set(stateScope(key), { ...current, seedPending: false });
+      await ctx.state.set(stateScope(key), {
+        ...current,
+        seedPending: false,
+        seededUpTo: latestTs(current.seededUpTo, seededUpTo),
+      });
+    }
+  }
+
+  // Monotonically advances the delta watermark (see SessionEntry.seededUpTo):
+  // max-merge on a re-read entry, so two overlapping turns can only move it
+  // forward, never back, whatever order their writes land in.
+  async function advanceWatermark(key: string, ts: string | undefined): Promise<void> {
+    if (ts === undefined) return;
+    const current = (await ctx.state.get(stateScope(key))) as SessionEntry | null;
+    if (!current) return;
+    const merged = latestTs(current.seededUpTo, ts);
+    if (merged !== current.seededUpTo) {
+      await ctx.state.set(stateScope(key), { ...current, seededUpTo: merged });
     }
   }
 
@@ -691,7 +720,7 @@ export function createChat(deps: ChatDeps): Chat {
     msg: InboundMessage,
     scope: SessionScope,
     placeholderTs: string,
-  ): Promise<{ block: string; retryable: boolean }> {
+  ): Promise<{ block: string; retryable: boolean; maxTs: string | undefined }> {
     const threadTs = scope.replyThreadTs;
     // Whether there is a thread to read is resolveSessionScope's answer, not
     // a second guess at channel types here: a channel-scoped DM session
@@ -700,7 +729,7 @@ export function createChat(deps: ChatDeps): Chat {
     // dmSessionMode "thread" resolves to scope "thread" and seeds like any
     // other thread. Nothing to seed, ever — not retryable.
     if (scope.scope !== "thread" || threadTs === undefined || threadTs === msg.ts) {
-      return { block: "", retryable: false };
+      return { block: "", retryable: false, maxTs: undefined };
     }
     // Exact-ts exclusions: the triggering mention (it arrives as the prompt
     // proper) and this turn's own "_Thinking…_" placeholder. A falsy ts is
@@ -711,7 +740,7 @@ export function createChat(deps: ChatDeps): Chat {
     const excludeTs = new Set([msg.ts, placeholderTs].filter((ts) => ts !== ""));
     const triggerTsNum = Number(msg.ts);
     try {
-      const block = await withTimeout(
+      const result = await withTimeout(
         (async () => {
           const fetched = await gateway.fetchThreadReplies(
             msg.channel,
@@ -722,6 +751,14 @@ export function createChat(deps: ChatDeps): Chat {
             // drop the recent tail this feature exists to show. See
             // THREAD_FETCH_PAGE_SIZE.
             THREAD_FETCH_PAGE_SIZE,
+          );
+          // Watermark the whole snapshot, not just what selection keeps:
+          // anything fetched now — delivered, machinery-excluded, or
+          // budget-omitted (announced in-band) — is this seed's coverage,
+          // and deltas start strictly after it.
+          const maxTs = fetched.reduce<string | undefined>(
+            (acc, m) => (m.ts !== "" ? latestTs(acc, m.ts) : acc),
+            undefined,
           );
           // Drop the bot's OWN turn machinery as a class, not just this
           // turn's placeholder by its exact ts: any own-bot message posted
@@ -751,7 +788,7 @@ export function createChat(deps: ChatDeps): Chat {
               channel: msg.channel,
               threadTs,
             });
-            return "";
+            return { block: "", maxTs };
           }
           const { kept, omitted } = selectThreadMessages(
             history,
@@ -759,14 +796,14 @@ export function createChat(deps: ChatDeps): Chat {
             THREAD_CONTEXT_MAX_CHARS,
             THREAD_CONTEXT_MAX_MESSAGES,
           );
-          if (kept.length === 0) return "";
-          return buildThreadContext(await resolveThreadEntries(kept), omitted);
+          if (kept.length === 0) return { block: "", maxTs };
+          return { block: buildThreadContext(await resolveThreadEntries(kept), omitted), maxTs };
         })(),
         seedTimeoutMs,
       );
       // Reached the fetch and got an answer (a block, or a considered
       // "nothing to seed") — the attempt is complete, don't retry it.
-      return { block, retryable: false };
+      return { ...result, retryable: false };
     } catch (err) {
       // Covers both a genuine fetch failure and SEED_FETCH_TIMEOUT_MS
       // expiring (withTimeout rejects with SeedTimeoutError in that case) —
@@ -779,7 +816,73 @@ export function createChat(deps: ChatDeps): Chat {
         channel: msg.channel,
         threadTs,
       });
-      return { block: "", retryable: true };
+      return { block: "", retryable: true, maxTs: undefined };
+    }
+  }
+
+  /**
+   * Renders the messages this thread gained since `watermark` as a
+   * <thread_context> delta block (THREAD_DELTA_FRAMING), or "" when nothing
+   * new. Returns `fetched: false` only when the thread could not be read —
+   * the caller must then leave the watermark untouched so the unread gap
+   * stays fetchable on a later turn. `maxTs` is the newest candidate the
+   * block covers; budget-omitted candidates are announced in-band and
+   * counted as covered, the same trade the initial seed's bounds make.
+   *
+   * The `oldest` passed to the fetch is an efficiency hint only; the strict
+   * `> watermark` filter below is the correctness boundary (see the
+   * SlackGateway declaration). The bot's OWN messages are excluded outright
+   * — the session already contains its own words — and the trigger and this
+   * turn's placeholder are excluded exactly as in buildSeedBlock. Everything
+   * kept goes through the same resolveThreadEntries + buildThreadContext
+   * hardening as a seed. Never throws.
+   */
+  async function buildDeltaBlock(
+    msg: InboundMessage,
+    scope: SessionScope,
+    placeholderTs: string,
+    watermark: string,
+  ): Promise<{ block: string; fetched: boolean; maxTs: string | undefined }> {
+    const threadTs = scope.replyThreadTs;
+    if (scope.scope !== "thread" || threadTs === undefined || threadTs === msg.ts) {
+      return { block: "", fetched: true, maxTs: undefined };
+    }
+    const excludeTs = new Set([msg.ts, placeholderTs].filter((ts) => ts !== ""));
+    // An unparsable watermark makes every comparison below false, so the
+    // delta is empty and the caller's advance to this turn's trigger
+    // self-heals the corrupt value.
+    const watermarkNum = Number(watermark);
+    try {
+      const result = await withTimeout(
+        (async () => {
+          const fetched = await gateway.fetchThreadReplies(msg.channel, threadTs, THREAD_FETCH_PAGE_SIZE, watermark);
+          const candidates = fetched.filter(
+            (m) => m.ts !== "" && Number(m.ts) > watermarkNum && !excludeTs.has(m.ts) && !m.isBot,
+          );
+          if (candidates.length === 0) return { block: "", maxTs: undefined };
+          const maxTs = candidates.reduce<string | undefined>((acc, m) => latestTs(acc, m.ts), undefined);
+          const { kept, omitted } = selectThreadMessages(
+            candidates,
+            new Set<string>(),
+            THREAD_CONTEXT_MAX_CHARS,
+            THREAD_CONTEXT_MAX_MESSAGES,
+          );
+          if (kept.length === 0) return { block: "", maxTs };
+          return {
+            block: buildThreadContext(await resolveThreadEntries(kept), omitted, THREAD_DELTA_FRAMING),
+            maxTs,
+          };
+        })(),
+        seedTimeoutMs,
+      );
+      return { ...result, fetched: true };
+    } catch (err) {
+      ctx.logger.warn("Slack thread delta fetch failed; continuing without it", {
+        err: errString(err),
+        channel: msg.channel,
+        threadTs,
+      });
+      return { block: "", fetched: false, maxTs: undefined };
     }
   }
 
@@ -793,7 +896,16 @@ export function createChat(deps: ChatDeps): Chat {
     // here — see the placeholder-post call in converse for why. Also the
     // source of the channel every message in this turn posts to.
     placeholder: { channel: string; ts: string },
-  ): Promise<void> {
+  ): Promise<{
+    /**
+     * False only when the host rejected the send itself — the prompt (and
+     * any seed/delta block riding in it) never reached the agent, so the
+     * caller must not clear seedPending or advance the watermark. True on
+     * every other outcome, including a watchdog timeout and an agent-error
+     * event: the run was accepted, so the prompt was delivered.
+     */
+    delivered: boolean;
+  }> {
     // Every message posted AFTER the placeholder — overflow chunks and the
     // watchdog's late reply — belongs under the reply, not beside it. In a
     // channel-scoped 1:1 DM there is no thread (`replyThreadTs` is
@@ -815,6 +927,7 @@ export function createChat(deps: ChatDeps): Chat {
     // gate — whichever of timeout/done/error/rejection happens first owns
     // the placeholder, and anything arriving afterwards must leave it alone.
     let settled = false;
+    let delivered = true;
     let turnTimer: ReturnType<typeof setTimeout> | null = null;
     // Heartbeat: while the turn runs, the "_Thinking…_" placeholder is
     // rewritten with elapsed time ("_Thinking… (2m 03s)_") every
@@ -1073,6 +1186,7 @@ export function createChat(deps: ChatDeps): Chat {
           // Clear any pending chunk-scheduled update so it can't fire later
           // and overwrite this error message with a stale partial buffer.
           clearPendingTimer();
+          delivered = false;
           if (settled) return;
           settled = true;
           clearTurnTimer();
@@ -1081,6 +1195,7 @@ export function createChat(deps: ChatDeps): Chat {
         });
     });
     await updateChain;
+    return { delivered };
   }
 
   async function converse(msg: InboundMessage): Promise<void> {
@@ -1134,23 +1249,61 @@ export function createChat(deps: ChatDeps): Chat {
       // see the BLOCKER 1 note on buildSeedBlock.
       let seed = "";
       let seedComplete = false;
+      let seedMaxTs: string | undefined;
       if (wantSeed) {
         const result = await buildSeedBlock(msg, scope, placeholder.ts);
         seed = result.block;
         // A retryable failure (fetch error/timeout) leaves seedPending set;
         // anything else — a delivered block, or nothing to seed — completes.
         seedComplete = !result.retryable;
+        seedMaxTs = result.maxTs;
       }
-      const prompt = buildChatPrompt(cfg.chatPromptPreamble, text, seed);
-      await streamReply(cfg, entry, scope.replyThreadTs, prompt, placeholder);
 
-      // Cleared only now — after the prompt carrying the seed actually
-      // reached the agent (streamReply resolved) and only when the attempt
-      // was complete. "Seed once" is thus "once delivered", not "once
-      // attempted": a first turn that threw before here leaves seedPending
-      // set for the next mention to retry.
-      if (wantSeed && seedComplete) {
-        await markSeedDelivered(scope.key);
+      // Delta hydration: on a turn whose session is already seeded, fetch
+      // only what the thread gained since the watermark and prepend it the
+      // same way a seed is — same fence, same hardening, refresh framing —
+      // so a re-mention answers from the whole conversation, not just the
+      // one line that mentioned the bot. Gated on the same seedThreadHistory
+      // switch because it is the same trust boundary: text written by
+      // people who never addressed the bot, in front of a tool-holding
+      // agent. A session from before watermarks existed skips the fetch
+      // once and starts tracking from this turn's trigger — its older
+      // history was either seeded already or deliberately never delivered.
+      const wantDelta =
+        !wantSeed && cfg.seedThreadHistory && entry.seedPending !== true && scope.scope === "thread";
+      let delta = "";
+      let deltaFetchOk = false;
+      let deltaMaxTs: string | undefined;
+      const initializeWatermark = wantDelta && entry.seededUpTo === undefined;
+      if (wantDelta && entry.seededUpTo !== undefined) {
+        const result = await buildDeltaBlock(msg, scope, placeholder.ts, entry.seededUpTo);
+        delta = result.block;
+        deltaFetchOk = result.fetched;
+        deltaMaxTs = result.maxTs;
+        if (delta) void ctx.metrics.write("slack.turns.thread_delta", 1).catch(() => {});
+      }
+
+      const prompt = buildChatPrompt(cfg.chatPromptPreamble, text, seed || delta);
+      const { delivered } = await streamReply(cfg, entry, scope.replyThreadTs, prompt, placeholder);
+
+      // Watermark and seed bookkeeping run only after the prompt actually
+      // REACHED the agent — `delivered` is false when the host rejected the
+      // send, and nothing below may run then: clearing seedPending would
+      // orphan a seed that was never read, and advancing the watermark
+      // would permanently skip messages the agent never saw. "Seed once" is
+      // thus "once delivered", not "once attempted".
+      if (delivered) {
+        if (wantSeed && seedComplete) {
+          await markSeedDelivered(scope.key, latestTs(seedMaxTs, msg.ts));
+        }
+        if (wantDelta && (deltaFetchOk || initializeWatermark)) {
+          // On a failed delta fetch the watermark deliberately stays put —
+          // even below this turn's trigger — so the unread gap is fetched
+          // by the next turn instead of being skipped forever. The cost is
+          // benign: that retry re-delivers this turn's trigger as one line
+          // of background, which the agent already saw as a prompt.
+          await advanceWatermark(scope.key, latestTs(deltaMaxTs, msg.ts));
+        }
       }
     } catch (err) {
       const reason = describeHostError(err);
