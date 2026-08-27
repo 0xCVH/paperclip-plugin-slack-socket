@@ -7,6 +7,7 @@ import {
   extractReply,
   extractTaggedReply,
   filterRuntimeNoticeLines,
+  formatElapsed,
   HOST_WITHHELD_REPLY_NOTICE,
   resolveSessionScope,
   selectThreadMessages,
@@ -553,6 +554,56 @@ describe("chat", () => {
     });
   });
 
+  describe("placeholder heartbeat", () => {
+    const emitDelayedDone = (ctx: unknown, message: string, delayMs: number): void => {
+      ((ctx as { agents: { sessions: { sendMessage: unknown } } }).agents.sessions
+        .sendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce(
+        async (_sessionId: string, _companyId: string, opts: { onEvent?: (e: unknown) => void }) => {
+          setTimeout(() => {
+            opts.onEvent?.({
+              sessionId: "sess-1", runId: "run-1", seq: 1,
+              eventType: "done", stream: "system", message, payload: null,
+            });
+          }, delayMs);
+          return { runId: "run-1" };
+        },
+      );
+    };
+
+    it("rewrites the placeholder with elapsed time while the turn is still running", async () => {
+      const { ctx, gateway, chat } = setup({}, { heartbeatIntervalMs: 20 });
+      emitDelayedDone(ctx, "Late answer", 120);
+
+      await chat.handleMessage(dm("hi", "1400.1"));
+
+      const texts = gateway.updates.map((u) => u.text);
+      expect(texts.some((t) => /^_Thinking… \(\d+s\)_$/.test(t))).toBe(true);
+      // The final reply always wins; no heartbeat lands after it.
+      expect(texts.at(-1)).toBe("Late answer");
+    });
+
+    it("does not heartbeat when partial replies are streaming — content owns the placeholder", async () => {
+      const { ctx, gateway, chat } = setup({ streamPartialReplies: true }, { heartbeatIntervalMs: 20 });
+      emitDelayedDone(ctx, "Late answer", 120);
+
+      await chat.handleMessage(dm("hi", "1400.2"));
+
+      expect(gateway.updates.every((u) => !u.text.startsWith("_Thinking… ("))).toBe(true);
+    });
+  });
+
+  describe("formatElapsed", () => {
+    it("renders seconds under a minute", () => {
+      expect(formatElapsed(5_000)).toBe("5s");
+      expect(formatElapsed(59_400)).toBe("59s");
+    });
+
+    it("renders minutes with zero-padded seconds from one minute up", () => {
+      expect(formatElapsed(60_000)).toBe("1m 00s");
+      expect(formatElapsed(123_000)).toBe("2m 03s");
+    });
+  });
+
   describe("extractTaggedReply", () => {
     it("returns null when the text has no tags", () => {
       expect(extractTaggedReply("plain text, no tags")).toBeNull();
@@ -923,8 +974,10 @@ describe("turn watchdog", () => {
     // An unclamped 0m would fire the watchdog on this very tick.
     expect(gateway.updates).toHaveLength(0);
 
+    // Still short of the clamped 1-minute floor: heartbeat rewrites of the
+    // placeholder are expected by now, but the watchdog notice is not.
     await vi.advanceTimersByTimeAsync(59_999);
-    expect(gateway.updates).toHaveLength(0); // still short of the clamped 1-minute floor
+    expect(gateway.updates.every((u) => !u.text.includes("No response from the agent"))).toBe(true);
 
     await vi.advanceTimersByTimeAsync(1);
     await turn;

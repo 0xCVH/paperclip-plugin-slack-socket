@@ -48,6 +48,12 @@ export interface ChatDeps {
    * it unset and SEED_FETCH_TIMEOUT_MS applies (see buildSeedBlock).
    */
   seedTimeoutMs?: number;
+  /**
+   * Overrides the placeholder heartbeat interval, in ms. Tests pass small
+   * values; production leaves it unset and HEARTBEAT_INTERVAL_MS applies
+   * (see the heartbeat in streamReply).
+   */
+  heartbeatIntervalMs?: number;
 }
 
 export interface Chat {
@@ -694,6 +700,24 @@ export function clampTurnTimeoutMinutes(minutes: number): number {
 // say which turn it belongs to instead of arriving as a bare answer.
 const LATE_REPLY_PREFIX = "⏳ _Late reply to your earlier message:_\n\n";
 
+// How often the "_Thinking…_" placeholder is rewritten with elapsed time
+// while a turn is still running (see the heartbeat in streamReply). 30s:
+// frequent enough that a person watching a long turn can tell the bot is
+// alive long before the turnTimeoutMinutes notice (default 10 minutes),
+// infrequent enough that a whole 10-minute turn costs only ~20 chat.update
+// calls — well under Slack's per-channel rate limit, and each one is
+// serialized on the same update chain as every other placeholder write.
+const HEARTBEAT_INTERVAL_MS = 30_000;
+
+/** "45s" under a minute, "2m 03s" from one minute up. */
+export function formatElapsed(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+}
+
 // IMPORTANT 4: bounds the whole thread-history seeding step (buildSeedBlock),
 // independently of streamReply's turn watchdog, which does not arm until
 // AFTER buildSeedBlock returns (see the ordering comment in converse). The
@@ -838,6 +862,7 @@ export function createChat(deps: ChatDeps): Chat {
   const updateIntervalMs = deps.updateIntervalMs ?? 1000;
   const turnTimeoutMsOverride = deps.turnTimeoutMs;
   const seedTimeoutMs = deps.seedTimeoutMs ?? SEED_FETCH_TIMEOUT_MS;
+  const heartbeatIntervalMs = deps.heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_MS;
 
   // Item 7: a process-level cache of resolved "display name (id)" labels
   // (see resolveThreadEntries), scoped to this createChat instance — i.e.
@@ -1299,6 +1324,23 @@ export function createChat(deps: ChatDeps): Chat {
     // the placeholder, and anything arriving afterwards must leave it alone.
     let settled = false;
     let turnTimer: ReturnType<typeof setTimeout> | null = null;
+    // Heartbeat: while the turn runs, the "_Thinking…_" placeholder is
+    // rewritten with elapsed time ("_Thinking… (2m 03s)_") every
+    // HEARTBEAT_INTERVAL_MS, so a person watching a long turn can tell the
+    // bot is alive long before the watchdog notice. Skipped entirely when
+    // partial replies stream — streamed content owns the placeholder then,
+    // and a heartbeat overwrite would erase text the person is reading.
+    // Every write goes through pushUpdate's serialized chain and checks
+    // `settled` first, so a tick can never clobber the final reply, the
+    // timeout notice, or an error message.
+    const turnStartedAt = Date.now();
+    let heartbeat: ReturnType<typeof setInterval> | null = null;
+    const clearHeartbeat = (): void => {
+      if (heartbeat) {
+        clearInterval(heartbeat);
+        heartbeat = null;
+      }
+    };
     // Clamped so a misconfigured (or unvalidated, host-pushed) value can
     // never produce a 0/NaN delay — see clampTurnTimeoutMinutes above. The
     // clamped value, not the raw config, is also what the timeout notice
@@ -1357,6 +1399,9 @@ export function createChat(deps: ChatDeps): Chat {
         clearTimeout(turnTimer);
         turnTimer = null;
       }
+      // Every settle path that clears the watchdog is also done with the
+      // placeholder, so the heartbeat dies with it.
+      clearHeartbeat();
     };
 
     const scheduleUpdate = (): void => {
@@ -1377,8 +1422,10 @@ export function createChat(deps: ChatDeps): Chat {
         if (settled) return;
         settled = true;
         // Drop any pending debounced chunk update so it can't fire later and
-        // replace the notice with a stale partial.
+        // replace the notice with a stale partial, and stop the heartbeat so
+        // no elapsed-time rewrite lands after the notice.
         clearPendingTimer();
+        clearHeartbeat();
         // Deliberately not phrased as a failure: the run may well still be
         // alive host-side, which is exactly why a late `done` is posted
         // rather than discarded.
@@ -1400,6 +1447,16 @@ export function createChat(deps: ChatDeps): Chat {
       };
 
       resetTurnTimer();
+
+      if (!cfg.streamPartialReplies) {
+        heartbeat = setInterval(() => {
+          if (settled) return;
+          pushUpdate(`_Thinking… (${formatElapsed(Date.now() - turnStartedAt)})_`);
+        }, heartbeatIntervalMs);
+        // Bookkeeping timer only — cleared on every settle path; never let
+        // it hold the process open by itself (same guard as withTimeout).
+        heartbeat.unref();
+      }
 
       ctx.agents.sessions
         .sendMessage(entry.sessionId, cfg.companyId, {
