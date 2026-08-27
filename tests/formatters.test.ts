@@ -105,6 +105,16 @@ describe("formatters", () => {
     expect(escapeMrkdwn("plain text")).toBe("plain text");
   });
 
+  it("escapeMrkdwn does not double-escape already-escaped entities (idempotent)", () => {
+    expect(escapeMrkdwn("a &amp; b")).toBe("a &amp; b");
+    expect(escapeMrkdwn("&lt;!channel&gt;")).toBe("&lt;!channel&gt;");
+    expect(escapeMrkdwn(escapeMrkdwn("a & b < c > d"))).toBe("a &amp; b &lt; c &gt; d");
+  });
+
+  it("escapeMrkdwn still neutralises live control sequences after the idempotency fix", () => {
+    expect(escapeMrkdwn("<!channel> & <@U1>")).toBe("&lt;!channel&gt; &amp; &lt;@U1&gt;");
+  });
+
   it("escapes a hostile title so it can't inject a fake link label", () => {
     const hostile = "<https://evil.example|x>";
     const out = formatIssueCreated({ title: hostile }, "iss-1", BASE);

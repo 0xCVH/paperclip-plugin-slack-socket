@@ -76,4 +76,62 @@ describe("markdownToMrkdwn", () => {
     expect(result).toContain("*bold outside*");
     expect(result).toContain("**literal inside**");
   });
+
+  describe("fidelity pack", () => {
+    it("converts single-star italic *x* to Slack italic _x_", () => {
+      expect(markdownToMrkdwn("an *emphasised* word")).toBe("an _emphasised_ word");
+    });
+
+    it("leaves spaced-out stars alone — 'a * b * c' is arithmetic, not emphasis", () => {
+      expect(markdownToMrkdwn("a * b * c")).toBe("a * b * c");
+    });
+
+    it("converts bold-italic ***x*** to Slack *_x_*", () => {
+      expect(markdownToMrkdwn("***really***")).toBe("*_really_*");
+    });
+
+    it("inserts U+200B before the closing bold star when the content ends with a non-word character", () => {
+      // Slack's parser fails to close bold when * follows ), ], ., : etc,
+      // silently truncating the rest of the message.
+      expect(markdownToMrkdwn("**verified (2/4)**")).toBe("*verified (2/4)\u200B*");
+    });
+
+    it("does not insert U+200B when bold content ends with a word character", () => {
+      expect(markdownToMrkdwn("**word**")).toBe("*word*");
+    });
+
+    it("keeps converted bold out of the italic pass", () => {
+      expect(markdownToMrkdwn("**x** and __y__")).toBe("*x* and *y*");
+    });
+
+    it("restores nested inline code inside converted bold", () => {
+      expect(markdownToMrkdwn("**bold `code` end**")).toBe("*bold `code` end*");
+    });
+
+    it("strips the language tag from a genuine opening fence — Slack renders it as a literal first line", () => {
+      expect(markdownToMrkdwn("```python\nprint(1)\n```")).toBe("```\nprint(1)\n```");
+    });
+
+    it("keeps an untagged fence unchanged", () => {
+      expect(markdownToMrkdwn("```\nx\n```")).toBe("```\nx\n```");
+    });
+
+    it("does not strip content after a mid-line triple backtick, which is not an opening fence", () => {
+      expect(markdownToMrkdwn("see ```inline span``` here")).toBe("see ```inline span``` here");
+    });
+
+    it("converts a link whose URL contains balanced parentheses", () => {
+      expect(markdownToMrkdwn("[Foo](https://en.wikipedia.org/wiki/Foo_(bar))")).toBe(
+        "<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>",
+      );
+    });
+
+    it("protects a converted link's URL from the emphasis passes", () => {
+      expect(markdownToMrkdwn("[x](https://a.example/b__c__d)")).toBe("<https://a.example/b__c__d|x>");
+    });
+
+    it("strips redundant bold markers inside a header instead of nesting them", () => {
+      expect(markdownToMrkdwn("# Title **x**")).toBe("*Title x*");
+    });
+  });
 });

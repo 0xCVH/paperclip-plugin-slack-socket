@@ -7,6 +7,7 @@ import {
   extractReply,
   extractTaggedReply,
   filterRuntimeNoticeLines,
+  formatElapsed,
   HOST_WITHHELD_REPLY_NOTICE,
   resolveSessionScope,
   selectThreadMessages,
@@ -553,6 +554,117 @@ describe("chat", () => {
     });
   });
 
+  describe("reuse-time idle check", () => {
+    const hoursAgo = (h: number): string => new Date(Date.now() - h * 3_600_000).toISOString();
+
+    it("treats a stored session past sessionIdleHours as inactive at reuse time: closes it and starts fresh", async () => {
+      // Mirrors the cleanup cron's idle rule, but applied at the moment of
+      // reuse — a mention landing between idle-expiry and the next cron
+      // sweep must not resume a session the operator considers stale.
+      const { ctx, chat, stateStore } = setup({ dmSessionMode: "thread" });
+      stateStore.set(STATE_KEYS.session("D1", "100.1"), {
+        sessionId: "sess-stale", channel: "D1", threadTs: "100.1",
+        lastActivityAt: hoursAgo(25), // past the 24h default
+      });
+
+      await chat.handleMessage(dm("hello again", "100.9", "100.1"));
+
+      expect(ctx.agents.sessions.close).toHaveBeenCalledWith("sess-stale", "co-1");
+      expect(ctx.agents.sessions.create).toHaveBeenCalledTimes(1);
+      expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledWith("sess-1", "co-1", expect.anything());
+    });
+
+    it("reuses a session still inside the idle window", async () => {
+      const { ctx, chat, stateStore } = setup({ dmSessionMode: "thread" });
+      stateStore.set(STATE_KEYS.session("D1", "100.1"), {
+        sessionId: "sess-fresh", channel: "D1", threadTs: "100.1",
+        lastActivityAt: hoursAgo(23),
+      });
+
+      await chat.handleMessage(dm("hello again", "100.9", "100.1"));
+
+      expect(ctx.agents.sessions.create).not.toHaveBeenCalled();
+      expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledWith("sess-fresh", "co-1", expect.anything());
+    });
+
+    it("treats an unparsable lastActivityAt as not expired, matching the cleanup cron", async () => {
+      const { ctx, chat, stateStore } = setup({ dmSessionMode: "thread" });
+      stateStore.set(STATE_KEYS.session("D1", "100.1"), {
+        sessionId: "sess-odd", channel: "D1", threadTs: "100.1",
+        lastActivityAt: "not-a-date",
+      });
+
+      await chat.handleMessage(dm("hello again", "100.9", "100.1"));
+
+      expect(ctx.agents.sessions.create).not.toHaveBeenCalled();
+      expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledWith("sess-odd", "co-1", expect.anything());
+    });
+
+    it("still starts a fresh session when closing the stale one fails", async () => {
+      const { ctx, chat, stateStore } = setup({ dmSessionMode: "thread" });
+      (ctx.agents.sessions.close as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("gone"));
+      stateStore.set(STATE_KEYS.session("D1", "100.1"), {
+        sessionId: "sess-stale", channel: "D1", threadTs: "100.1",
+        lastActivityAt: hoursAgo(25),
+      });
+
+      await chat.handleMessage(dm("hello again", "100.9", "100.1"));
+
+      expect(ctx.agents.sessions.create).toHaveBeenCalledTimes(1);
+      expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledWith("sess-1", "co-1", expect.anything());
+    });
+  });
+
+  describe("placeholder heartbeat", () => {
+    const emitDelayedDone = (ctx: unknown, message: string, delayMs: number): void => {
+      ((ctx as { agents: { sessions: { sendMessage: unknown } } }).agents.sessions
+        .sendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce(
+        async (_sessionId: string, _companyId: string, opts: { onEvent?: (e: unknown) => void }) => {
+          setTimeout(() => {
+            opts.onEvent?.({
+              sessionId: "sess-1", runId: "run-1", seq: 1,
+              eventType: "done", stream: "system", message, payload: null,
+            });
+          }, delayMs);
+          return { runId: "run-1" };
+        },
+      );
+    };
+
+    it("rewrites the placeholder with elapsed time while the turn is still running", async () => {
+      const { ctx, gateway, chat } = setup({}, { heartbeatIntervalMs: 20 });
+      emitDelayedDone(ctx, "Late answer", 120);
+
+      await chat.handleMessage(dm("hi", "1400.1"));
+
+      const texts = gateway.updates.map((u) => u.text);
+      expect(texts.some((t) => /^_Thinking… \(\d+s\)_$/.test(t))).toBe(true);
+      // The final reply always wins; no heartbeat lands after it.
+      expect(texts.at(-1)).toBe("Late answer");
+    });
+
+    it("does not heartbeat when partial replies are streaming — content owns the placeholder", async () => {
+      const { ctx, gateway, chat } = setup({ streamPartialReplies: true }, { heartbeatIntervalMs: 20 });
+      emitDelayedDone(ctx, "Late answer", 120);
+
+      await chat.handleMessage(dm("hi", "1400.2"));
+
+      expect(gateway.updates.every((u) => !u.text.startsWith("_Thinking… ("))).toBe(true);
+    });
+  });
+
+  describe("formatElapsed", () => {
+    it("renders seconds under a minute", () => {
+      expect(formatElapsed(5_000)).toBe("5s");
+      expect(formatElapsed(59_400)).toBe("59s");
+    });
+
+    it("renders minutes with zero-padded seconds from one minute up", () => {
+      expect(formatElapsed(60_000)).toBe("1m 00s");
+      expect(formatElapsed(123_000)).toBe("2m 03s");
+    });
+  });
+
   describe("extractTaggedReply", () => {
     it("returns null when the text has no tags", () => {
       expect(extractTaggedReply("plain text, no tags")).toBeNull();
@@ -923,8 +1035,10 @@ describe("turn watchdog", () => {
     // An unclamped 0m would fire the watchdog on this very tick.
     expect(gateway.updates).toHaveLength(0);
 
+    // Still short of the clamped 1-minute floor: heartbeat rewrites of the
+    // placeholder are expected by now, but the watchdog notice is not.
     await vi.advanceTimersByTimeAsync(59_999);
-    expect(gateway.updates).toHaveLength(0); // still short of the clamped 1-minute floor
+    expect(gateway.updates.every((u) => !u.text.includes("No response from the agent"))).toBe(true);
 
     await vi.advanceTimersByTimeAsync(1);
     await turn;

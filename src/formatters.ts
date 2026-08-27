@@ -22,9 +22,20 @@ function str(payload: Payload, key: string): string {
  * didn't author ourselves. Must NOT be applied to our own literal markup
  * (section/context text templates, emoji codes, link syntax we construct).
  * See https://api.slack.com/reference/surfaces/formatting#escaping
+ *
+ * Idempotent: already-escaped entities are unescaped FIRST, in a single
+ * regex pass, then everything is re-escaped — so `&amp;` stays `&amp;`
+ * instead of double-escaping to `&amp;amp;` (which Slack renders as the
+ * literal text "&amp;"). The unescape must be one pass, not sequential
+ * replaces: a sequential decode re-scans its own output, letting
+ * "&amp;lt;" decode twice into a live "<". The security property is
+ * unchanged — the output still contains no unescaped `&`, `<`, or `>`.
  */
 export function escapeMrkdwn(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const unescaped = s.replace(/&(amp|lt|gt);/g, (_m, name: string) =>
+    name === "amp" ? "&" : name === "lt" ? "<" : ">",
+  );
+  return unescaped.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 export function formatIssueCreated(payload: Payload, issueId: string, baseUrl: string): SlackContent {
