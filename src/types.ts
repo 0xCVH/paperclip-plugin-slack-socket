@@ -221,7 +221,14 @@ export interface SlackGateway {
    * the call rejects with `missing_scope`, and callers should treat that as
    * "no history available" and proceed rather than fail the turn.
    */
-  fetchThreadReplies(channel: string, threadTs: string, limit: number): Promise<ThreadMessage[]>;
+  /**
+   * `oldest`, when given, is passed to conversations.replies so Slack only
+   * returns messages at/after that ts — an efficiency hint for delta
+   * fetches, NOT a correctness boundary: callers filter by their own
+   * watermark regardless, because Slack's inclusivity semantics at the
+   * boundary are not relied upon.
+   */
+  fetchThreadReplies(channel: string, threadTs: string, limit: number, oldest?: string): Promise<ThreadMessage[]>;
   onMessage(handler: (msg: InboundMessage) => Promise<void>): void;
   onMention(handler: (msg: InboundMessage) => Promise<void>): void;
   onReaction(handler: (reaction: InboundReaction) => Promise<void>): void;

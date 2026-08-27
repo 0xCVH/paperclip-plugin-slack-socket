@@ -127,7 +127,7 @@ export class FakeGateway implements SlackGateway {
   /** Transcript `fetchThreadReplies` returns; set per test. */
   threadReplies: ThreadMessage[] = [];
   /** Every fetchThreadReplies call, so a test can assert what was requested. */
-  threadFetches: Array<{ channel: string; threadTs: string; limit: number }> = [];
+  threadFetches: Array<{ channel: string; threadTs: string; limit: number; oldest?: string }> = [];
 
   private botId: string | undefined = "UBOT";
   private tsCounter = 0;
@@ -168,8 +168,8 @@ export class FakeGateway implements SlackGateway {
     return `name-${userId}`;
   }
 
-  async fetchThreadReplies(channel: string, threadTs: string, limit: number): Promise<ThreadMessage[]> {
-    this.threadFetches.push({ channel, threadTs, limit });
+  async fetchThreadReplies(channel: string, threadTs: string, limit: number, oldest?: string): Promise<ThreadMessage[]> {
+    this.threadFetches.push({ channel, threadTs, limit, oldest });
     return this.threadReplies;
   }
 

@@ -120,13 +120,13 @@ export function createGatewayProxy(
       return gateway.getUserDisplayName(userId);
     },
 
-    async fetchThreadReplies(channel: string, threadTs: string, limit: number) {
+    async fetchThreadReplies(channel: string, threadTs: string, limit: number, oldest?: string) {
       const gateway = getGateway();
       if (!gateway) {
         warnUnconfigured("fetchThreadReplies");
         return [];
       }
-      return gateway.fetchThreadReplies(channel, threadTs, limit);
+      return gateway.fetchThreadReplies(channel, threadTs, limit, oldest);
     },
 
     onMessage(handler: (msg: InboundMessage) => Promise<void>) {
