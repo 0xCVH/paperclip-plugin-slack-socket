@@ -283,14 +283,17 @@ export class BoltGateway implements SlackGateway {
    * existing fallback label for an unresolvable author covers it, so no
    * extra field was added here for it.
    */
-  async fetchThreadReplies(channel: string, threadTs: string, limit: number): Promise<ThreadMessage[]> {
+  async fetchThreadReplies(channel: string, threadTs: string, limit: number, oldest?: string): Promise<ThreadMessage[]> {
     const collected: ThreadMessage[] = [];
     let cursor: string | undefined;
 
     for (let page = 0; page < THREAD_REPLIES_MAX_PAGES; page++) {
-      const res = await this.app.client.conversations.replies(
-        cursor ? { channel, ts: threadTs, limit, cursor } : { channel, ts: threadTs, limit },
-      );
+      // `oldest` rides on every page, cursor pages included — it is an
+      // efficiency hint (see the SlackGateway declaration), and callers
+      // re-filter by their own watermark, so boundary inclusivity here is
+      // deliberately not load-bearing.
+      const base = oldest === undefined ? { channel, ts: threadTs, limit } : { channel, ts: threadTs, limit, oldest };
+      const res = await this.app.client.conversations.replies(cursor ? { ...base, cursor } : base);
       const messages = res.messages;
       if (Array.isArray(messages)) {
         for (const m of messages as Array<{ user?: string; text?: string; ts?: string }>) {

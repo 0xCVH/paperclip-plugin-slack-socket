@@ -27,6 +27,7 @@ import {
   THREAD_FETCH_PAGE_SIZE,
 } from "../src/constants.js";
 import type { InboundMessage, OutboundMessage, ThreadMessage } from "../src/types.js";
+import { THREAD_DELTA_FRAMING } from "../src/thread-transcript.js";
 import { FakeGateway, makeCtx, TEST_CONFIG } from "./helpers.js";
 
 function setup(configOverrides = {}, depsOverrides: Record<string, unknown> = {}) {
@@ -2613,7 +2614,7 @@ describe("thread history seeding", () => {
     expect(second).toContain(THREAD_CONTEXT_OPEN_TAG);
   });
 
-  it("does not re-seed the second turn in the same thread", async () => {
+  it("does not re-seed the second turn in the same thread — it delta-checks from the watermark instead", async () => {
     const { ctx, chat, fetchThreadReplies } = setupSeeding();
     fetchThreadReplies.mockResolvedValue(alertThread("1000.2"));
 
@@ -2623,8 +2624,11 @@ describe("thread history seeding", () => {
     await chat.handleMention(mentionInThread("second", "1000.3", "1000.1"));
 
     // The session already holds the history; re-sending it every turn would
-    // grow the prompt without bound for no gain.
-    expect(fetchThreadReplies).toHaveBeenCalledTimes(1);
+    // grow the prompt without bound for no gain. The second turn only asks
+    // Slack what the thread gained past the watermark the seed recorded —
+    // and here that is nothing, so the prompt stays plain.
+    expect(fetchThreadReplies).toHaveBeenCalledTimes(2);
+    expect(fetchThreadReplies).toHaveBeenLastCalledWith("C-ALERT", "1000.1", THREAD_FETCH_PAGE_SIZE, "1000.2");
     expect(ctx.agents.sessions.create).toHaveBeenCalledTimes(1);
     const second = (ctx.agents.sessions.sendMessage as any).mock.calls[1][2].prompt as string;
     expect(second).toBe(buildChatPrompt(TEST_CONFIG.chatPromptPreamble, "second"));
@@ -2963,5 +2967,329 @@ describe("thread history seeding", () => {
     expect(otherCalls).toHaveLength(2);
     const secondPrompt = (ctx.agents.sessions.sendMessage as any).mock.calls[1][2].prompt as string;
     expect(secondPrompt).toContain("[Christopher Von Hessert (U-OTHER)] seen this one too");
+  });
+});
+
+describe("thread delta hydration", () => {
+  function setupDelta(configOverrides = {}, depsOverrides: Record<string, unknown> = {}) {
+    const bundle = makeCtx(configOverrides);
+    const gateway = new FakeGateway();
+    const chat = createChat({
+      ctx: bundle.ctx,
+      gateway,
+      getConfig: async () => ({ ...TEST_CONFIG, ...configOverrides }),
+      updateIntervalMs: 0,
+      ...depsOverrides,
+    });
+    const fetchThreadReplies = vi.fn(async (): Promise<ThreadMessage[]> => []);
+    gateway.fetchThreadReplies = fetchThreadReplies;
+    return { ...bundle, gateway, chat, fetchThreadReplies };
+  }
+
+  const threadMessage = (user: string, text: string, ts: string, isBot = false): ThreadMessage => ({
+    user, text, ts, isBot,
+  });
+
+  const sessionKey = STATE_KEYS.session("C-ALERT", "1000.1");
+  const liveEntry = (overrides: Record<string, unknown> = {}) => ({
+    sessionId: "sess-live",
+    channel: "C-ALERT",
+    threadTs: "1000.1",
+    scope: "thread",
+    lastActivityAt: new Date().toISOString(),
+    seedPending: false,
+    seededUpTo: "1000.5",
+    ...overrides,
+  });
+
+  const mentionInThread = (text: string, ts: string): InboundMessage => ({
+    channel: "C-ALERT", channelType: "channel", user: "U-HUMAN",
+    text: `<@UBOT> ${text}`, ts, threadTs: "1000.1",
+  });
+
+  const grownThread = (triggerTs: string): ThreadMessage[] => [
+    threadMessage("UBOT", "Action needed: claimable subdomain", "1000.1", true),
+    threadMessage("U-OLD", "before the watermark", "1000.4"),
+    threadMessage("U-NEW", "fresh info after the watermark", "1000.9"),
+    threadMessage("UBOT", "the bot's own earlier reply", "1000.95", true),
+    threadMessage("U-NEW2", "second fresh message", "1001.0"),
+    threadMessage("U-HUMAN", "<@UBOT> and now?", triggerTs),
+  ];
+
+  it("delivers only messages newer than the watermark, excluding the bot's own and the trigger", async () => {
+    const { ctx, chat, stateStore, fetchThreadReplies } = setupDelta();
+    stateStore.set(sessionKey, liveEntry());
+    fetchThreadReplies.mockResolvedValue(grownThread("1001.5"));
+
+    await chat.handleMention(mentionInThread("and now?", "1001.5"));
+
+    expect(fetchThreadReplies).toHaveBeenCalledWith("C-ALERT", "1000.1", THREAD_FETCH_PAGE_SIZE, "1000.5");
+    expect(ctx.agents.sessions.create).not.toHaveBeenCalled();
+    const prompt = (ctx.agents.sessions.sendMessage as any).mock.calls[0][2].prompt as string;
+    expect(prompt).toContain(THREAD_DELTA_FRAMING);
+    expect(prompt).toContain("fresh info after the watermark");
+    expect(prompt).toContain("second fresh message");
+    expect(prompt).toContain("(U-NEW)"); // speaker labels carry their id, same as seeds
+    expect(prompt).not.toContain("before the watermark");
+    expect(prompt).not.toContain("the bot's own earlier reply");
+    // The trigger lands after the fence as the labelled request, never inside it.
+    const fenceCloseIdx = prompt.indexOf(THREAD_CONTEXT_CLOSE_TAG);
+    expect(fenceCloseIdx).toBeGreaterThan(-1);
+    expect(prompt.indexOf("Slack message:\nand now?")).toBeGreaterThan(fenceCloseIdx);
+  });
+
+  it("advances the watermark past the delta and the trigger after a delivered turn", async () => {
+    const { chat, stateStore, fetchThreadReplies } = setupDelta();
+    stateStore.set(sessionKey, liveEntry());
+    fetchThreadReplies.mockResolvedValue(grownThread("1001.5"));
+
+    await chat.handleMention(mentionInThread("and now?", "1001.5"));
+
+    expect((stateStore.get(sessionKey) as { seededUpTo?: string }).seededUpTo).toBe("1001.5");
+  });
+
+  it("sends a plain prompt and still advances the watermark when nothing new arrived", async () => {
+    const { ctx, chat, stateStore, fetchThreadReplies } = setupDelta();
+    stateStore.set(sessionKey, liveEntry());
+    fetchThreadReplies.mockResolvedValue([
+      threadMessage("UBOT", "Action needed", "1000.1", true),
+      threadMessage("U-OLD", "before the watermark", "1000.4"),
+    ]);
+
+    await chat.handleMention(mentionInThread("and now?", "1001.5"));
+
+    const prompt = (ctx.agents.sessions.sendMessage as any).mock.calls[0][2].prompt as string;
+    expect(prompt).not.toContain(THREAD_CONTEXT_OPEN_TAG);
+    expect((stateStore.get(sessionKey) as { seededUpTo?: string }).seededUpTo).toBe("1001.5");
+  });
+
+  it("skips the fetch for a legacy session without a watermark, then initialises it to the trigger", async () => {
+    const { chat, stateStore, fetchThreadReplies } = setupDelta();
+    stateStore.set(sessionKey, liveEntry({ seededUpTo: undefined }));
+
+    await chat.handleMention(mentionInThread("and now?", "1001.5"));
+
+    expect(fetchThreadReplies).not.toHaveBeenCalled();
+    expect((stateStore.get(sessionKey) as { seededUpTo?: string }).seededUpTo).toBe("1001.5");
+  });
+
+  it("proceeds without a delta and keeps the watermark when the fetch fails", async () => {
+    const { gateway, chat, stateStore, fetchThreadReplies } = setupDelta();
+    stateStore.set(sessionKey, liveEntry());
+    fetchThreadReplies.mockRejectedValue(new Error("rate limited"));
+
+    await chat.handleMention(mentionInThread("and now?", "1001.5"));
+
+    expect(gateway.updates.at(-1)!.text).toBe("Hello there!"); // the turn still ran
+    // The gap between 1000.5 and now was NOT delivered, so it must stay
+    // fetchable — advancing to the trigger here would lose it forever.
+    expect((stateStore.get(sessionKey) as { seededUpTo?: string }).seededUpTo).toBe("1000.5");
+  });
+
+  it("does not fetch a delta when seedThreadHistory is off", async () => {
+    const { chat, stateStore, fetchThreadReplies } = setupDelta({ seedThreadHistory: false });
+    stateStore.set(sessionKey, liveEntry());
+
+    await chat.handleMention(mentionInThread("and now?", "1001.5"));
+
+    expect(fetchThreadReplies).not.toHaveBeenCalled();
+  });
+
+  it("records the watermark when the initial seed is delivered", async () => {
+    const { chat, stateStore, fetchThreadReplies } = setupDelta();
+    fetchThreadReplies.mockResolvedValue([
+      threadMessage("UBOT", "Action needed", "1000.1", true),
+      threadMessage("U-OTHER", "confirmed", "1000.15"),
+      threadMessage("U-HUMAN", "<@UBOT> raise a ticket", "1000.2"),
+    ]);
+
+    await chat.handleMention(mentionInThread("raise a ticket", "1000.2"));
+
+    const entry = stateStore.get(sessionKey) as { seedPending?: boolean; seededUpTo?: string };
+    expect(entry.seedPending).toBe(false);
+    expect(entry.seededUpTo).toBe("1000.2");
+  });
+
+  it("keeps seedPending and the watermark untouched when the send itself is rejected", async () => {
+    const { ctx, chat, stateStore, fetchThreadReplies } = setupDelta();
+    fetchThreadReplies.mockResolvedValue([
+      threadMessage("UBOT", "Action needed", "1000.1", true),
+      threadMessage("U-HUMAN", "<@UBOT> raise a ticket", "1000.2"),
+    ]);
+    (ctx.agents.sessions.sendMessage as any).mockRejectedValueOnce(new Error("host down"));
+
+    await chat.handleMention(mentionInThread("raise a ticket", "1000.2"));
+
+    // The prompt never reached the agent, so the seed was NOT delivered:
+    // it must stay pending for the next mention to retry.
+    const entry = stateStore.get(sessionKey) as { seedPending?: boolean; seededUpTo?: string };
+    expect(entry.seedPending).toBe(true);
+    expect(entry.seededUpTo).toBeUndefined();
+  });
+});
+
+describe("delta hydration hardening (review findings)", () => {
+  function setupDelta(configOverrides = {}, depsOverrides: Record<string, unknown> = {}) {
+    const bundle = makeCtx(configOverrides);
+    const gateway = new FakeGateway();
+    const chat = createChat({
+      ctx: bundle.ctx,
+      gateway,
+      getConfig: async () => ({ ...TEST_CONFIG, ...configOverrides }),
+      updateIntervalMs: 0,
+      ...depsOverrides,
+    });
+    const fetchThreadReplies = vi.fn(async (): Promise<ThreadMessage[]> => []);
+    gateway.fetchThreadReplies = fetchThreadReplies;
+    return { ...bundle, gateway, chat, fetchThreadReplies };
+  }
+
+  const threadMessage = (user: string, text: string, ts: string, isBot = false): ThreadMessage => ({
+    user, text, ts, isBot,
+  });
+  const sessionKey = STATE_KEYS.session("C-ALERT", "1000.1");
+  const liveEntry = (overrides: Record<string, unknown> = {}) => ({
+    sessionId: "sess-live", channel: "C-ALERT", threadTs: "1000.1", scope: "thread",
+    lastActivityAt: new Date().toISOString(), seedPending: false, seededUpTo: "1000.5",
+    ...overrides,
+  });
+  const mentionInThread = (text: string, ts: string): InboundMessage => ({
+    channel: "C-ALERT", channelType: "channel", user: "U-HUMAN",
+    text: `<@UBOT> ${text}`, ts, threadTs: "1000.1",
+  });
+
+  it("does not advance the watermark when the turn times out with the send still pending", async () => {
+    // The watchdog releasing the turn proves nothing about delivery: if the
+    // host never accepted the send, advancing would permanently skip the
+    // delta the agent never saw.
+    const { ctx, chat, stateStore, fetchThreadReplies } = setupDelta({}, { turnTimeoutMs: 10 });
+    stateStore.set(sessionKey, liveEntry());
+    fetchThreadReplies.mockResolvedValue([threadMessage("U-NEW", "unseen info", "1000.9")]);
+    (ctx.agents.sessions.sendMessage as any).mockImplementationOnce(
+      () => new Promise(() => {}), // never settles, no events
+    );
+
+    await chat.handleMention(mentionInThread("and now?", "1001.5"));
+
+    expect((stateStore.get(sessionKey) as { seededUpTo?: string }).seededUpTo).toBe("1000.5");
+  });
+
+  it("still counts a turn as delivered when the send rejects only after the reply arrived", async () => {
+    // A transport-level rejection landing after the done event must not
+    // retro-mark a completed turn as undelivered.
+    const { ctx, chat, stateStore, fetchThreadReplies } = setupDelta();
+    stateStore.set(sessionKey, liveEntry());
+    fetchThreadReplies.mockResolvedValue([threadMessage("U-NEW", "unseen info", "1000.9")]);
+    (ctx.agents.sessions.sendMessage as any).mockImplementationOnce(
+      (_s: string, _c: string, opts: { onEvent?: (e: unknown) => void }) => {
+        opts.onEvent?.({
+          sessionId: "sess-live", runId: "run-1", seq: 1,
+          eventType: "done", stream: null, message: "All good.", payload: null,
+        });
+        return new Promise((_res, rej) => setTimeout(() => rej(new Error("late transport close")), 15));
+      },
+    );
+
+    await chat.handleMention(mentionInThread("and now?", "1001.5"));
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect((stateStore.get(sessionKey) as { seededUpTo?: string }).seededUpTo).toBe("1001.5");
+  });
+
+  it("delivers the newest replies when the oldest unseen one blows the budget", async () => {
+    // The seed's parent-privilege must not apply to deltas: candidates[0]
+    // is just the oldest new message, not the thread root.
+    const { ctx, chat, stateStore, fetchThreadReplies } = setupDelta();
+    stateStore.set(sessionKey, liveEntry());
+    // Oldest candidate truncates to ~4k under the per-message cap; the 9k
+    // newest must still be delivered (under seed parent-semantics it was
+    // dropped: 4k + 9k > the 12k budget → break → only the oldest kept).
+    fetchThreadReplies.mockResolvedValue([
+      threadMessage("U-BIG", `huge old ${"x".repeat(11_500)}`, "1000.9"),
+      threadMessage("U-NEW", `newest-and-most-relevant ${"z".repeat(9_000)}`, "1001.0"),
+    ]);
+
+    await chat.handleMention(mentionInThread("and now?", "1001.5"));
+
+    const prompt = (ctx.agents.sessions.sendMessage as any).mock.calls[0][2].prompt as string;
+    expect(prompt).toContain("newest-and-most-relevant");
+  });
+
+  it("delivers a lone oversized delta message truncated with a visible marker, not dropped", async () => {
+    const { ctx, chat, stateStore, fetchThreadReplies } = setupDelta();
+    stateStore.set(sessionKey, liveEntry());
+    fetchThreadReplies.mockResolvedValue([
+      threadMessage("U-BIG", `start-marker ${"y".repeat(20_000)}`, "1000.9"),
+    ]);
+
+    await chat.handleMention(mentionInThread("and now?", "1001.5"));
+
+    const prompt = (ctx.agents.sessions.sendMessage as any).mock.calls[0][2].prompt as string;
+    expect(prompt).toContain("start-marker");
+    expect(prompt).toContain("more characters omitted");
+  });
+
+  it("only one of two concurrent mentions in a thread fetches the delta", async () => {
+    const { ctx, chat, stateStore, fetchThreadReplies } = setupDelta();
+    stateStore.set(sessionKey, liveEntry());
+    let releaseFetch!: (v: ThreadMessage[]) => void;
+    fetchThreadReplies.mockImplementationOnce(
+      () => new Promise<ThreadMessage[]>((res) => { releaseFetch = res; }),
+    );
+    // Default mock (helpers.ts) resolves sendMessage turns immediately.
+    void ctx;
+
+    const first = chat.handleMention(mentionInThread("first", "1001.5"));
+    await new Promise((r) => setTimeout(r, 5)); // let the first turn claim + start fetching
+    const second = chat.handleMention(mentionInThread("second", "1001.6"));
+    await new Promise((r) => setTimeout(r, 5));
+    releaseFetch([threadMessage("U-NEW", "unseen info", "1000.9")]);
+    await Promise.all([first, second]);
+
+    expect(fetchThreadReplies).toHaveBeenCalledTimes(1);
+  });
+
+  it("heals an unparsable persisted watermark by advancing to the trigger", async () => {
+    const { chat, stateStore, fetchThreadReplies } = setupDelta();
+    stateStore.set(sessionKey, liveEntry({ seededUpTo: "corrupt-value" }));
+    fetchThreadReplies.mockResolvedValue([threadMessage("U-NEW", "unseen info", "1000.9")]);
+
+    await chat.handleMention(mentionInThread("and now?", "1001.5"));
+
+    expect((stateStore.get(sessionKey) as { seededUpTo?: string }).seededUpTo).toBe("1001.5");
+  });
+
+  it("does not stamp a replaced session with the old turn's seed bookkeeping", async () => {
+    // Reset race: while a slow turn is finishing, the operator resets and a
+    // new mention creates a FRESH session under the same key. The old
+    // turn's post-delivery write must not mark the new session seeded with
+    // the old watermark — that would leave it permanently unseeded.
+    const { ctx, chat, stateStore, fetchThreadReplies } = setupDelta();
+    fetchThreadReplies.mockResolvedValue([threadMessage("U-A", "history", "1000.05")]);
+    let releaseDone!: () => void;
+    (ctx.agents.sessions.sendMessage as any).mockImplementationOnce(
+      (_s: string, _c: string, opts: { onEvent?: (e: unknown) => void }) =>
+        new Promise((res) => {
+          releaseDone = () => {
+            opts.onEvent?.({
+              sessionId: "sess-1", runId: "run-1", seq: 1,
+              eventType: "done", stream: null, message: "Slow answer.", payload: null,
+            });
+            res({ runId: "run-1" });
+          };
+        }),
+    );
+
+    const slowTurn = chat.handleMention(mentionInThread("seed me", "1000.2"));
+    await new Promise((r) => setTimeout(r, 10)); // session created, seed fetched, send pending
+    // Simulate reset + new mention elsewhere: the key now holds a DIFFERENT session.
+    stateStore.set(sessionKey, liveEntry({ sessionId: "sess-replacement", seedPending: true, seededUpTo: undefined }));
+    releaseDone();
+    await slowTurn;
+
+    const entry = stateStore.get(sessionKey) as { sessionId: string; seedPending?: boolean; seededUpTo?: string };
+    expect(entry.sessionId).toBe("sess-replacement");
+    expect(entry.seedPending).toBe(true);
+    expect(entry.seededUpTo).toBeUndefined();
   });
 });

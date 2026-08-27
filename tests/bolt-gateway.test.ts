@@ -145,6 +145,40 @@ describe("BoltGateway (against a mocked @slack/bolt App)", () => {
     await expect(gateway.probe()).resolves.toBe(false);
   });
 
+  it("fetchThreadReplies forwards `oldest` to conversations.replies on every page", async () => {
+    const gateway = await makeGateway();
+    await gateway.start();
+    const replies = appInstances[0]!.client.conversations.replies;
+    replies.mockResolvedValueOnce({
+      ok: true,
+      messages: [{ user: "U1", text: "one", ts: "5.1" }],
+      has_more: true,
+      response_metadata: { next_cursor: "cur-2" },
+    });
+    replies.mockResolvedValueOnce({
+      ok: true,
+      messages: [{ user: "U1", text: "two", ts: "5.2" }],
+    });
+
+    await gateway.fetchThreadReplies("C1", "1.1", 50, "1700.5");
+
+    expect(replies).toHaveBeenNthCalledWith(1, { channel: "C1", ts: "1.1", limit: 50, oldest: "1700.5" });
+    expect(replies).toHaveBeenNthCalledWith(2, {
+      channel: "C1", ts: "1.1", limit: 50, oldest: "1700.5", cursor: "cur-2",
+    });
+  });
+
+  it("fetchThreadReplies omits `oldest` from the API call when not given", async () => {
+    const gateway = await makeGateway();
+    await gateway.start();
+    const replies = appInstances[0]!.client.conversations.replies;
+    replies.mockResolvedValueOnce({ ok: true, messages: [] });
+
+    await gateway.fetchThreadReplies("C1", "1.1", 50);
+
+    expect(replies).toHaveBeenCalledWith({ channel: "C1", ts: "1.1", limit: 50 });
+  });
+
   it("fetchThreadReplies maps a conversations.replies payload to ThreadMessage[]", async () => {
     const gateway = await makeGateway();
     await gateway.start(); // captures user_id "UBOT" from auth.test
