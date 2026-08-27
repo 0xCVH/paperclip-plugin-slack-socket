@@ -974,12 +974,37 @@ export function createChat(deps: ChatDeps): Chat {
 
     const promise = (async (): Promise<SessionEntry> => {
       const existing = (await ctx.state.get(stateScope(key))) as SessionEntry | null;
-      if (existing) {
+      // Reuse-time idle check, mirroring the cleanup cron's rule exactly
+      // (see cleanup.ts): an entry idle past sessionIdleHours is one the
+      // operator considers closed — the cron just hasn't swept it yet. A
+      // mention landing in that window must start fresh (and re-seed the
+      // thread), not silently resume a conversation whose context the
+      // person believes has ended. Date.parse of an unparsable timestamp
+      // is NaN, and NaN comparisons are false, so a malformed entry counts
+      // as NOT expired — the same conservative reading the cron applies.
+      const expired =
+        existing !== null &&
+        Date.now() - Date.parse(existing.lastActivityAt) > cfg.sessionIdleHours * 3_600_000;
+      if (existing && !expired) {
         // Spread preserves seedPending: a session created but not yet
         // seeded (a failed first turn) stays pending until a turn delivers.
         const updated = { ...existing, lastActivityAt: new Date().toISOString() };
         await ctx.state.set(stateScope(key), updated);
         return updated;
+      }
+      if (existing) {
+        // A failed close still falls through to create: a stale host-side
+        // session is strictly better than a wedged conversation — the same
+        // trade resetSession makes.
+        try {
+          await ctx.agents.sessions.close(existing.sessionId, cfg.companyId);
+        } catch (err) {
+          ctx.logger.warn("Failed to close an idle session at reuse time; starting fresh anyway", {
+            err: errString(err),
+            sessionId: existing.sessionId,
+          });
+        }
+        await ctx.metrics.write("slack.sessions.expired_at_reuse", 1).catch(() => {});
       }
       const session = await ctx.agents.sessions.create(cfg.defaultAgentId, cfg.companyId, {
         reason: "slack-thread",

@@ -554,6 +554,67 @@ describe("chat", () => {
     });
   });
 
+  describe("reuse-time idle check", () => {
+    const hoursAgo = (h: number): string => new Date(Date.now() - h * 3_600_000).toISOString();
+
+    it("treats a stored session past sessionIdleHours as inactive at reuse time: closes it and starts fresh", async () => {
+      // Mirrors the cleanup cron's idle rule, but applied at the moment of
+      // reuse — a mention landing between idle-expiry and the next cron
+      // sweep must not resume a session the operator considers stale.
+      const { ctx, chat, stateStore } = setup({ dmSessionMode: "thread" });
+      stateStore.set(STATE_KEYS.session("D1", "100.1"), {
+        sessionId: "sess-stale", channel: "D1", threadTs: "100.1",
+        lastActivityAt: hoursAgo(25), // past the 24h default
+      });
+
+      await chat.handleMessage(dm("hello again", "100.9", "100.1"));
+
+      expect(ctx.agents.sessions.close).toHaveBeenCalledWith("sess-stale", "co-1");
+      expect(ctx.agents.sessions.create).toHaveBeenCalledTimes(1);
+      expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledWith("sess-1", "co-1", expect.anything());
+    });
+
+    it("reuses a session still inside the idle window", async () => {
+      const { ctx, chat, stateStore } = setup({ dmSessionMode: "thread" });
+      stateStore.set(STATE_KEYS.session("D1", "100.1"), {
+        sessionId: "sess-fresh", channel: "D1", threadTs: "100.1",
+        lastActivityAt: hoursAgo(23),
+      });
+
+      await chat.handleMessage(dm("hello again", "100.9", "100.1"));
+
+      expect(ctx.agents.sessions.create).not.toHaveBeenCalled();
+      expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledWith("sess-fresh", "co-1", expect.anything());
+    });
+
+    it("treats an unparsable lastActivityAt as not expired, matching the cleanup cron", async () => {
+      const { ctx, chat, stateStore } = setup({ dmSessionMode: "thread" });
+      stateStore.set(STATE_KEYS.session("D1", "100.1"), {
+        sessionId: "sess-odd", channel: "D1", threadTs: "100.1",
+        lastActivityAt: "not-a-date",
+      });
+
+      await chat.handleMessage(dm("hello again", "100.9", "100.1"));
+
+      expect(ctx.agents.sessions.create).not.toHaveBeenCalled();
+      expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledWith("sess-odd", "co-1", expect.anything());
+    });
+
+    it("still starts a fresh session when closing the stale one fails", async () => {
+      const { ctx, chat, stateStore } = setup({ dmSessionMode: "thread" });
+      (ctx.agents.sessions.close as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("gone"));
+      stateStore.set(STATE_KEYS.session("D1", "100.1"), {
+        sessionId: "sess-stale", channel: "D1", threadTs: "100.1",
+        lastActivityAt: hoursAgo(25),
+      });
+
+      await chat.handleMessage(dm("hello again", "100.9", "100.1"));
+
+      expect(ctx.agents.sessions.create).toHaveBeenCalledTimes(1);
+      expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledWith("sess-1", "co-1", expect.anything());
+    });
+  });
+
   describe("placeholder heartbeat", () => {
     const emitDelayedDone = (ctx: unknown, message: string, delayMs: number): void => {
       ((ctx as { agents: { sessions: { sendMessage: unknown } } }).agents.sessions
