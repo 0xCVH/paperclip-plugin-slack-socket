@@ -18,6 +18,7 @@ import {
 } from "./reply-extraction.js";
 import {
   buildThreadContext,
+  selectDeltaMessages,
   selectThreadMessages,
   THREAD_DELTA_FRAMING,
   type ThreadContextEntry,
@@ -373,6 +374,13 @@ export function createChat(deps: ChatDeps): Chat {
   // true, so a later turn still retries.
   const seedInFlight = new Set<string>();
 
+  // Same shape for delta turns: two concurrent mentions in one thread would
+  // otherwise both read the same watermark and both deliver the identical
+  // delta block into the one shared session. The loser simply skips the
+  // fetch — its own trigger reaches the agent as its prompt regardless, and
+  // whatever it did not fold into the watermark is re-fetched next turn.
+  const deltaInFlight = new Set<string>();
+
   function stripMention(text: string): string {
     const botId = gateway.botUserId();
     return (botId ? text.replaceAll(`<@${botId}>`, "") : text).trim();
@@ -519,11 +527,18 @@ export function createChat(deps: ChatDeps): Chat {
 
   // Numeric max of two Slack ts strings, either possibly undefined. Slack
   // ts values are decimal strings; comparing them as numbers is what the
-  // dedup/staleness code does too.
+  // dedup/staleness code does too. An UNPARSABLE value loses to any
+  // parsable one, deliberately: the persisted watermark comes back from a
+  // host-backed store this plugin does not solely control, and a corrupt
+  // value must be healed by the next real ts, not returned as the max
+  // forever (a NaN comparison is false both ways, which would otherwise
+  // make the corrupt side sticky).
   function latestTs(a: string | undefined, b: string | undefined): string | undefined {
-    if (a === undefined) return b;
-    if (b === undefined) return a;
-    return Number(b) > Number(a) ? b : a;
+    const aNum = a === undefined ? NaN : Number(a);
+    const bNum = b === undefined ? NaN : Number(b);
+    if (Number.isNaN(aNum)) return b;
+    if (Number.isNaN(bNum)) return a;
+    return bNum > aNum ? b : a;
   }
 
   // Durably records that this session's thread history has been delivered,
@@ -531,10 +546,13 @@ export function createChat(deps: ChatDeps): Chat {
   // transcript covered (see SessionEntry.seededUpTo). Re-reads the current
   // entry before writing so a concurrent lastActivityAt update isn't
   // clobbered — the seedPending flip (true -> false) is idempotent and the
-  // watermark merge is monotonic.
-  async function markSeedDelivered(key: string, seededUpTo: string | undefined): Promise<void> {
+  // watermark merge is monotonic. `sessionId` guards identity: the key can
+  // hold a DIFFERENT session by the time this write lands (a reset plus a
+  // new mention during a slow turn), and stamping the replacement with the
+  // old turn's bookkeeping would leave it permanently unseeded.
+  async function markSeedDelivered(key: string, sessionId: string, seededUpTo: string | undefined): Promise<void> {
     const current = (await ctx.state.get(stateScope(key))) as SessionEntry | null;
-    if (current && current.seedPending) {
+    if (current && current.sessionId === sessionId && current.seedPending) {
       await ctx.state.set(stateScope(key), {
         ...current,
         seedPending: false,
@@ -545,11 +563,12 @@ export function createChat(deps: ChatDeps): Chat {
 
   // Monotonically advances the delta watermark (see SessionEntry.seededUpTo):
   // max-merge on a re-read entry, so two overlapping turns can only move it
-  // forward, never back, whatever order their writes land in.
-  async function advanceWatermark(key: string, ts: string | undefined): Promise<void> {
+  // forward, never back, whatever order their writes land in. Same
+  // session-identity guard as markSeedDelivered, same reason.
+  async function advanceWatermark(key: string, sessionId: string, ts: string | undefined): Promise<void> {
     if (ts === undefined) return;
     const current = (await ctx.state.get(stateScope(key))) as SessionEntry | null;
-    if (!current) return;
+    if (!current || current.sessionId !== sessionId) return;
     const merged = latestTs(current.seededUpTo, ts);
     if (merged !== current.seededUpTo) {
       await ctx.state.set(stateScope(key), { ...current, seededUpTo: merged });
@@ -861,15 +880,24 @@ export function createChat(deps: ChatDeps): Chat {
           );
           if (candidates.length === 0) return { block: "", maxTs: undefined };
           const maxTs = candidates.reduce<string | undefined>((acc, m) => latestTs(acc, m.ts), undefined);
-          const { kept, omitted } = selectThreadMessages(
+          // Delta-specific selection — no message here has the seed
+          // parent's privilege, and a lone oversized reply must arrive
+          // truncated rather than starve the budget (see
+          // selectDeltaMessages). Omitted candidates are always the oldest,
+          // so the notice renders before everything kept.
+          const { kept, omitted } = selectDeltaMessages(
             candidates,
-            new Set<string>(),
             THREAD_CONTEXT_MAX_CHARS,
             THREAD_CONTEXT_MAX_MESSAGES,
           );
           if (kept.length === 0) return { block: "", maxTs };
           return {
-            block: buildThreadContext(await resolveThreadEntries(kept), omitted, THREAD_DELTA_FRAMING),
+            block: buildThreadContext(
+              await resolveThreadEntries(kept),
+              omitted,
+              THREAD_DELTA_FRAMING,
+              "before-all",
+            ),
             maxTs,
           };
         })(),
@@ -928,6 +956,12 @@ export function createChat(deps: ChatDeps): Chat {
     // the placeholder, and anything arriving afterwards must leave it alone.
     let settled = false;
     let delivered = true;
+    // Whether the sendMessage RPC itself has settled. The watchdog firing
+    // proves nothing about delivery: if the turn times out while the send
+    // is STILL PENDING, the host may never have accepted the prompt, so it
+    // must not be counted as delivered — the conservative direction, whose
+    // only cost is a retried seed/delta the agent may already have.
+    let sendSettled = false;
     let turnTimer: ReturnType<typeof setTimeout> | null = null;
     // Heartbeat: while the turn runs, the "_Thinking…_" placeholder is
     // rewritten with elapsed time ("_Thinking… (2m 03s)_") every
@@ -1026,6 +1060,7 @@ export function createChat(deps: ChatDeps): Chat {
         turnTimer = null;
         if (settled) return;
         settled = true;
+        if (!sendSettled) delivered = false;
         // Drop any pending debounced chunk update so it can't fire later and
         // replace the notice with a stale partial, and stop the heartbeat so
         // no elapsed-time rewrite lands after the notice.
@@ -1182,17 +1217,28 @@ export function createChat(deps: ChatDeps): Chat {
             }
           },
         })
-        .catch((err) => {
-          // Clear any pending chunk-scheduled update so it can't fire later
-          // and overwrite this error message with a stale partial buffer.
-          clearPendingTimer();
-          delivered = false;
-          if (settled) return;
-          settled = true;
-          clearTurnTimer();
-          pushUpdate(`:warning: Failed to reach the agent: ${errString(err)}`);
-          resolve();
-        });
+        .then(
+          () => {
+            sendSettled = true;
+          },
+          (err) => {
+            sendSettled = true;
+            // Clear any pending chunk-scheduled update so it can't fire
+            // later and overwrite this error message with a stale partial
+            // buffer.
+            clearPendingTimer();
+            // A rejection AFTER the turn already settled does not un-deliver
+            // it: a done event means the run executed, so a late transport
+            // failure on the request channel must not retro-flag the turn
+            // (the timeout path decides its own delivered-ness above).
+            if (settled) return;
+            delivered = false;
+            settled = true;
+            clearTurnTimer();
+            pushUpdate(`:warning: Failed to reach the agent: ${errString(err)}`);
+            resolve();
+          },
+        );
     });
     await updateChain;
     return { delivered };
@@ -1211,6 +1257,8 @@ export function createChat(deps: ChatDeps): Chat {
     // the finally so a turn that failed to deliver leaves seedPending set
     // for a later retry.
     let claimedSeedKey: string | undefined;
+    // Same lifecycle as claimedSeedKey, for the delta claim.
+    let claimedDeltaKey: string | undefined;
     try {
       const cfg = await getConfig();
       const scope = resolveSessionScope(msg, cfg.dmSessionMode);
@@ -1270,12 +1318,21 @@ export function createChat(deps: ChatDeps): Chat {
       // once and starts tracking from this turn's trigger — its older
       // history was either seeded already or deliberately never delivered.
       const wantDelta =
-        !wantSeed && cfg.seedThreadHistory && entry.seedPending !== true && scope.scope === "thread";
+        !wantSeed &&
+        cfg.seedThreadHistory &&
+        entry.seedPending !== true &&
+        scope.scope === "thread" &&
+        !deltaInFlight.has(scope.key);
       let delta = "";
       let deltaFetchOk = false;
       let deltaMaxTs: string | undefined;
       const initializeWatermark = wantDelta && entry.seededUpTo === undefined;
       if (wantDelta && entry.seededUpTo !== undefined) {
+        // Claimed synchronously before the fetch's await, mirroring
+        // seedInFlight, so a second overlapping mention skips the fetch
+        // instead of double-delivering the same delta.
+        deltaInFlight.add(scope.key);
+        claimedDeltaKey = scope.key;
         const result = await buildDeltaBlock(msg, scope, placeholder.ts, entry.seededUpTo);
         delta = result.block;
         deltaFetchOk = result.fetched;
@@ -1294,7 +1351,7 @@ export function createChat(deps: ChatDeps): Chat {
       // thus "once delivered", not "once attempted".
       if (delivered) {
         if (wantSeed && seedComplete) {
-          await markSeedDelivered(scope.key, latestTs(seedMaxTs, msg.ts));
+          await markSeedDelivered(scope.key, entry.sessionId, latestTs(seedMaxTs, msg.ts));
         }
         if (wantDelta && (deltaFetchOk || initializeWatermark)) {
           // On a failed delta fetch the watermark deliberately stays put —
@@ -1302,7 +1359,7 @@ export function createChat(deps: ChatDeps): Chat {
           // by the next turn instead of being skipped forever. The cost is
           // benign: that retry re-delivers this turn's trigger as one line
           // of background, which the agent already saw as a prompt.
-          await advanceWatermark(scope.key, latestTs(deltaMaxTs, msg.ts));
+          await advanceWatermark(scope.key, entry.sessionId, latestTs(deltaMaxTs, msg.ts));
         }
       }
     } catch (err) {
@@ -1327,6 +1384,7 @@ export function createChat(deps: ChatDeps): Chat {
       }
     } finally {
       if (claimedSeedKey) seedInFlight.delete(claimedSeedKey);
+      if (claimedDeltaKey) deltaInFlight.delete(claimedDeltaKey);
     }
   }
 

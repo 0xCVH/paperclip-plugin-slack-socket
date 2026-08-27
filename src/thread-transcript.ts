@@ -99,6 +99,37 @@ export function selectThreadMessages(
 }
 
 /**
+ * Delta counterpart of selectThreadMessages: nothing is privileged the way
+ * a seed's thread root is — `messages[0]` here is merely the oldest unseen
+ * reply, not the message the feature exists to show. Every message is
+ * individually capped at the parent cap (with the same visible marker) so a
+ * lone oversized reply is delivered truncated rather than either starving
+ * the whole budget or being dropped; then messages are admitted
+ * newest-first until either bound and returned in chronological order. The
+ * walk breaks at the first overflow, so `omitted` is always a contiguous
+ * run of the OLDEST candidates — which is what the "earlier replies
+ * omitted" notice describes. Pure.
+ */
+export function selectDeltaMessages(
+  messages: ThreadMessage[],
+  maxChars: number,
+  maxMessages: number,
+): { kept: ThreadMessage[]; omitted: number } {
+  const tail: ThreadMessage[] = [];
+  let chars = 0;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const raw = messages[i]!;
+    const text = truncateParentText(raw.text);
+    const msg = text === raw.text ? raw : { ...raw, text };
+    if (tail.length >= maxMessages) break;
+    if (chars + msg.text.length > maxChars) break;
+    tail.push(msg);
+    chars += msg.text.length;
+  }
+  return { kept: tail.reverse(), omitted: messages.length - tail.length };
+}
+
+/**
  * One rendered line of the seeded transcript. `label` is who spoke — "you"
  * for the bot's own messages, otherwise a display name.
  *
@@ -399,6 +430,12 @@ export function buildThreadContext(
   // wording; delta blocks pass THREAD_DELTA_FRAMING. Only these two
   // plugin-authored constants are ever passed — never derived text.
   framing: string = THREAD_CONTEXT_FRAMING,
+  // Where the omission notice renders. A seed's dropped messages sit
+  // between its always-kept parent and the kept tail, so "after-first" is
+  // where they actually were; a delta's dropped messages are always the
+  // OLDEST candidates (see selectDeltaMessages), before everything kept,
+  // so deltas pass "before-all".
+  noticePlacement: "after-first" | "before-all" = "after-first",
 ): string {
   if (entries.length === 0) return "";
 
@@ -423,12 +460,9 @@ export function buildThreadContext(
       ? [`… ${omitted} earlier ${omitted === 1 ? "reply" : "replies"} omitted …`]
       : [];
 
-  return [
-    THREAD_CONTEXT_OPEN_TAG,
-    framing,
-    lines[0]!,
-    ...notice,
-    ...lines.slice(1),
-    THREAD_CONTEXT_CLOSE_TAG,
-  ].join("\n");
+  const body =
+    noticePlacement === "before-all"
+      ? [...notice, ...lines]
+      : [lines[0]!, ...notice, ...lines.slice(1)];
+  return [THREAD_CONTEXT_OPEN_TAG, framing, ...body, THREAD_CONTEXT_CLOSE_TAG].join("\n");
 }
