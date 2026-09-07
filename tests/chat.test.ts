@@ -162,6 +162,34 @@ describe("chat", () => {
     expect(text).toContain("no agent");
   });
 
+  it("recreates and retries a durable session pointer that Paperclip no longer knows after restart", async () => {
+    const { ctx, gateway, chat, stateStore } = setup();
+    const key = STATE_KEYS.session("D1", "main");
+    stateStore.set(key, {
+      sessionId: "sess-before-restart",
+      agentId: "agent-1",
+      channel: "D1",
+      threadTs: "main",
+      scope: "channel",
+      lastActivityAt: new Date().toISOString(),
+      seedPending: false,
+    });
+    stateStore.set(STATE_KEYS.sessionIndex, [key]);
+    (ctx.agents.sessions.sendMessage as any).mockRejectedValueOnce(
+      new Error("JsonRpcCallError: Session not found: sess-before-restart"),
+    );
+
+    await chat.handleMessage(dm("hello after restart", "102.1"));
+
+    expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledTimes(2);
+    expect(ctx.agents.sessions.create).toHaveBeenCalledWith("agent-1", "co-1", {
+      reason: "slack-thread",
+    });
+    expect((stateStore.get(key) as { sessionId: string }).sessionId).toBe("sess-1");
+    expect(gateway.updates.at(-1)!.text).toBe("Hello there!");
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.sessions.stale_recreated", 1);
+  });
+
   it("redacts tokens from the reason it posts to Slack", async () => {
     const { ctx, gateway, chat } = setup();
     (ctx.agents.sessions.create as any).mockRejectedValueOnce(
@@ -447,6 +475,44 @@ describe("chat", () => {
       expect(ctx.metrics.write).toHaveBeenCalledWith("slack.turns.reply_withheld", 1);
     });
 
+    it("does not recover the word between reply tags echoed in a Hermes prompt when inference fails", async () => {
+      const { ctx, gateway, chat } = setup();
+      emitTurn(
+        ctx,
+        [
+          "Query: Put your entire reply between <slack_reply> and </slack_reply>.\n",
+          "Initializing agent...\n",
+          "Error: HTTP 404: Model 'auto' not found.\n",
+        ],
+        HOST_WITHHELD_REPLY_NOTICE,
+      );
+
+      await chat.handleMessage(dm("status?", "1200.35"));
+
+      expect(gateway.updates.at(-1)!.text).toBe(WITHHELD_REPLY_USER_NOTICE);
+      expect(gateway.updates.at(-1)!.text).not.toBe("and");
+      expect(ctx.metrics.write).not.toHaveBeenCalledWith("slack.turns.reply_recovered", 1);
+      expect(ctx.metrics.write).toHaveBeenCalledWith("slack.turns.reply_withheld", 1);
+    });
+
+    it("still recovers a real Hermes reply emitted after the agent-output boundary", async () => {
+      const { ctx, gateway, chat } = setup();
+      emitTurn(
+        ctx,
+        [
+          "Query: Put your entire reply between <slack_reply> and </slack_reply>.\n",
+          "Initializing agent...\n",
+          `${REPLY_OPEN_TAG}Real answer.${REPLY_CLOSE_TAG}\n`,
+        ],
+        HOST_WITHHELD_REPLY_NOTICE,
+      );
+
+      await chat.handleMessage(dm("status?", "1200.36"));
+
+      expect(gateway.updates.at(-1)!.text).toBe("Real answer.");
+      expect(ctx.metrics.write).toHaveBeenCalledWith("slack.turns.reply_recovered", 1);
+    });
+
     it("never consults the buffer for an ordinary untagged reply — tag pairs in tool output stay unposted", async () => {
       const { ctx, gateway, chat } = setup();
       // A hostile tag pair that transited the stdout stream via tool output
@@ -573,6 +639,21 @@ describe("chat", () => {
       expect(ctx.agents.sessions.close).toHaveBeenCalledWith("sess-stale", "co-1");
       expect(ctx.agents.sessions.create).toHaveBeenCalledTimes(1);
       expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledWith("sess-1", "co-1", expect.anything());
+    });
+
+    it("starts a fresh session when the bot is remapped to a different agent", async () => {
+      const { ctx, chat, stateStore } = setup({ dmSessionMode: "thread", defaultAgentId: "agent-2" });
+      stateStore.set(STATE_KEYS.session("D1", "100.1"), {
+        sessionId: "sess-agent-1", agentId: "agent-1", channel: "D1", threadTs: "100.1",
+        scope: "thread", lastActivityAt: hoursAgo(1),
+      });
+
+      await chat.handleMessage(dm("hello new agent", "100.9", "100.1"));
+
+      expect(ctx.agents.sessions.close).toHaveBeenCalledWith("sess-agent-1", "co-1");
+      expect(ctx.agents.sessions.create).toHaveBeenCalledWith("agent-2", "co-1", expect.anything());
+      expect(stateStore.get(STATE_KEYS.session("D1", "100.1"))).toMatchObject({ agentId: "agent-2" });
+      expect(ctx.metrics.write).toHaveBeenCalledWith("slack.sessions.agent_changed", 1);
     });
 
     it("reuses a session still inside the idle window", async () => {

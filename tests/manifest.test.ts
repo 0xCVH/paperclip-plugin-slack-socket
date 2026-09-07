@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import manifest from "../src/manifest.js";
-import { JOB_KEYS, PLUGIN_VERSION, TOOL_NAMES } from "../src/constants.js";
+import { API_ROUTE_KEYS, JOB_KEYS, PLUGIN_VERSION, TOOL_NAMES } from "../src/constants.js";
 
 describe("manifest", () => {
   it("declares no webhooks (Socket Mode only)", () => {
@@ -15,7 +15,7 @@ describe("manifest", () => {
         "agent.sessions.create", "agent.sessions.send", "agent.sessions.close",
         "agent.tools.register", "http.outbound", "events.subscribe",
         "plugin.state.read", "plugin.state.write", "secrets.read-ref", "instance.settings.register",
-        "activity.log.write", "metrics.write", "jobs.schedule",
+        "activity.log.write", "metrics.write", "jobs.schedule", "api.routes.register",
       ].sort(),
     );
   });
@@ -23,6 +23,20 @@ describe("manifest", () => {
   it("declares the cleanup job and both agent tools", () => {
     expect(manifest.jobs?.map((j) => j.jobKey)).toEqual([JOB_KEYS.cleanup]);
     expect(manifest.tools?.map((t) => t.name)).toEqual([TOOL_NAMES.askHuman, TOOL_NAMES.postMessage]);
+  });
+
+  it("declares the company-scoped inbound Slack bridge", () => {
+    expect(manifest.apiRoutes).toEqual([
+      {
+        routeKey: API_ROUTE_KEYS.slackInbound,
+        method: "POST",
+        path: "/slack-inbound",
+        auth: "board",
+        capability: "api.routes.register",
+        checkoutPolicy: "none",
+        companyResolution: { from: "body", key: "companyId" },
+      },
+    ]);
   });
 
   it("requires tokens, company, agent, and default channel in config", () => {

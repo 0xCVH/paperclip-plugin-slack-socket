@@ -2,6 +2,7 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 import { MAX_TURN_TIMEOUT_MINUTES } from "./chat.js";
 import {
   ASK_HUMAN_TOOL_DECLARATION,
+  API_ROUTE_KEYS,
   DEFAULT_CONFIG,
   JOB_KEYS,
   PLUGIN_ID,
@@ -35,6 +36,7 @@ const manifest: PaperclipPluginManifestV1 = {
     "activity.log.write",
     "metrics.write",
     "jobs.schedule",
+    "api.routes.register",
   ],
   entrypoints: {
     worker: "./dist/worker.js",
@@ -75,6 +77,45 @@ const manifest: PaperclipPluginManifestV1 = {
         title: "Default Agent ID",
         description: "Agent that handles DM and @mention conversations.",
         default: DEFAULT_CONFIG.defaultAgentId,
+      },
+      additionalBots: {
+        type: "array",
+        title: "Additional Slack bots",
+        description:
+          "Optional additional Slack apps. Each app is isolated and talks directly to its mapped Paperclip agent. The primary bot above remains the notification and outbound-tool bot.",
+        default: DEFAULT_CONFIG.additionalBots,
+        items: {
+          type: "object",
+          properties: {
+            key: {
+              type: "string",
+              pattern: "^[a-z0-9][a-z0-9_-]*$",
+              title: "Bot key",
+              description: "Stable unique name such as ceo, reflection-coach, or summarizer.",
+            },
+            slackBotTokenRef: {
+              type: ["string", "object"],
+              format: "secret-ref",
+              title: "Slack Bot Token",
+            },
+            slackAppTokenRef: {
+              type: ["string", "object"],
+              format: "secret-ref",
+              title: "Slack App-Level Token",
+            },
+            agentId: {
+              type: "string",
+              title: "Paperclip Agent ID",
+            },
+            allowedSlackUserIds: {
+              type: "array",
+              items: { type: "string" },
+              title: "Allowed Slack user IDs",
+              description: "Optional per-bot allowlist. Omit to inherit the primary bot allowlist.",
+            },
+          },
+          required: ["key", "slackBotTokenRef", "slackAppTokenRef", "agentId"],
+        },
       },
       defaultChannelId: {
         type: "string",
@@ -250,6 +291,17 @@ const manifest: PaperclipPluginManifestV1 = {
       displayName: "Cleanup idle sessions and expired questions",
       description: "Closes agent sessions idle beyond the configured TTL and expires unanswered ask-human questions.",
       schedule: "*/15 * * * *",
+    },
+  ],
+  apiRoutes: [
+    {
+      routeKey: API_ROUTE_KEYS.slackInbound,
+      method: "POST",
+      path: "/slack-inbound",
+      auth: "board",
+      capability: "api.routes.register",
+      checkoutPolicy: "none",
+      companyResolution: { from: "body", key: "companyId" },
     },
   ],
   tools: [ASK_HUMAN_TOOL_DECLARATION, POST_MESSAGE_TOOL_DECLARATION],

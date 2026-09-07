@@ -91,6 +91,43 @@ describe("instanceConfigSchema vs the host settings form", () => {
     expect(result.valid).toBe(true);
   });
 
+  it("accepts an additional Slack app mapped to its own Paperclip agent", () => {
+    const result = validateInstanceConfig({
+      ...baseConfig,
+      slackBotTokenRef: SECRET_REF,
+      slackAppTokenRef: SECRET_REF,
+      additionalBots: [
+        {
+          key: "reflection-coach",
+          slackBotTokenRef: SECRET_REF,
+          slackAppTokenRef: SECRET_REF,
+          agentId: "55555555-5555-4555-8555-555555555555",
+          allowedSlackUserIds: ["U01ABC2DEF3"],
+        },
+      ],
+    });
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+  });
+
+  it("rejects an unsafe additional-bot key", () => {
+    const result = validateInstanceConfig({
+      ...baseConfig,
+      slackBotTokenRef: SECRET_REF,
+      slackAppTokenRef: SECRET_REF,
+      additionalBots: [
+        {
+          key: "Reflection Coach",
+          slackBotTokenRef: SECRET_REF,
+          slackAppTokenRef: SECRET_REF,
+          agentId: "55555555-5555-4555-8555-555555555555",
+        },
+      ],
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((error) => error.field.includes("/additionalBots/0/key"))).toBe(true);
+  });
+
   it("accepts a fully populated config with every optional field set", () => {
     const result = validateInstanceConfig({
       ...baseConfig,

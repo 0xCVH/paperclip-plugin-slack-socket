@@ -3,6 +3,8 @@ import {
   runWorker,
   type PluginContext,
   type PluginHealthDiagnostics,
+  type PluginApiRequestInput,
+  type PluginApiResponse,
 } from "@paperclipai/plugin-sdk";
 import { isUserAllowed } from "./access.js";
 import { createApprovals, type Approvals } from "./approvals.js";
@@ -12,14 +14,19 @@ import { createChat, type Chat } from "./chat.js";
 import { runCleanup } from "./cleanup.js";
 import { createCommands, type Commands } from "./commands.js";
 import { mergeConfig } from "./config.js";
-import { DEFAULT_CONFIG, JOB_KEYS, SLASH_COMMAND } from "./constants.js";
+import { API_ROUTE_KEYS, DEFAULT_CONFIG, JOB_KEYS, PLUGIN_ID, SLASH_COMMAND } from "./constants.js";
 import { createEventDeduper } from "./event-dedup.js";
 import { createGatewayProxy } from "./gateway-proxy.js";
 import { registerNotifications } from "./notifications.js";
 import { createPostMessage, type PostMessage } from "./post-message.js";
 import { errString } from "./redact.js";
 import { describeHostError } from "./host-errors.js";
-import type { SlackGateway, SlackSocketConfig } from "./types.js";
+import type {
+  AdditionalSlackBotConfig,
+  InboundMessage,
+  SlackGateway,
+  SlackSocketConfig,
+} from "./types.js";
 
 export type GatewayFactory = (opts: { botToken: string; appToken: string }) => SlackGateway;
 
@@ -61,6 +68,13 @@ let liveConfig: SlackSocketConfig | null = null;
 // field, and a cross-tenant config is refused before this is written.
 let lastAttemptedConfig: SlackSocketConfig | null = null;
 let currentGateway: SlackGateway | null = null;
+interface AdditionalBotRuntime {
+  key: string;
+  config: SlackSocketConfig;
+  gateway: SlackGateway;
+  chat: Chat;
+}
+let additionalBotRuntimes = new Map<string, AdditionalBotRuntime>();
 let lastCtx: PluginContext | null = null;
 let coreModules: CoreModules | null = null;
 let approvals: Approvals | null = null;
@@ -115,11 +129,107 @@ export function getLiveConfig(): SlackSocketConfig {
 // message wirings below so a denied event never consumes a dedup key.
 type AccessSurface = "mention" | "message" | "reaction" | "action" | "command";
 
-async function checkAccess(ctx: PluginContext, userId: string, surface: AccessSurface): Promise<boolean> {
-  if (isUserAllowed(getLiveConfig().allowedSlackUserIds, userId)) return true;
-  ctx.logger.info("Ignoring Slack interaction from a user not on the allowlist", { user: userId, surface });
-  await ctx.metrics.write("slack.access.denied", 1, { surface }).catch(() => {});
+async function checkAccess(
+  ctx: PluginContext,
+  userId: string,
+  surface: AccessSurface,
+  cfg: SlackSocketConfig = getLiveConfig(),
+  botKey = "primary",
+): Promise<boolean> {
+  if (isUserAllowed(cfg.allowedSlackUserIds, userId)) return true;
+  ctx.logger.info("Ignoring Slack interaction from a user not on the allowlist", { user: userId, surface, botKey });
+  const metricTags: Record<string, string> = botKey === "primary" ? { surface } : { surface, botKey };
+  await ctx.metrics.write("slack.access.denied", 1, metricTags).catch(() => {});
   return false;
+}
+
+type ScopedChatSurface = "mention" | "message";
+
+interface ScopedChatRequest {
+  companyId: string;
+  botKey?: string;
+  surface: ScopedChatSurface;
+  message: InboundMessage;
+}
+
+function isInboundMessage(value: unknown): value is InboundMessage {
+  if (!value || typeof value !== "object") return false;
+  const msg = value as Record<string, unknown>;
+  return (
+    typeof msg.channel === "string" &&
+    (msg.channelType === "im" || msg.channelType === "channel" || msg.channelType === "group") &&
+    typeof msg.user === "string" &&
+    typeof msg.text === "string" &&
+    typeof msg.ts === "string" &&
+    (msg.threadTs === undefined || typeof msg.threadTs === "string")
+  );
+}
+
+function parseScopedChatRequest(value: unknown): ScopedChatRequest | null {
+  if (!value || typeof value !== "object") return null;
+  const body = value as Record<string, unknown>;
+  if (typeof body.companyId !== "string") return null;
+  if (body.surface !== "mention" && body.surface !== "message") return null;
+  if (!isInboundMessage(body.message)) return null;
+  return {
+    companyId: body.companyId,
+    botKey: typeof body.botKey === "string" ? body.botKey : undefined,
+    surface: body.surface,
+    message: body.message,
+  };
+}
+
+async function forwardChatThroughScopedRoute(
+  cfg: SlackSocketConfig,
+  botKey: string,
+  surface: ScopedChatSurface,
+  message: InboundMessage,
+): Promise<void> {
+  const url = `${cfg.paperclipBaseUrl.replace(/\/+$/, "")}/api/plugins/${PLUGIN_ID}/api/slack-inbound`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ companyId: cfg.companyId, botKey, surface, message } satisfies ScopedChatRequest),
+  });
+  if (!response.ok) {
+    throw new Error(`Paperclip scoped Slack bridge returned HTTP ${response.status}`);
+  }
+}
+
+async function handleScopedApiRequest(
+  ctx: PluginContext,
+  input: PluginApiRequestInput,
+): Promise<PluginApiResponse> {
+  if (input.routeKey !== API_ROUTE_KEYS.slackInbound) {
+    return { status: 404, body: { error: "Unknown plugin API route" } };
+  }
+
+  const request = parseScopedChatRequest(input.body);
+  if (!request) return { status: 400, body: { error: "Invalid Slack callback payload" } };
+  if (request.companyId !== input.companyId || request.companyId !== boundCompanyId) {
+    return { status: 403, body: { error: "Company scope mismatch" } };
+  }
+
+  const botKey = request.botKey ?? "primary";
+  const runtime = botKey === "primary" ? null : additionalBotRuntimes.get(botKey);
+  if (botKey !== "primary" && !runtime) {
+    return { status: 404, body: { error: "Unknown Slack bot key" } };
+  }
+  const primary = botKey === "primary" ? ensureCoreModules(ctx) : null;
+  const chat = runtime?.chat ?? primary!.chat;
+  const askHuman = primary?.askHuman;
+  const cfg = runtime?.config ?? getLiveConfig();
+  const { message, surface } = request;
+  if (!(await checkAccess(ctx, message.user, surface, cfg, botKey))) return { status: 204 };
+  if (!eventDeduper.shouldProcess(`${botKey}:${surface}:${message.channel}:${message.ts}`)) return { status: 204 };
+
+  if (surface === "mention") {
+    await chat.handleMention(message);
+  } else {
+    if (askHuman && (await askHuman.tryHandleAnswer(message))) return { status: 204 };
+    await chat.handleMessage(message);
+  }
+  return { status: 204 };
 }
 
 // --- Config apply pump ---------------------------------------------------
@@ -151,7 +261,18 @@ async function checkAccess(ctx: PluginContext, userId: string, surface: AccessSu
 // like `setup()` itself.
 interface PendingApply {
   cfg: SlackSocketConfig;
+  resolvedTokens?: ResolvedSlackTokenSet;
+  secretResolutionError?: unknown;
+  scopedBridge?: boolean;
   done: () => void;
+}
+interface ResolvedSlackTokens {
+  botToken: string;
+  appToken: string;
+}
+interface ResolvedSlackTokenSet {
+  primary: ResolvedSlackTokens;
+  additional: Record<string, ResolvedSlackTokens>;
 }
 let applyQueue: PendingApply[] = [];
 let wakePump: (() => void) | null = null;
@@ -200,7 +321,11 @@ function startConfigPump(ctx: PluginContext, makeGateway: GatewayFactory): void 
         const job = applyQueue.shift()!;
         applyInFlight = true;
         try {
-          await applyConfig(ctx, job.cfg, makeGateway);
+          await applyConfig(ctx, job.cfg, makeGateway, {
+            resolvedTokens: job.resolvedTokens,
+            secretResolutionError: job.secretResolutionError,
+            scopedBridge: job.scopedBridge,
+          });
         } catch (err) {
           ctx.logger.error("Slack config apply failed", { err: errString(err) });
           health = { status: "degraded", message: `Slack Socket configuration failed: ${errString(err)}` };
@@ -349,8 +474,13 @@ export async function socketWatchdogTick(ctx: PluginContext, now: number = Date.
 
   recoveryInFlight = true;
   try {
-    const gateway = currentGateway;
-    const alive = gateway !== null && gateway.isConnected() && (await probeWithTimeout(gateway, PROBE_TIMEOUT_MS));
+    const gateways = [currentGateway, ...[...additionalBotRuntimes.values()].map((runtime) => runtime.gateway)];
+    const aliveChecks = await Promise.all(
+      gateways.map((gateway) =>
+        gateway !== null && gateway.isConnected() ? probeWithTimeout(gateway, PROBE_TIMEOUT_MS) : false,
+      ),
+    );
+    const alive = gateways.length > 0 && aliveChecks.every(Boolean);
     if (alive) {
       notAliveStreak = 0;
       recoveryAttempts = 0;
@@ -389,7 +519,7 @@ export async function socketWatchdogTick(ctx: PluginContext, now: number = Date.
     const cfg = liveConfig ?? lastAttemptedConfig;
     if (!cfg || applyQueue.length > 0 || applyInFlight) return;
     await new Promise<void>((resolve) => {
-      applyQueue.push({ cfg, done: resolve });
+      applyQueue.push({ cfg, scopedBridge: true, done: resolve });
       signalPump();
     });
 
@@ -475,6 +605,53 @@ function ensureCompanyModules(ctx: PluginContext, companyId: string): Approvals 
   return approvals!;
 }
 
+function additionalBotConfigError(bots: AdditionalSlackBotConfig[]): string | null {
+  const keys = new Set<string>();
+  for (const bot of bots) {
+    const key = bot.key.trim();
+    if (!key) return "additionalBots contains an empty key";
+    if (key !== bot.key || !/^[a-z0-9][a-z0-9_-]*$/.test(key)) {
+      return `additionalBots key "${bot.key}" must use lowercase letters, numbers, hyphens, or underscores`;
+    }
+    if (key === "primary") return 'additionalBots key "primary" is reserved';
+    if (keys.has(key)) return `additionalBots contains duplicate key "${key}"`;
+    keys.add(key);
+    if (!bot.slackBotTokenRef || !bot.slackAppTokenRef || !bot.agentId) {
+      return `additionalBots entry "${key}" is missing a token reference or agentId`;
+    }
+  }
+  return null;
+}
+
+function effectiveAdditionalBotConfig(
+  cfg: SlackSocketConfig,
+  bot: AdditionalSlackBotConfig,
+): SlackSocketConfig {
+  return {
+    ...cfg,
+    slackBotTokenRef: bot.slackBotTokenRef,
+    slackAppTokenRef: bot.slackAppTokenRef,
+    defaultAgentId: bot.agentId,
+    allowedSlackUserIds: bot.allowedSlackUserIds ?? cfg.allowedSlackUserIds,
+    additionalBots: [],
+  };
+}
+
+async function resolveAllSlackTokens(ctx: PluginContext, cfg: SlackSocketConfig): Promise<ResolvedSlackTokenSet> {
+  const primary = {
+    botToken: await ctx.secrets.resolve(cfg.slackBotTokenRef, { companyId: cfg.companyId }),
+    appToken: await ctx.secrets.resolve(cfg.slackAppTokenRef, { companyId: cfg.companyId }),
+  };
+  const additional: Record<string, ResolvedSlackTokens> = {};
+  for (const bot of cfg.additionalBots) {
+    additional[bot.key] = {
+      botToken: await ctx.secrets.resolve(bot.slackBotTokenRef, { companyId: cfg.companyId }),
+      appToken: await ctx.secrets.resolve(bot.slackAppTokenRef, { companyId: cfg.companyId }),
+    };
+  }
+  return { primary, additional };
+}
+
 /**
  * Apply a fully-merged config: validate the required fields, resolve the
  * Slack secrets scoped to `cfg.companyId` (required outside an invocation —
@@ -519,6 +696,11 @@ export async function applyConfig(
   ctx: PluginContext,
   cfg: SlackSocketConfig,
   makeGateway: GatewayFactory,
+  prepared: {
+    resolvedTokens?: ResolvedSlackTokenSet;
+    secretResolutionError?: unknown;
+    scopedBridge?: boolean;
+  } = {},
 ): Promise<Health> {
   if (boundCompanyId && cfg.companyId !== boundCompanyId) {
     const message =
@@ -578,17 +760,33 @@ export async function applyConfig(
     return health;
   }
 
+  const additionalConfigError = additionalBotConfigError(cfg.additionalBots);
+  if (additionalConfigError) {
+    health = liveConfig
+      ? {
+          status: "degraded",
+          message: `New Slack Socket configuration rejected (${additionalConfigError}); the previous configuration is still active`,
+        }
+      : { status: "degraded", message: `Slack Socket plugin not configured: ${additionalConfigError}` };
+    ctx.logger.warn("Slack Socket plugin additional bot configuration rejected", { error: additionalConfigError });
+    if (didClaim) boundCompanyId = null;
+    return health;
+  }
+
   // Structurally valid for the bound company: remember it so the watchdog
   // can retry a first-ever apply that fails on a transient step below (see
   // lastAttemptedConfig's declaration). Configs that fail the checks above
   // are deliberately never remembered.
   lastAttemptedConfig = cfg;
 
-  let botToken: string;
-  let appToken: string;
+  let resolvedTokens: ResolvedSlackTokenSet;
   try {
-    botToken = await ctx.secrets.resolve(cfg.slackBotTokenRef, { companyId: cfg.companyId });
-    appToken = await ctx.secrets.resolve(cfg.slackAppTokenRef, { companyId: cfg.companyId });
+    if (prepared.secretResolutionError) throw prepared.secretResolutionError;
+    if (prepared.resolvedTokens) {
+      resolvedTokens = prepared.resolvedTokens;
+    } else {
+      resolvedTokens = await resolveAllSlackTokens(ctx, cfg);
+    }
   } catch (err) {
     health = liveConfig
       ? {
@@ -612,16 +810,26 @@ export async function applyConfig(
     await currentGateway.stop().catch(() => {});
     currentGateway = null;
   }
+  await Promise.all([...additionalBotRuntimes.values()].map((runtime) => runtime.gateway.stop().catch(() => {})));
+  additionalBotRuntimes = new Map();
   liveConfig = cfg;
 
-  const gateway = makeGateway({ botToken, appToken });
+  const gateway = makeGateway(resolvedTokens.primary);
 
   gateway.onMention(async (msg) => {
+    if (prepared.scopedBridge) {
+      await forwardChatThroughScopedRoute(cfg, "primary", "mention", msg);
+      return;
+    }
     if (!(await checkAccess(ctx, msg.user, "mention"))) return;
     if (!eventDeduper.shouldProcess(`mention:${msg.channel}:${msg.ts}`)) return;
     await chat.handleMention(msg);
   });
   gateway.onMessage(async (msg) => {
+    if (prepared.scopedBridge) {
+      await forwardChatThroughScopedRoute(cfg, "primary", "message", msg);
+      return;
+    }
     if (!(await checkAccess(ctx, msg.user, "message"))) return;
     if (!eventDeduper.shouldProcess(`message:${msg.channel}:${msg.ts}`)) return;
     if (await askHuman.tryHandleAnswer(msg)) return;
@@ -643,6 +851,44 @@ export async function applyConfig(
   currentGateway = gateway;
   try {
     await gateway.start();
+    for (const bot of cfg.additionalBots) {
+      const botCfg = effectiveAdditionalBotConfig(cfg, bot);
+      const botGateway = makeGateway(resolvedTokens.additional[bot.key]);
+      const getConfig = async (): Promise<SlackSocketConfig> => botCfg;
+      const botChat = createChat({
+        ctx,
+        gateway: botGateway,
+        getConfig,
+        sessionKeyPrefix: `bot:${bot.key}:`,
+      });
+      const runtime: AdditionalBotRuntime = {
+        key: bot.key,
+        config: botCfg,
+        gateway: botGateway,
+        chat: botChat,
+      };
+      additionalBotRuntimes.set(bot.key, runtime);
+
+      botGateway.onMention(async (msg) => {
+        if (prepared.scopedBridge) {
+          await forwardChatThroughScopedRoute(botCfg, bot.key, "mention", msg);
+          return;
+        }
+        if (!(await checkAccess(ctx, msg.user, "mention", botCfg, bot.key))) return;
+        if (!eventDeduper.shouldProcess(`${bot.key}:mention:${msg.channel}:${msg.ts}`)) return;
+        await botChat.handleMention(msg);
+      });
+      botGateway.onMessage(async (msg) => {
+        if (prepared.scopedBridge) {
+          await forwardChatThroughScopedRoute(botCfg, bot.key, "message", msg);
+          return;
+        }
+        if (!(await checkAccess(ctx, msg.user, "message", botCfg, bot.key))) return;
+        if (!eventDeduper.shouldProcess(`${bot.key}:message:${msg.channel}:${msg.ts}`)) return;
+        await botChat.handleMessage(msg);
+      });
+      await botGateway.start();
+    }
   } catch (err) {
     // Roll back the claim (if we made one) so a later, valid config for a
     // different company isn't permanently blocked by this failed bind.
@@ -669,7 +915,7 @@ export async function applyConfig(
   recoveryAttempts = 0;
   recoveryNotBefore = 0;
   health = { status: "ok" };
-  ctx.logger.info("Slack Socket Mode connected");
+  ctx.logger.info("Slack Socket Mode connected", { botCount: 1 + cfg.additionalBots.length });
   return health;
 }
 
@@ -702,14 +948,34 @@ const plugin = definePlugin({
   // config has actually been applied.
   async onConfigChanged(config) {
     const cfg = mergeConfig(config);
+    let resolvedTokens: ResolvedSlackTokenSet | undefined;
+    let secretResolutionError: unknown;
+
+    // Paperclip authorizes secret access only for the lifetime of this
+    // company-scoped host invocation. Resolve the credentials here, while
+    // that scope is active, but keep gateway construction in the clean-ALS
+    // pump below so future Slack callbacks do not inherit a stale invocation.
+    if (REQUIRED_FIELDS.every((field) => cfg[field])) {
+      try {
+        resolvedTokens = await resolveAllSlackTokens(lastCtx!, cfg);
+      } catch (err) {
+        secretResolutionError = err;
+      }
+    }
+
     await new Promise<void>((resolve) => {
-      applyQueue.push({ cfg, done: resolve });
+      applyQueue.push({ cfg, resolvedTokens, secretResolutionError, scopedBridge: true, done: resolve });
       signalPump();
     });
   },
 
+  async onApiRequest(input) {
+    return handleScopedApiRequest(lastCtx!, input);
+  },
+
   async onShutdown() {
     await currentGateway?.stop().catch(() => {});
+    await Promise.all([...additionalBotRuntimes.values()].map((runtime) => runtime.gateway.stop().catch(() => {})));
   },
 
   async onHealth() {
@@ -729,6 +995,13 @@ const plugin = definePlugin({
     if (currentGateway && !currentGateway.isConnected()) {
       return { status: "degraded", message: "Slack Socket Mode disconnected; Bolt is reconnecting" };
     }
+    const disconnectedBot = [...additionalBotRuntimes.values()].find((runtime) => !runtime.gateway.isConnected());
+    if (disconnectedBot) {
+      return {
+        status: "degraded",
+        message: `Slack bot "${disconnectedBot.key}" disconnected; Bolt is reconnecting`,
+      };
+    }
     return { status: "ok" };
   },
 
@@ -738,6 +1011,8 @@ const plugin = definePlugin({
     for (const field of [...REQUIRED_FIELDS, "defaultChannelId"] as const) {
       if (!cfg[field]) errors.push(`${field} is required`);
     }
+    const additionalError = additionalBotConfigError(cfg.additionalBots);
+    if (additionalError) errors.push(additionalError);
     if (errors.length > 0) return { ok: false, errors };
     if (!lastCtx) {
       return { ok: false, errors: ["Validation unavailable: plugin context not initialized"] };
@@ -768,6 +1043,22 @@ const plugin = definePlugin({
       if (!conn.ok) errors.push("apps.connections.open failed for the app token (needs connections:write)");
     } catch (err) {
       errors.push(`App token check failed: ${describeHostError(err)}`);
+    }
+    for (const bot of cfg.additionalBots) {
+      try {
+        const botToken = await lastCtx.secrets.resolve(bot.slackBotTokenRef, { companyId: cfg.companyId });
+        const auth = await new WebClient(botToken).auth.test();
+        if (!auth.ok) errors.push(`Bot token check failed for additional bot "${bot.key}"`);
+      } catch (err) {
+        errors.push(`Bot token check failed for additional bot "${bot.key}": ${describeHostError(err)}`);
+      }
+      try {
+        const appToken = await lastCtx.secrets.resolve(bot.slackAppTokenRef, { companyId: cfg.companyId });
+        const conn = await new WebClient(appToken).apps.connections.open();
+        if (!conn.ok) errors.push(`App token check failed for additional bot "${bot.key}"`);
+      } catch (err) {
+        errors.push(`App token check failed for additional bot "${bot.key}": ${describeHostError(err)}`);
+      }
     }
     return { ok: errors.length === 0, errors };
   },
