@@ -215,6 +215,12 @@ const manifest: PaperclipPluginManifestV1 = {
           "Text prepended to every Slack chat message sent to the agent, to frame the turn as a conversation rather than autonomous work. Set to an empty string to send the user's message verbatim with no framing.",
         default: DEFAULT_CONFIG.chatPromptPreamble,
       },
+      continueMentionedThreads: {
+        type: "boolean",
+        title: "Continue mentioned threads without tagging",
+        description: "Allow approved users to continue an active channel thread after mentioning this bot. New threads still require a mention. Expired or reset conversations require a new mention.",
+        default: false,
+      },
       dmSessionMode: {
         type: "string",
         enum: ["channel", "thread"],

@@ -183,6 +183,7 @@ export const DEFAULT_CONFIG: SlackSocketConfig = {
   turnTimeoutMinutes: 10,
   streamPartialReplies: false,
   chatPromptPreamble: DEFAULT_CHAT_PROMPT_PREAMBLE,
+  continueMentionedThreads: false,
   // Default chosen because today's behavior is the defect: nothing depends
   // on the bot forgetting the previous line of a DM.
   dmSessionMode: "channel",

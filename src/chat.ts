@@ -1438,15 +1438,22 @@ export function createChat(deps: ChatDeps): Chat {
     async handleMessage(msg) {
       const botId = gateway.botUserId();
       if (botId && msg.text.includes(`<@${botId}>`)) return; // the app_mention event handles it
-      if (msg.channelType === "im") await converse(msg);
-      // Channels, private channels and group DMs: only an explicit @mention
-      // (delivered as app_mention, handled above) starts or continues a
-      // conversation. A thread reply is not addressed to the bot just
-      // because the bot is in the thread — an agent that posts proactively
-      // would otherwise turn every human follow-up under its own message
-      // into an agent turn, including replies people meant for each other.
-      // Mentioning the bot again in the same thread reuses that thread's
-      // session (see getOrCreateSession), so continuity is not lost.
+      if (msg.channelType === "im") {
+        await converse(msg);
+        return;
+      }
+      if (!msg.threadTs) return;
+      // Access checks remain in the worker, before this handler. Only an
+      // existing session for this bot/agent opts a thread into follow-ups.
+      const cfg = await getConfig();
+      if (!cfg.continueMentionedThreads) return;
+      const scope = resolveSessionScope(msg, cfg.dmSessionMode);
+      const entry = (await ctx.state.get(stateScope(scope.key))) as SessionEntry | null;
+      if (!entry || entry.agentId !== cfg.defaultAgentId) return;
+      const lastActivity = Date.parse(entry.lastActivityAt);
+      if (!Number.isFinite(lastActivity) || Date.now() - lastActivity >= cfg.sessionIdleHours * 3_600_000) return;
+      if (await tryHandleReset(msg)) return;
+      await converse(msg);
     },
   };
 }

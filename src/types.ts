@@ -49,6 +49,8 @@ export interface SlackSocketConfig {
   streamPartialReplies: boolean;
   chatPromptPreamble: string;
   dmSessionMode: DmSessionMode;
+  /** Continue an existing channel thread without requiring another mention. */
+  continueMentionedThreads?: boolean;
   /**
    * Seed a newly created session with the Slack thread it was mentioned in
    * (see buildSeedBlock in chat.ts). Default true: without it the agent
