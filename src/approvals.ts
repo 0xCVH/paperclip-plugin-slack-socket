@@ -107,6 +107,102 @@ export function createApprovals({ ctx, gateway, getConfig, companyId }: Approval
       .catch(() => {});
   }
 
+  // In-process claim per approval id: first clicker wins, later clicks while
+  // the decision call is in flight are dropped silently. Released in the
+  // caller's finally so a genuinely failed decision stays retryable.
+  const decisionsInFlight = new Set<string>();
+
+  async function decideApproval(
+    action: InboundAction,
+    approvalId: string,
+    decision: "approve" | "reject",
+    cfg: SlackSocketConfig,
+  ): Promise<void> {
+    // In `local_trusted` deployment mode every request is implicitly a
+    // board actor, so no Authorization header is needed. In `authenticated`
+    // mode the server requires a board API key to authenticate the
+    // decision — resolve it only when the operator configured one.
+    let authHeaders: Record<string, string> = {};
+    if (cfg.paperclipApiKeyRef) {
+      try {
+        const apiKey = await ctx.secrets.resolve(cfg.paperclipApiKeyRef, { companyId: cfg.companyId });
+        authHeaders = { Authorization: `Bearer ${apiKey}` };
+      } catch (err) {
+        ctx.logger.warn("Approval decision via Slack failed: could not resolve the Paperclip board API key", {
+          err: errString(err),
+          approvalId,
+        });
+        await postFailureEphemeral(
+          action,
+          approvalId,
+          decision,
+          "The configured Paperclip board API key could not be resolved — check the plugin settings.",
+        );
+        return;
+      }
+    }
+
+    try {
+      const response = await ctx.http.fetch(
+        `${cfg.paperclipBaseUrl}/api/approvals/${encodeURIComponent(approvalId)}/${decision}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...authHeaders },
+          // The server ignores decidedByUserId in the body (it uses the
+          // authenticated actor) but does record decisionNote.
+          body: JSON.stringify({
+            decisionNote: `Decided via Slack by ${action.userName} (slack:${action.user})`,
+          }),
+        },
+      );
+      if (response.status < 200 || response.status >= 300) {
+        throw new Error(`Approval ${decision} returned HTTP ${response.status}`);
+      }
+      // ORDER IS LOAD-BEARING: drop the link the instant the decision is
+      // recorded, and BEFORE we write our own attribution. The host echoes
+      // an `approval.decided` back for this very decision; with the link
+      // already gone that handler no-ops instead of overwriting
+      // "Approved by <name>" with generic decided-elsewhere text. Its own
+      // catch, so a state failure can never make a decision that actually
+      // succeeded report to the user as failed.
+      await unlinkMessage(
+        ctx,
+        STATE_KEYS.approvalMessageIndex,
+        STATE_KEYS.approvalMessage(approvalId),
+      ).catch((err: unknown) => {
+        ctx.logger.warn("Failed to unlink an approval message decided in Slack", {
+          err: errString(err),
+          approvalId,
+        });
+      });
+      await gateway.updateMessage({
+        channel: action.channel,
+        ts: action.messageTs,
+        ...formatApprovalDecided(approvalId, decision, action.userName),
+      });
+      // Telemetry only, and the decision above is already recorded and the
+      // message rewritten: each write carries its own catch so a telemetry
+      // failure can never fall through to the outer catch and post
+      // ':x: Failed to approve … It may already be decided.' under a
+      // message that shows the approval succeeded.
+      await ctx.activity.log({
+        companyId: cfg.companyId,
+        message: `Approval ${approvalId} ${decision === "approve" ? "approved" : "rejected"} via Slack by ${action.userName} (slack:${action.user})`,
+        entityType: "approval",
+        entityId: approvalId,
+      }).catch((err: unknown) => {
+        ctx.logger.warn("Failed to write the activity entry for a decided Slack approval", {
+          err: errString(err),
+          approvalId,
+        });
+      });
+      await ctx.metrics.write("slack.approvals.decided", 1, { decision }).catch(() => {});
+    } catch (err) {
+      ctx.logger.warn("Approval decision via Slack failed", { err: errString(err), approvalId });
+      await postFailureEphemeral(action, approvalId, decision, "It may already be decided.");
+    }
+  }
+
   return {
     async handleAction(action) {
       const cfg = await getConfig();
@@ -128,88 +224,21 @@ export function createApprovals({ ctx, gateway, getConfig, companyId }: Approval
         return;
       }
 
-      // In `local_trusted` deployment mode every request is implicitly a
-      // board actor, so no Authorization header is needed. In `authenticated`
-      // mode the server requires a board API key to authenticate the
-      // decision — resolve it only when the operator configured one.
-      let authHeaders: Record<string, string> = {};
-      if (cfg.paperclipApiKeyRef) {
-        try {
-          const apiKey = await ctx.secrets.resolve(cfg.paperclipApiKeyRef, { companyId: cfg.companyId });
-          authHeaders = { Authorization: `Bearer ${apiKey}` };
-        } catch (err) {
-          ctx.logger.warn("Approval decision via Slack failed: could not resolve the Paperclip board API key", {
-            err: errString(err),
-            approvalId,
-          });
-          await postFailureEphemeral(
-            action,
-            approvalId,
-            decision,
-            "The configured Paperclip board API key could not be resolved — check the plugin settings.",
-          );
-          return;
-        }
-      }
 
+      // First clicker wins: a second click while the decision call is still
+      // in flight is Slack UX noise, not a second decision — without this
+      // claim it fired a duplicate REST call whose failure posted a scary
+      // ":x: Failed … may already be decided." ephemeral for a click that
+      // did exactly what the person asked for.
+      if (decisionsInFlight.has(approvalId)) {
+        ctx.logger.info("Ignoring a duplicate approval click while the first is still deciding", { approvalId });
+        return;
+      }
+      decisionsInFlight.add(approvalId);
       try {
-        const response = await ctx.http.fetch(
-          `${cfg.paperclipBaseUrl}/api/approvals/${encodeURIComponent(approvalId)}/${decision}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json", ...authHeaders },
-            // The server ignores decidedByUserId in the body (it uses the
-            // authenticated actor) but does record decisionNote.
-            body: JSON.stringify({
-              decisionNote: `Decided via Slack by ${action.userName} (slack:${action.user})`,
-            }),
-          },
-        );
-        if (response.status < 200 || response.status >= 300) {
-          throw new Error(`Approval ${decision} returned HTTP ${response.status}`);
-        }
-        // ORDER IS LOAD-BEARING: drop the link the instant the decision is
-        // recorded, and BEFORE we write our own attribution. The host echoes
-        // an `approval.decided` back for this very decision; with the link
-        // already gone that handler no-ops instead of overwriting
-        // "Approved by <name>" with generic decided-elsewhere text. Its own
-        // catch, so a state failure can never make a decision that actually
-        // succeeded report to the user as failed.
-        await unlinkMessage(
-          ctx,
-          STATE_KEYS.approvalMessageIndex,
-          STATE_KEYS.approvalMessage(approvalId),
-        ).catch((err: unknown) => {
-          ctx.logger.warn("Failed to unlink an approval message decided in Slack", {
-            err: errString(err),
-            approvalId,
-          });
-        });
-        await gateway.updateMessage({
-          channel: action.channel,
-          ts: action.messageTs,
-          ...formatApprovalDecided(approvalId, decision, action.userName),
-        });
-        // Telemetry only, and the decision above is already recorded and the
-        // message rewritten: each write carries its own catch so a telemetry
-        // failure can never fall through to the outer catch and post
-        // ':x: Failed to approve … It may already be decided.' under a
-        // message that shows the approval succeeded.
-        await ctx.activity.log({
-          companyId: cfg.companyId,
-          message: `Approval ${approvalId} ${decision === "approve" ? "approved" : "rejected"} via Slack by ${action.userName} (slack:${action.user})`,
-          entityType: "approval",
-          entityId: approvalId,
-        }).catch((err: unknown) => {
-          ctx.logger.warn("Failed to write the activity entry for a decided Slack approval", {
-            err: errString(err),
-            approvalId,
-          });
-        });
-        await ctx.metrics.write("slack.approvals.decided", 1, { decision }).catch(() => {});
-      } catch (err) {
-        ctx.logger.warn("Approval decision via Slack failed", { err: errString(err), approvalId });
-        await postFailureEphemeral(action, approvalId, decision, "It may already be decided.");
+        await decideApproval(action, approvalId, decision, cfg);
+      } finally {
+        decisionsInFlight.delete(approvalId);
       }
     },
   };

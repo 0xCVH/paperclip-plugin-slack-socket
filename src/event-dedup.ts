@@ -12,6 +12,14 @@ export interface EventDeduperOptions {
   maxAgeMs?: number;
   /** Injectable clock for tests. Defaults to Date.now. */
   now?: () => number;
+  /**
+   * Called when an event is dropped as STALE (not for duplicates): the
+   * event was never processed and never will be, which is invisible in
+   * logs without this hook. The caller wires it to a metric so operators
+   * can see redeliveries arriving outside the staleness window instead of
+   * silently losing them.
+   */
+  onStaleDrop?: (key: string, ageMs: number) => void;
 }
 
 export interface EventDeduper {
@@ -45,7 +53,13 @@ export function createEventDeduper(opts: EventDeduperOptions = {}): EventDeduper
       if (seen.has(key)) return false;
 
       const tsSeconds = parseTsSeconds(key);
-      if (tsSeconds !== null && now() - tsSeconds * 1000 > maxAgeMs) return false;
+      if (tsSeconds !== null) {
+        const ageMs = now() - tsSeconds * 1000;
+        if (ageMs > maxAgeMs) {
+          opts.onStaleDrop?.(key, ageMs);
+          return false;
+        }
+      }
 
       seen.add(key);
       if (seen.size > maxEntries) {

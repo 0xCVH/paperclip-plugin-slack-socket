@@ -1431,3 +1431,21 @@ describe("socket watchdog", () => {
     expect(boltGatewayInstances[1]!.started).toBe(true);
   });
 });
+
+describe("stale-drop observability", () => {
+  it("writes a metric when the deduper drops a stale event", async () => {
+    const { applyConfig } = await loadWorker();
+    const { ctx } = makeCtx();
+    const gateway = new FakeGateway();
+    await applyConfig(ctx, cfg(), () => gateway);
+
+    // A DM whose ts is hours old: dropped by the staleness filter before
+    // any routing — previously silently.
+    await gateway.emitMessage({
+      channel: "D-STALE", channelType: "im", user: "U1", text: "old", ts: "1000.000001",
+    });
+
+    expect(ctx.agents.sessions.sendMessage).not.toHaveBeenCalled();
+    expect(ctx.metrics.write).toHaveBeenCalledWith("slack.events.stale_dropped", 1);
+  });
+});

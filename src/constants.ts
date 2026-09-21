@@ -2,6 +2,25 @@ import type { PluginToolDeclaration, ScopeKey } from "@paperclipai/plugin-sdk";
 import type { SlackSocketConfig } from "./types.js";
 
 export const PLUGIN_ID = "cvh.slack-socket";
+// The bot scopes slack-app-manifest.json requests — the feature set this
+// plugin assumes a token carries. Compared at connect time against the
+// x-oauth-scopes the token actually has (see BoltGateway.start): a scope
+// dropped during a manual app edit otherwise fails silently as a dead
+// feature. A test pins this list to the checked-in manifest so the two
+// cannot drift.
+export const REQUIRED_BOT_SCOPES = [
+  "app_mentions:read",
+  "chat:write",
+  "channels:history",
+  "groups:history",
+  "im:history",
+  "im:read",
+  "im:write",
+  "reactions:read",
+  "users:read",
+  "commands",
+] as const;
+
 export const PLUGIN_VERSION = "0.11.3";
 
 export const ACTION_IDS = {

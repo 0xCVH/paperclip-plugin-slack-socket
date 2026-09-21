@@ -68,6 +68,7 @@ const { appInstances, MockApp } = vi.hoisted(() => {
   const instances: InstanceType<typeof MockApp>[] = [];
   class MockApp {
     handlers = new Map<string, (arg: unknown) => Promise<void>>();
+    eventRegistrations: Array<{ name: unknown }> = [];
     client = {
       auth: { test: vi.fn().mockResolvedValue({ ok: true, user_id: "UBOT" }) },
       conversations: { replies: vi.fn().mockResolvedValue({ ok: true, messages: [] }) },
@@ -75,8 +76,9 @@ const { appInstances, MockApp } = vi.hoisted(() => {
     constructor(public opts: unknown) {
       instances.push(this);
     }
-    event(name: string, handler: (arg: unknown) => Promise<void>): void {
-      this.handlers.set(name, handler);
+    event(name: string | RegExp, handler: (arg: unknown) => Promise<void>): void {
+      this.eventRegistrations.push({ name });
+      if (typeof name === "string") this.handlers.set(name, handler);
     }
     message(handler: (arg: unknown) => Promise<void>): void {
       this.handlers.set("message", handler);
@@ -326,5 +328,67 @@ describe("BoltGateway (against a mocked @slack/bolt App)", () => {
 
     await gateway.fetchThreadReplies("C1", "1.1", 200);
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+describe("connect-time token diagnostics", () => {
+  async function makeGatewayWithWarn() {
+    appInstances.length = 0;
+    const { BoltGateway } = await import("../src/bolt-gateway.js");
+    const warn = vi.fn();
+    const gateway = new BoltGateway({ botToken: "xoxb", appToken: "xapp", logger: { warn } });
+    return { gateway, warn, app: appInstances[0]! };
+  }
+
+  it("warns at start when the token is missing manifest scopes, and exposes them in diagnostics", async () => {
+    const { gateway, warn, app } = await makeGatewayWithWarn();
+    app.client.auth.test.mockResolvedValueOnce({
+      ok: true, user_id: "UBOT", bot_id: "B1",
+      response_metadata: { scopes: ["chat:write", "commands"] },
+    });
+    await gateway.start();
+    expect(warn).toHaveBeenCalled();
+    expect(gateway.diagnostics().missingScopes).toContain("app_mentions:read");
+    expect(gateway.diagnostics().missingScopes).toContain("channels:history");
+  });
+
+  it("warns when auth.test carries no bot_id — the token looks like a user token", async () => {
+    const { gateway, warn, app } = await makeGatewayWithWarn();
+    app.client.auth.test.mockResolvedValueOnce({ ok: true, user_id: "UBOT" });
+    await gateway.start();
+    expect(gateway.diagnostics().looksLikeUserToken).toBe(true);
+    expect(warn.mock.calls.some((c) => String(c[0]).toLowerCase().includes("user token"))).toBe(true);
+  });
+
+  it("stays quiet when the bot token has every manifest scope", async () => {
+    const { gateway, warn, app } = await makeGatewayWithWarn();
+    const { REQUIRED_BOT_SCOPES } = await import("../src/constants.js");
+    app.client.auth.test.mockResolvedValueOnce({
+      ok: true, user_id: "UBOT", bot_id: "B1",
+      response_metadata: { scopes: [...REQUIRED_BOT_SCOPES] },
+    });
+    await gateway.start();
+    expect(warn).not.toHaveBeenCalled();
+    expect(gateway.diagnostics().missingScopes).toEqual([]);
+    expect(gateway.diagnostics().looksLikeUserToken).toBe(false);
+  });
+
+  it("does not treat absent scope metadata as missing scopes — unknown is not missing", async () => {
+    const { gateway, warn, app } = await makeGatewayWithWarn();
+    app.client.auth.test.mockResolvedValueOnce({ ok: true, user_id: "UBOT", bot_id: "B1" });
+    await gateway.start();
+    expect(gateway.diagnostics().missingScopes).toEqual([]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+describe("catch-all event ack", () => {
+  it("registers a regex catch-all event handler so unhandled events are always acked", async () => {
+    // Un-acked events count toward Slack's failure threshold, after which
+    // Slack silently disables the app's Event Subscriptions.
+    appInstances.length = 0;
+    const { BoltGateway } = await import("../src/bolt-gateway.js");
+    void new BoltGateway({ botToken: "xoxb", appToken: "xapp", logger: { warn: vi.fn() } });
+    expect(appInstances[0]!.eventRegistrations.some((r) => r.name instanceof RegExp)).toBe(true);
   });
 });
