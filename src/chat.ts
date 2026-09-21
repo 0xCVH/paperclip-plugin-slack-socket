@@ -10,6 +10,7 @@ import {
 } from "./constants.js";
 import {
   extractReply,
+  extractRawStreamedTaggedReply,
   extractTaggedReply,
   filterRuntimeNoticeLines,
   HOST_WITHHELD_REPLY_NOTICE,
@@ -80,6 +81,8 @@ export interface ChatDeps {
    * (see the heartbeat in streamReply).
    */
   heartbeatIntervalMs?: number;
+  /** Prefixes persisted session keys so two Slack apps can share a channel safely. */
+  sessionKeyPrefix?: string;
 }
 
 export interface Chat {
@@ -332,6 +335,12 @@ export function createChat(deps: ChatDeps): Chat {
   const turnTimeoutMsOverride = deps.turnTimeoutMs;
   const seedTimeoutMs = deps.seedTimeoutMs ?? SEED_FETCH_TIMEOUT_MS;
   const heartbeatIntervalMs = deps.heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_MS;
+  const sessionKeyPrefix = deps.sessionKeyPrefix ?? "";
+
+  const sessionScopeFor = (msg: InboundMessage, mode: DmSessionMode): SessionScope => {
+    const scope = resolveSessionScope(msg, mode);
+    return sessionKeyPrefix ? { ...scope, key: `${sessionKeyPrefix}${scope.key}` } : scope;
+  };
 
   // Item 7: a process-level cache of resolved "display name (id)" labels
   // (see resolveThreadEntries), scoped to this createChat instance — i.e.
@@ -395,7 +404,7 @@ export function createChat(deps: ChatDeps): Chat {
     let replyThreadTs: string | undefined;
     try {
       const cfg = await getConfig();
-      const scope = resolveSessionScope(msg, cfg.dmSessionMode);
+      const scope = sessionScopeFor(msg, cfg.dmSessionMode);
       replyThreadTs = scope.replyThreadTs;
       cleared = await resetSession(ctx, cfg, scope.key, "mention");
     } catch (err) {
@@ -461,7 +470,14 @@ export function createChat(deps: ChatDeps): Chat {
       const expired =
         existing !== null &&
         Date.now() - Date.parse(existing.lastActivityAt) > cfg.sessionIdleHours * 3_600_000;
-      if (existing && !expired) {
+      // A Slack conversation must never keep talking to the previous agent
+      // after an operator remaps the bot. Newly written entries carry their
+      // agent identity, so every future remap rotates automatically. Legacy
+      // entries have no identity to compare and retain the pre-existing reuse
+      // behavior; operators clear those once during migration.
+      const agentChanged =
+        existing !== null && existing.agentId !== undefined && existing.agentId !== cfg.defaultAgentId;
+      if (existing && !expired && !agentChanged) {
         // Spread preserves seedPending: a session created but not yet
         // seeded (a failed first turn) stays pending until a turn delivers.
         const updated = { ...existing, lastActivityAt: new Date().toISOString() };
@@ -475,18 +491,21 @@ export function createChat(deps: ChatDeps): Chat {
         try {
           await ctx.agents.sessions.close(existing.sessionId, cfg.companyId);
         } catch (err) {
-          ctx.logger.warn("Failed to close an idle session at reuse time; starting fresh anyway", {
+          ctx.logger.warn("Failed to close a replaced session at reuse time; starting fresh anyway", {
             err: errString(err),
             sessionId: existing.sessionId,
           });
         }
-        await ctx.metrics.write("slack.sessions.expired_at_reuse", 1).catch(() => {});
+        await ctx.metrics
+          .write(agentChanged ? "slack.sessions.agent_changed" : "slack.sessions.expired_at_reuse", 1)
+          .catch(() => {});
       }
       const session = await ctx.agents.sessions.create(cfg.defaultAgentId, cfg.companyId, {
         reason: "slack-thread",
       });
       const entry: SessionEntry = {
         sessionId: session.sessionId,
+        agentId: cfg.defaultAgentId,
         channel,
         // NOT a key round-trip. `scope.replyThreadTs` mirrors wherever the
         // triggering message actually landed — for a channel-scoped DM
@@ -933,6 +952,8 @@ export function createChat(deps: ChatDeps): Chat {
      * event: the run was accepted, so the prompt was delivered.
      */
     delivered: boolean;
+    /** Present when sendMessage itself rejected before the turn was accepted. */
+    sendError?: unknown;
   }> {
     // Every message posted AFTER the placeholder — overflow chunks and the
     // watchdog's late reply — belongs under the reply, not beside it. In a
@@ -956,6 +977,7 @@ export function createChat(deps: ChatDeps): Chat {
     // the placeholder, and anything arriving afterwards must leave it alone.
     let settled = false;
     let delivered = true;
+    let sendError: unknown;
     // Whether the sendMessage RPC itself has settled. The watchdog firing
     // proves nothing about delivery: if the turn times out while the send
     // is STILL PENDING, the host may never have accepted the prompt, so it
@@ -1175,7 +1197,7 @@ export function createChat(deps: ChatDeps): Chat {
                   ? streamed !== null
                     ? extractTaggedReply(streamed)
                     : isSentinel
-                      ? extractTaggedReply(filterRuntimeNoticeLines(buffer))
+                      ? extractRawStreamedTaggedReply(buffer)
                       : null
                   : null;
               let reply: string;
@@ -1223,6 +1245,7 @@ export function createChat(deps: ChatDeps): Chat {
           },
           (err) => {
             sendSettled = true;
+            sendError = err;
             // Clear any pending chunk-scheduled update so it can't fire
             // later and overwrite this error message with a stale partial
             // buffer.
@@ -1241,7 +1264,7 @@ export function createChat(deps: ChatDeps): Chat {
         );
     });
     await updateChain;
-    return { delivered };
+    return { delivered, sendError };
   }
 
   async function converse(msg: InboundMessage): Promise<void> {
@@ -1261,11 +1284,11 @@ export function createChat(deps: ChatDeps): Chat {
     let claimedDeltaKey: string | undefined;
     try {
       const cfg = await getConfig();
-      const scope = resolveSessionScope(msg, cfg.dmSessionMode);
+      const scope = sessionScopeFor(msg, cfg.dmSessionMode);
       replyThreadTs = scope.replyThreadTs;
       const text = stripMention(msg.text);
       if (!text) return;
-      const entry = await getOrCreateSession(cfg, msg.channel, scope);
+      let entry = await getOrCreateSession(cfg, msg.channel, scope);
 
       // Seed decision: gated on the session's PERSISTED seedPending (so a
       // failed first turn retries — see SessionEntry.seedPending) and
@@ -1341,7 +1364,26 @@ export function createChat(deps: ChatDeps): Chat {
       }
 
       const prompt = buildChatPrompt(cfg.chatPromptPreamble, text, seed || delta);
-      const { delivered } = await streamReply(cfg, entry, scope.replyThreadTs, prompt, placeholder);
+      let { delivered, sendError } = await streamReply(cfg, entry, scope.replyThreadTs, prompt, placeholder);
+
+      // Paperclip session registrations are process-local for some agent
+      // adapters, while this plugin's session pointer is durable state. A
+      // clean Paperclip restart can therefore leave a perfectly valid
+      // Slack conversation pointing at a session the new host process no
+      // longer knows. Heal that exact failure once, in place: drop only the
+      // stale pointer, create a fresh session for the same configured agent,
+      // and retry the same prompt through the existing Slack placeholder.
+      // Other send failures are never retried here.
+      if (!delivered && sendError && errString(sendError).includes("Session not found")) {
+        const current = (await ctx.state.get(stateScope(scope.key))) as SessionEntry | null;
+        if (current?.sessionId === entry.sessionId) {
+          await ctx.state.delete(stateScope(scope.key));
+          await updateIndex(ctx, STATE_KEYS.sessionIndex, (keys) => keys.filter((key) => key !== scope.key));
+        }
+        await ctx.metrics.write("slack.sessions.stale_recreated", 1).catch(() => {});
+        entry = await getOrCreateSession(cfg, msg.channel, scope);
+        ({ delivered, sendError } = await streamReply(cfg, entry, scope.replyThreadTs, prompt, placeholder));
+      }
 
       // Watermark and seed bookkeeping run only after the prompt actually
       // REACHED the agent — `delivered` is false when the host rejected the
@@ -1396,15 +1438,22 @@ export function createChat(deps: ChatDeps): Chat {
     async handleMessage(msg) {
       const botId = gateway.botUserId();
       if (botId && msg.text.includes(`<@${botId}>`)) return; // the app_mention event handles it
-      if (msg.channelType === "im") await converse(msg);
-      // Channels, private channels and group DMs: only an explicit @mention
-      // (delivered as app_mention, handled above) starts or continues a
-      // conversation. A thread reply is not addressed to the bot just
-      // because the bot is in the thread — an agent that posts proactively
-      // would otherwise turn every human follow-up under its own message
-      // into an agent turn, including replies people meant for each other.
-      // Mentioning the bot again in the same thread reuses that thread's
-      // session (see getOrCreateSession), so continuity is not lost.
+      if (msg.channelType === "im") {
+        await converse(msg);
+        return;
+      }
+      if (!msg.threadTs) return;
+      // Access checks remain in the worker, before this handler. Only an
+      // existing session for this bot/agent opts a thread into follow-ups.
+      const cfg = await getConfig();
+      if (!cfg.continueMentionedThreads) return;
+      const scope = resolveSessionScope(msg, cfg.dmSessionMode);
+      const entry = (await ctx.state.get(stateScope(scope.key))) as SessionEntry | null;
+      if (!entry || entry.agentId !== cfg.defaultAgentId) return;
+      const lastActivity = Date.parse(entry.lastActivityAt);
+      if (!Number.isFinite(lastActivity) || Date.now() - lastActivity >= cfg.sessionIdleHours * 3_600_000) return;
+      if (await tryHandleReset(msg)) return;
+      await converse(msg);
     },
   };
 }
