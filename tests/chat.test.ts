@@ -265,14 +265,17 @@ describe("chat", () => {
 
     const placeholderTs = gateway.posts[0]!.ts;
     const placeholderUpdate = gateway.updates.find((u) => u.ts === placeholderTs);
-    expect(placeholderUpdate!.text.length).toBe(3900);
-    expect(placeholderUpdate!.text).toBe(longText.slice(0, 3900));
+    expect(placeholderUpdate!.text.length).toBeLessThanOrEqual(3900);
+    expect(placeholderUpdate!.text.endsWith("_(1/3)_")).toBe(true);
 
     const extraPosts = gateway.posts.slice(1);
-    expect(extraPosts.length).toBe(2); // 9000 chars = 3900 + 3900 + 1200
+    expect(extraPosts.length).toBe(2);
     for (const post of extraPosts) expect(post.threadTs).toBe("800.1");
 
-    const rejoined = placeholderUpdate!.text + extraPosts.map((p) => p.text).join("");
+    // Stripping the part indicators and rejoining reproduces the reply.
+    const rejoined = [placeholderUpdate!.text, ...extraPosts.map((p) => p.text)]
+      .map((t) => t.replace(/\n_\(\d+\/\d+\)_$/, ""))
+      .join("");
     expect(rejoined).toBe(longText);
   });
 

@@ -135,3 +135,41 @@ describe("markdownToMrkdwn", () => {
     });
   });
 });
+
+describe("pipe tables", () => {
+  it("wraps a GFM pipe table in a fence with aligned columns", () => {
+    const input = "| Name | Qty |\n|---|---|\n| foo | 1 |\n| barbar | 22 |";
+    expect(markdownToMrkdwn(input)).toBe(
+      "```\nName   | Qty\n-------|----\nfoo    | 1\nbarbar | 22\n```",
+    );
+  });
+
+  it("keeps text around the table and converts the rest normally", () => {
+    const input = "**intro**\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nafter";
+    const out = markdownToMrkdwn(input);
+    expect(out).toContain("*intro*");
+    expect(out).toContain("```\nA | B\n--|--\n1 | 2\n```");
+    expect(out).toContain("after");
+  });
+
+  it("leaves a pipe table inside an existing code fence untouched", () => {
+    const input = "```\n| A | B |\n|---|---|\n| 1 | 2 |\n```";
+    expect(markdownToMrkdwn(input)).toBe(input);
+  });
+
+  it("does not treat a lone pipe line without a separator row as a table", () => {
+    expect(markdownToMrkdwn("a | b")).toBe("a | b");
+  });
+
+  it("keeps markdown inside table cells literal — the fence makes it monospace, not rendered", () => {
+    const input = "| H |\n|---|\n| **bold** |";
+    const out = markdownToMrkdwn(input);
+    expect(out).toContain("**bold**");
+    expect(out).not.toContain("*bold*\n");
+  });
+
+  it("pads short rows to the header's column count", () => {
+    const input = "| A | B |\n|---|---|\n| only |";
+    expect(markdownToMrkdwn(input)).toBe("```\nA    | B\n-----|--\nonly |\n```");
+  });
+});
