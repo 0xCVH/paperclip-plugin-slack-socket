@@ -81,7 +81,13 @@ let approvals: Approvals | null = null;
 // the one moment its memory matters, and each redelivered message would run
 // a duplicate agent turn. Keys are channel:ts, so they identify the same
 // event across connections.
-const eventDeduper = createEventDeduper();
+// Reporter for stale-dropped events, assigned once a ctx exists (see
+// applyConfig): the deduper is module-scoped so its memory survives config
+// re-applies, which predates any ctx to log or write metrics through.
+let staleDropReporter: ((key: string, ageMs: number) => void) | null = null;
+const eventDeduper = createEventDeduper({
+  onStaleDrop: (key, ageMs) => staleDropReporter?.(key, ageMs),
+});
 
 // This plugin binds to exactly one company for the lifetime of the worker
 // process: the first company whose config successfully applies. The host
@@ -520,6 +526,14 @@ export async function applyConfig(
   cfg: SlackSocketConfig,
   makeGateway: GatewayFactory,
 ): Promise<Health> {
+  // A stale drop means a redelivered event was never processed and never
+  // will be — invisible without this. Hermes' incident data says Slack
+  // replays can exceed the 5-minute staleness window, so make the loss
+  // observable rather than widening the window on speculation.
+  staleDropReporter = (key, ageMs) => {
+    ctx.logger.info("Dropped a stale Slack event without processing it", { key, ageMs });
+    void ctx.metrics.write("slack.events.stale_dropped", 1).catch(() => {});
+  };
   if (boundCompanyId && cfg.companyId !== boundCompanyId) {
     const message =
       `Refusing configuration for company "${cfg.companyId}": this plugin process is already bound to ` +

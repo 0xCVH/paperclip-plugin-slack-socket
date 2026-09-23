@@ -115,9 +115,11 @@ describe("slack_post_message tool", () => {
     const { handler, gateway } = setup();
     await handler({ target: "C-OK", text: "a".repeat(4200) }, RUN_CTX);
     expect(gateway.posts).toHaveLength(2);
-    expect(gateway.posts[0]!.text).toHaveLength(3900);
-    expect(gateway.posts[1]!.text).toHaveLength(300);
+    for (const post of gateway.posts) expect(post.text.length).toBeLessThanOrEqual(3900);
+    expect(gateway.posts[0]!.text.endsWith("_(1/2)_")).toBe(true);
     expect(gateway.posts[1]!.threadTs).toBe(gateway.posts[0]!.ts);
+    const rejoined = gateway.posts.map((p) => p.text.replace(/\n_\(\d+\/\d+\)_$/, "")).join("");
+    expect(rejoined).toBe("a".repeat(4200));
   });
 
   it("returns an error instead of throwing when Slack fails", async () => {

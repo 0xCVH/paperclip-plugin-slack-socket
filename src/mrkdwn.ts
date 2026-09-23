@@ -24,6 +24,68 @@ function closesBoldSafely(inner: string): boolean {
   return last !== undefined && /[\p{L}\p{N}_]/u.test(last);
 }
 
+// GFM pipe tables render in Slack as literal pipe noise — mrkdwn has no
+// table syntax. Each table (a pipe row, a separator row of dashes, then any
+// run of pipe rows) is rewritten as a fenced monospace block with
+// space-aligned columns. This runs AFTER code has been stashed, so a table
+// inside an existing fence stays byte-identical, and it emits THROUGH the
+// stash, so cell content is never touched by the emphasis passes — inside a
+// monospace fence, raw `**markdown**` reads better than half-converted
+// markup. Alignment pads by UTF-16 length; wide (CJK) glyphs mis-align by a
+// column or two, the accepted trade for not shipping a display-width table.
+const TABLE_SEPARATOR_ROW = /^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?\s*$/;
+
+function parseTableCells(line: string): string[] {
+  let inner = line.trim();
+  if (inner.startsWith("|")) inner = inner.slice(1);
+  if (inner.endsWith("|")) inner = inner.slice(0, -1);
+  return inner.split("|").map((cell) => cell.trim());
+}
+
+function wrapPipeTables(text: string, stash: (code: string) => string): string {
+  const lines = text.split("\n");
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const header = lines[i]!;
+    const separator = lines[i + 1];
+    const isTableStart =
+      header.includes("|") &&
+      !TABLE_SEPARATOR_ROW.test(header) &&
+      separator !== undefined &&
+      separator.includes("-") &&
+      TABLE_SEPARATOR_ROW.test(separator);
+    if (!isTableStart) {
+      out.push(header);
+      i += 1;
+      continue;
+    }
+    const headerCells = parseTableCells(header);
+    const rows: string[][] = [];
+    let j = i + 2;
+    while (j < lines.length && lines[j]!.includes("|") && !TABLE_SEPARATOR_ROW.test(lines[j]!)) {
+      rows.push(parseTableCells(lines[j]!));
+      j += 1;
+    }
+    const cols = Math.max(headerCells.length, ...rows.map((r) => r.length), 1);
+    const widths = Array.from({ length: cols }, (_, c) =>
+      Math.max(...[headerCells, ...rows].map((r) => (r[c] ?? "").length)),
+    );
+    const renderRow = (cells: string[]): string =>
+      Array.from({ length: cols }, (_, c) => (cells[c] ?? "").padEnd(widths[c]!))
+        .join(" | ")
+        .trimEnd();
+    const rendered = [
+      renderRow(headerCells),
+      widths.map((w) => "-".repeat(w)).join("-|-"),
+      ...rows.map(renderRow),
+    ];
+    out.push(stash(`\`\`\`\n${rendered.join("\n")}\n\`\`\``));
+    i = j;
+  }
+  return out.join("\n");
+}
+
 /**
  * Converts Markdown text to Slack mrkdwn.
  *
@@ -58,6 +120,11 @@ export function markdownToMrkdwn(text: string): string {
     return stash(block);
   });
   working = working.replace(/`[^`\n]+`/g, (match) => stash(match));
+
+  // Tables next (see wrapPipeTables): after code stashing so a table inside
+  // a fence stays literal, before everything else so cell content is behind
+  // a placeholder by the time the emphasis passes run.
+  working = wrapPipeTables(working, stash);
 
   // Images before links: both use `[...](...)`, but images have a leading
   // `!` that must not be swallowed by the link pattern first.

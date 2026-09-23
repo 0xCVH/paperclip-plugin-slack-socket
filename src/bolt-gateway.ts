@@ -1,4 +1,5 @@
 import boltPkg from "@slack/bolt";
+import { REQUIRED_BOT_SCOPES } from "./constants.js";
 import { errString } from "./redact.js";
 import { isDmChannelId } from "./slack-ids.js";
 import type {
@@ -43,11 +44,25 @@ interface GatewayLogger {
   warn(message: string, data?: Record<string, unknown>): void;
 }
 
+export interface GatewayTokenDiagnostics {
+  /** auth.test carried no bot_id — the token is likely a user token. */
+  looksLikeUserToken: boolean;
+  /** Manifest scopes absent from the token's x-oauth-scopes (empty when scope metadata was absent — unknown is not missing). */
+  missingScopes: string[];
+  /** The token's scopes as reported, or null when the response carried none. */
+  scopes: string[] | null;
+}
+
 export class BoltGateway implements SlackGateway {
   private readonly app: InstanceType<typeof App>;
   private readonly logger: GatewayLogger;
   private connected = false;
   private botId: string | undefined;
+  private tokenDiagnostics: GatewayTokenDiagnostics = {
+    looksLikeUserToken: false,
+    missingScopes: [],
+    scopes: null,
+  };
   private messageHandlers: Array<(msg: InboundMessage) => Promise<void>> = [];
   private mentionHandlers: Array<(msg: InboundMessage) => Promise<void>> = [];
   private reactionHandlers: Array<(r: InboundReaction) => Promise<void>> = [];
@@ -128,6 +143,15 @@ export class BoltGateway implements SlackGateway {
         reaction: e.reaction,
       });
     });
+
+    // Catch-all ack, registered LAST so every specific listener above wins
+    // first. Bolt acks an event only when a listener matched it; un-acked
+    // events count toward Slack's failure threshold (95% within 60 minutes),
+    // past which Slack silently disables the app's Event Subscriptions —
+    // for every event type at once. The static manifest makes an unhandled
+    // event impossible today, so this is insurance against manifest growth
+    // or an operator adding a subscription by hand.
+    this.app.event(/.*/, async () => {});
   }
 
   private async dispatch<T>(handlers: Array<(payload: T) => Promise<void>>, payload: T): Promise<void> {
@@ -185,7 +209,36 @@ export class BoltGateway implements SlackGateway {
     // `this.app.client`, which doesn't require the socket to be started.
     // Doing this first means a bad token fails fast with no socket to unwind.
     const auth = await this.app.client.auth.test();
-    this.botId = (auth as { user_id?: string }).user_id;
+    const authRecord = auth as {
+      user_id?: string;
+      bot_id?: string;
+      response_metadata?: { scopes?: string[] };
+    };
+    this.botId = authRecord.user_id;
+
+    // Connect-time token diagnostics, from data the auth.test response
+    // already carries: a bot token always comes back with a bot_id (a user
+    // token does not), and the WebClient folds the x-oauth-scopes header
+    // into response_metadata.scopes. Both failure shapes otherwise surface
+    // only as features silently doing nothing. Absent scope metadata is
+    // UNKNOWN, not missing — no warning on it.
+    const scopes = authRecord.response_metadata?.scopes ?? null;
+    const missingScopes =
+      scopes === null ? [] : REQUIRED_BOT_SCOPES.filter((scope) => !scopes.includes(scope));
+    const looksLikeUserToken = authRecord.bot_id === undefined;
+    this.tokenDiagnostics = { looksLikeUserToken, missingScopes, scopes };
+    if (looksLikeUserToken) {
+      this.logger.warn(
+        "auth.test returned no bot_id — the configured token looks like a user token, not a bot token; posting and event delivery will not behave as a bot",
+        { userId: authRecord.user_id },
+      );
+    }
+    if (missingScopes.length > 0) {
+      this.logger.warn(
+        "The bot token is missing scopes the app manifest requests; the features needing them will fail silently — reinstall the Slack app to grant them",
+        { missingScopes },
+      );
+    }
 
     const receiver = (this.app as unknown as {
       receiver?: { client?: { on?: (event: string, fn: () => void) => void } };
@@ -204,6 +257,9 @@ export class BoltGateway implements SlackGateway {
 
   isConnected(): boolean { return this.connected; }
   botUserId(): string | undefined { return this.botId; }
+
+  /** Connect-time token diagnostics captured by start(); see the comment there. */
+  diagnostics(): GatewayTokenDiagnostics { return this.tokenDiagnostics; }
 
   async probe(): Promise<boolean> {
     // Plain HTTP against the same client `start()` uses, so it does not need

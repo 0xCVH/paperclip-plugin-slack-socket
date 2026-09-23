@@ -53,3 +53,14 @@ describe("manifest", () => {
     expect(PLUGIN_VERSION).toBe(pkg.version);
   });
 });
+
+describe("slack-app-manifest drift", () => {
+  it("keeps REQUIRED_BOT_SCOPES in lockstep with the checked-in Slack app manifest", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const { REQUIRED_BOT_SCOPES } = await import("../src/constants.js");
+    const manifest = JSON.parse(await readFile(new URL("../slack-app-manifest.json", import.meta.url), "utf8")) as {
+      oauth_config: { scopes: { bot: string[] } };
+    };
+    expect([...REQUIRED_BOT_SCOPES].sort()).toEqual([...manifest.oauth_config.scopes.bot].sort());
+  });
+});

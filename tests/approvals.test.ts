@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createApprovals } from "../src/approvals.js";
 import { ACTION_IDS, STATE_KEYS } from "../src/constants.js";
 import { FakeGateway, makeCtx, TEST_CONFIG } from "./helpers.js";
@@ -265,5 +265,35 @@ describe("approvals", () => {
     expect(gateway.updates).toHaveLength(1);
     expect(gateway.updates.at(-1)!.text).toContain("sam");
     expect(gateway.updates.at(-1)!.text).not.toContain("Paperclip Web");
+  });
+});
+
+describe("double-click claim", () => {
+  it("ignores a second click while the first decision call is in flight — one REST call, no failure ephemeral", async () => {
+    const { ctx, gateway, approvals } = setup();
+    let release!: (v: unknown) => void;
+    (ctx.http.fetch as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      () => new Promise((res) => { release = res; }),
+    );
+
+    const first = approvals.handleAction(approveAction);
+    await new Promise((r) => setTimeout(r, 5));
+    const second = approvals.handleAction(approveAction);
+    await new Promise((r) => setTimeout(r, 5));
+    release({ status: 200, json: async () => ({}) });
+    await Promise.all([first, second]);
+
+    expect(ctx.http.fetch).toHaveBeenCalledTimes(1);
+    expect(gateway.ephemerals.filter((e) => e.text.includes(":x:"))).toHaveLength(0);
+  });
+
+  it("releases the claim on failure so a genuine retry click still works", async () => {
+    const { ctx, approvals } = setup();
+    (ctx.http.fetch as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("network"));
+
+    await approvals.handleAction(approveAction);
+    await approvals.handleAction(approveAction);
+
+    expect(ctx.http.fetch).toHaveBeenCalledTimes(2);
   });
 });

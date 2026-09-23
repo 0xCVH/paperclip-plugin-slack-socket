@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createEventDeduper } from "../src/event-dedup.js";
 
 describe("createEventDeduper", () => {
@@ -47,5 +47,22 @@ describe("createEventDeduper", () => {
     expect(deduper.shouldProcess(`C3:${tsFor(10)}`)).toBe(false);
     // C2 was evicted in turn, so it is treated as new again.
     expect(deduper.shouldProcess(`C2:${tsFor(20)}`)).toBe(true);
+  });
+});
+
+describe("stale-drop observability", () => {
+  it("reports a stale drop through onStaleDrop with the event's age", () => {
+    const onStaleDrop = vi.fn();
+    const deduper = createEventDeduper({ maxAgeMs: 1_000, now: () => 10_000_000, onStaleDrop });
+    expect(deduper.shouldProcess("C1:8000.000000")).toBe(false);
+    expect(onStaleDrop).toHaveBeenCalledWith("C1:8000.000000", 2_000_000);
+  });
+
+  it("does not report duplicates or fresh events as stale drops", () => {
+    const onStaleDrop = vi.fn();
+    const deduper = createEventDeduper({ maxAgeMs: 60_000, now: () => 10_000_000, onStaleDrop });
+    expect(deduper.shouldProcess("C1:9999.000000")).toBe(true);
+    expect(deduper.shouldProcess("C1:9999.000000")).toBe(false); // duplicate, not stale
+    expect(onStaleDrop).not.toHaveBeenCalled();
   });
 });
