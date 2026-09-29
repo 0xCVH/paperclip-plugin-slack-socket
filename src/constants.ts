@@ -32,6 +32,10 @@ export const JOB_KEYS = {
   cleanup: "cleanup",
 } as const;
 
+export const API_ROUTE_KEYS = {
+  slackInbound: "slack-inbound",
+} as const;
+
 export const TOOL_NAMES = {
   askHuman: "ask_human",
   postMessage: "slack_post_message",
@@ -183,6 +187,7 @@ export const DEFAULT_CONFIG: SlackSocketConfig = {
   slackAppTokenRef: "",
   companyId: "",
   defaultAgentId: "",
+  additionalBots: [],
   defaultChannelId: "",
   notifyOnIssueCreated: true,
   notifyOnIssueDone: true,
@@ -197,6 +202,7 @@ export const DEFAULT_CONFIG: SlackSocketConfig = {
   turnTimeoutMinutes: 10,
   streamPartialReplies: false,
   chatPromptPreamble: DEFAULT_CHAT_PROMPT_PREAMBLE,
+  continueMentionedThreads: false,
   // Default chosen because today's behavior is the defect: nothing depends
   // on the bot forgetting the previous line of a DM.
   dmSessionMode: "channel",

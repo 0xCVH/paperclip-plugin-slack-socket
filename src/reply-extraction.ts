@@ -83,6 +83,26 @@ export function extractTaggedReply(text: string): string | null {
   return content || null;
 }
 
+// Hermes prints the complete input prompt to stdout before this boundary.
+// That prompt necessarily contains the literal example
+//   <slack_reply> and </slack_reply>
+// from our conversational framing. If inference then fails before producing
+// an answer, scanning the whole raw transcript would recover the word "and"
+// from the echoed instruction and post it as though it were the agent's
+// reply. Only stdout after Hermes hands off to the model can contain a
+// model-authored reply. Other adapters that do not emit this marker retain
+// the existing raw-stream behaviour.
+export const HERMES_AGENT_OUTPUT_BOUNDARY = "Initializing agent...";
+
+export function extractRawStreamedTaggedReply(text: string): string | null {
+  const boundaryIdx = text.lastIndexOf(HERMES_AGENT_OUTPUT_BOUNDARY);
+  const agentOutput =
+    boundaryIdx === -1
+      ? text
+      : text.slice(boundaryIdx + HERMES_AGENT_OUTPUT_BOUNDARY.length);
+  return extractTaggedReply(filterRuntimeNoticeLines(agentOutput));
+}
+
 // The claude_local adapter's stdout is a stream of newline-delimited ACP
 // envelopes, not raw text — the agent's message text arrives as
 //   {"type":"acpx.text_delta","text":"…","channel":"output","tag":"agent_message_chunk"}

@@ -17,12 +17,24 @@ export type SecretRef = string | EnvSecretRefBinding;
 // does not touch them.
 export type DmSessionMode = "channel" | "thread";
 
+/** A second Slack app connected to a distinct Paperclip agent. */
+export interface AdditionalSlackBotConfig {
+  /** Stable local key used to isolate events and conversation state. */
+  key: string;
+  slackBotTokenRef: SecretRef;
+  slackAppTokenRef: SecretRef;
+  agentId: string;
+  /** Inherits the primary allowlist when omitted. */
+  allowedSlackUserIds?: string[];
+}
+
 export interface SlackSocketConfig {
   slackBotTokenRef: SecretRef;
   slackAppTokenRef: SecretRef;
   paperclipApiKeyRef: SecretRef;
   companyId: string;
   defaultAgentId: string;
+  additionalBots: AdditionalSlackBotConfig[];
   defaultChannelId: string;
   notifyOnIssueCreated: boolean;
   notifyOnIssueDone: boolean;
@@ -37,6 +49,8 @@ export interface SlackSocketConfig {
   streamPartialReplies: boolean;
   chatPromptPreamble: string;
   dmSessionMode: DmSessionMode;
+  /** Continue an existing channel thread without requiring another mention. */
+  continueMentionedThreads?: boolean;
   /**
    * Seed a newly created session with the Slack thread it was mentioned in
    * (see buildSeedBlock in chat.ts). Default true: without it the agent
@@ -65,6 +79,8 @@ export interface SlackSocketConfig {
 
 export interface SessionEntry {
   sessionId: string;
+  /** Agent this conversation is bound to. A missing value is legacy state. */
+  agentId?: string;
   channel: string;
   /**
    * The thread this session belongs to, or CHANNEL_SESSION_TS when `scope`
