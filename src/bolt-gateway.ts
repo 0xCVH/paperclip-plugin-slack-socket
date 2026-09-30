@@ -126,7 +126,10 @@ export class BoltGateway implements SlackGateway {
     });
 
     this.app.event("app_mention", async ({ event }) => {
-      const e = event as { channel: string; user?: string; text?: string; ts: string; thread_ts?: string };
+      const e = event as {
+        channel: string; user?: string; text?: string; ts: string; thread_ts?: string;
+        bot_id?: string; subtype?: string;
+      };
       await this.dispatch(this.mentionHandlers, {
         channel: e.channel,
         // Unlike `message`, app_mention carries no channel_type field, so
@@ -140,6 +143,9 @@ export class BoltGateway implements SlackGateway {
         text: e.text ?? "",
         ts: e.ts,
         threadTs: e.thread_ts,
+        // Slack delivers app_mention for other bots' messages too. Chat
+        // still answers them (unchanged); the mention relay must know.
+        fromBot: Boolean(e.bot_id) || e.subtype === "bot_message",
       });
     });
 

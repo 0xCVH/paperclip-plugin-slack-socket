@@ -1450,3 +1450,35 @@ describe("stale-drop observability", () => {
     expect(ctx.metrics.write).toHaveBeenCalledWith("slack.events.stale_dropped", 1);
   });
 });
+
+describe("worker: mention relay wiring", () => {
+  it("records an @mention in an issue-linked thread on the issue before the agent turn", async () => {
+    const { applyConfig } = await loadWorker();
+    const { ctx, stateStore } = makeCtx();
+    const gateway = new FakeGateway();
+    const ROOT_TS = `${Date.now() / 1000 - 600}.000100`;
+    const MENTION_TS = `${Date.now() / 1000 - 5}.000200`;
+    const issue = {
+      id: "11111111-2222-3333-4444-555555555555", identifier: "POL-3099", companyId: "co-1",
+      title: "Confirm the transfer", status: "in_progress", assigneeAgentId: "agent-owner", executionPolicy: null,
+    };
+    (ctx.issues.get as any).mockImplementation(async (ref: string) =>
+      ref === issue.id || ref === issue.identifier ? issue : null,
+    );
+    stateStore.set(STATE_KEYS.threadIssue("C-ESC", ROOT_TS), {
+      issueId: issue.id, channel: "C-ESC", ts: ROOT_TS, createdAt: new Date().toISOString(),
+    });
+
+    await applyConfig(ctx, cfg(), () => gateway);
+    await gateway.emitMention({
+      channel: "C-ESC", channelType: "channel", user: "U-HUMAN",
+      text: "<@UBOT> the fix is merged", ts: MENTION_TS, threadTs: ROOT_TS,
+    });
+
+    expect(ctx.issues.createComment).toHaveBeenCalledTimes(1);
+    expect((ctx.issues.createComment as any).mock.calls[0][0]).toBe(issue.id);
+    expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledTimes(1);
+    const prompt = (ctx.agents.sessions.sendMessage as any).mock.calls[0][2].prompt as string;
+    expect(prompt).toContain("Linked Paperclip issue: POL-3099");
+  });
+});

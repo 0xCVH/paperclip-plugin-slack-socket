@@ -11,15 +11,15 @@
 import { createHash } from "node:crypto";
 import type { PluginContext, ToolRunContext } from "@paperclipai/plugin-sdk";
 import { checkToolCompany } from "./access.js";
-import {
-  getLiveChatRun,
-  getThreadIssue,
-  isAgentPost,
-  THREAD_LINK_MAX_AGE_MS,
-} from "./chat-run-binding.js";
-import { RECORD_ON_ISSUE_TOOL_DECLARATION, STATE_KEYS, THREAD_FETCH_PAGE_SIZE, TOOL_NAMES, stateScope } from "./constants.js";
+import { getLiveChatRun } from "./chat-run-binding.js";
+import { RECORD_ON_ISSUE_TOOL_DECLARATION, STATE_KEYS, TOOL_NAMES, stateScope } from "./constants.js";
 import { errString } from "./redact.js";
-import type { ChatRunBinding, RecordedWrite, SlackGateway, SlackSocketConfig, ThreadMessage } from "./types.js";
+import { hasTrustPolicy, issueMatches, resolveThreadScope } from "./thread-issue.js";
+import type { ChatRunBinding, RecordedWrite, SlackGateway, SlackSocketConfig } from "./types.js";
+
+// The scope parsers live in thread-issue.ts now, shared with the mention
+// relay; re-exported so callers (and the tests) keep their import path.
+export { extractIssueLinkRefs, extractIssueRefs } from "./thread-issue.js";
 
 /** Mirrors the host's CROSS_ISSUE_INFLUENCE_LIMIT, so a chat run gets no more room than an issue run. */
 export const RECORD_ON_ISSUE_RUN_CAP = 20;
@@ -48,63 +48,6 @@ export interface RecordOnIssue {
   registerTool(): void;
 }
 
-// Paperclip identifiers look like POL-3267. Matched case-insensitively
-// because a person typing in Slack may write pol-3267; compared upper-cased.
-const IDENTIFIER_RE = /\b([A-Za-z][A-Za-z0-9]{1,9}-\d{1,9})\b/g;
-const UUID_RE = /\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/gi;
-const SLACK_LINK_RE = /<(https?:\/\/[^|>\s]+)(?:\|[^>]*)?>/g;
-
-/** Issue references (upper-cased identifiers, lower-cased UUIDs) named in free text. */
-export function extractIssueRefs(text: string): Set<string> {
-  const refs = new Set<string>();
-  for (const m of text.matchAll(IDENTIFIER_RE)) refs.add(m[1]!.toUpperCase());
-  for (const m of text.matchAll(UUID_RE)) refs.add(m[1]!.toLowerCase());
-  return refs;
-}
-
-/**
- * Issue references in the links of `message` that point at this Paperclip
- * instance: `<base>/<PREFIX>/issues/<IDENT>` or `<base>/issues/<id>`. Only
- * links on the configured base URL count, so a look-alike domain links
- * nothing. Reads both `text` and the Block Kit links, because a blocks
- * message's `text` is only a fallback and often drops the URL.
- */
-export function extractIssueLinkRefs(message: ThreadMessage, paperclipBaseUrl: string): Set<string> {
-  const refs = new Set<string>();
-  const base = paperclipBaseUrl.trim().replace(/\/+$/, "");
-  if (!base) return refs;
-  const urls = [...message.text.matchAll(SLACK_LINK_RE)].map((m) => m[1]!).concat(message.blockLinks ?? []);
-  for (const url of urls) {
-    if (!url.startsWith(`${base}/`)) continue;
-    const path = url.slice(base.length).split(/[?#]/)[0]!;
-    const match = /^\/(?:[A-Za-z0-9_-]+\/)?issues\/([^/]+)\/?$/.exec(path);
-    if (!match) continue;
-    let ref: string;
-    try {
-      ref = decodeURIComponent(match[1]!);
-    } catch {
-      continue;
-    }
-    for (const r of extractIssueRefs(ref)) refs.add(r);
-  }
-  return refs;
-}
-
-interface ThreadScope {
-  linked: Set<string>;
-  named: Set<string>;
-}
-
-function issueMatches(refs: Set<string>, issue: { id: string; identifier: string | null }): boolean {
-  return refs.has(issue.id.toLowerCase()) || (issue.identifier !== null && refs.has(issue.identifier.toUpperCase()));
-}
-
-/** True when the issue's execution policy puts it under a trust preset or boundary. */
-function hasTrustPolicy(policy: unknown): boolean {
-  if (!policy || typeof policy !== "object") return false;
-  return /"(trustPreset|reviewPreset|trustBoundary)"\s*:\s*(?!null)/.test(JSON.stringify(policy));
-}
-
 function hashBody(body: string): string {
   return createHash("sha256").update(body).digest("hex");
 }
@@ -122,54 +65,6 @@ export function createRecordOnIssue({ ctx, gateway, getConfig, now = Date.now }:
     return next.finally(() => {
       if (runChains.get(runId) === next) runChains.delete(runId);
     });
-  }
-
-  /**
-   * Which issues this run's thread may write to. `linked` holds the thread's
-   * own issue: the plugin's thread -> issue link, or an issue link in a
-   * thread root this bot posted itself — never one whose words an agent
-   * chose (see STATE_KEYS.agentPost), and never an unknown-age root.
-   * `named` holds issues a human named in the thread or the turn's
-   * triggering message. Bot text never widens either set.
-   */
-  async function resolveThreadScope(binding: ChatRunBinding, cfg: SlackSocketConfig): Promise<ThreadScope> {
-    const linked = new Set<string>();
-    const named = extractIssueRefs(binding.triggerText);
-    if (!binding.threadTs) return { linked, named };
-
-    const linkedId = await getThreadIssue(ctx, binding.channel, binding.threadTs);
-    if (linkedId) linked.add(linkedId.toLowerCase());
-
-    let messages: ThreadMessage[] = [];
-    try {
-      messages = await gateway.fetchThreadReplies(binding.channel, binding.threadTs, THREAD_FETCH_PAGE_SIZE);
-    } catch (err) {
-      // Fail closed: without the transcript only the stored link and the
-      // triggering message count.
-      ctx.logger.warn("record_on_issue: thread fetch failed; scope limited to the stored link and the trigger", {
-        err: errString(err),
-      });
-    }
-    const botId = gateway.botUserId();
-    for (const message of messages) {
-      if (message.ts === binding.threadTs) {
-        const authoredByThisBot = message.isBot && botId !== undefined && message.user === botId;
-        const ageMs = now() - Number.parseFloat(message.ts) * 1000;
-        if (
-          authoredByThisBot &&
-          Number.isFinite(ageMs) &&
-          ageMs <= THREAD_LINK_MAX_AGE_MS &&
-          !(await isAgentPost(ctx, binding.channel, message.ts))
-        ) {
-          for (const ref of extractIssueLinkRefs(message, cfg.paperclipBaseUrl)) linked.add(ref);
-        }
-        // A human-written root still names issues like any human message
-        // below; it just never makes one "this thread's issue".
-      }
-      if (message.isBot || message.fromAnyBot || !message.user) continue;
-      for (const ref of extractIssueRefs(message.text)) named.add(ref);
-    }
-    return { linked, named };
   }
 
   return {
@@ -242,8 +137,13 @@ export function createRecordOnIssue({ ctx, gateway, getConfig, now = Date.now }:
             );
           }
 
-          // 4. The thread must name the issue.
-          const scope = await resolveThreadScope(binding, cfg);
+          // 4. The thread must name the issue (thread-issue.ts decides how,
+          // the same way it does for the mention relay).
+          const scope = await resolveThreadScope(
+            { ctx, gateway, now },
+            { channel: binding.channel, threadTs: binding.threadTs, triggerText: binding.triggerText },
+            cfg,
+          );
           const rule: ScopeRule | null = issueMatches(scope.linked, issue)
             ? "thread_linked"
             : issueMatches(scope.named, issue)

@@ -180,3 +180,27 @@ describe("runCleanup", () => {
     expect(stateStore.get(STATE_KEYS.approvalMessageIndex)).toEqual([freshKey]);
   });
 });
+
+describe("runCleanup: relayed-mention records", () => {
+  it("drops relayed-mention records older than a week and keeps recent ones", async () => {
+    const { ctx, stateStore } = makeCtx();
+    const DAYS = 24 * HOURS;
+    const stale = STATE_KEYS.relayedMention("C-ESC", "1.1");
+    const fresh = STATE_KEYS.relayedMention("C-ESC", "2.2");
+    stateStore.set(stale, {
+      channel: "C-ESC", ts: "1.1", createdAt: new Date(Date.now() - 8 * DAYS).toISOString(),
+      issueId: "iss-1", commentId: "comment-1",
+    });
+    stateStore.set(fresh, {
+      channel: "C-ESC", ts: "2.2", createdAt: new Date(Date.now() - 1 * DAYS).toISOString(),
+      issueId: "iss-1", commentId: "comment-2",
+    });
+    stateStore.set(STATE_KEYS.relayedMentionIndex, [stale, fresh]);
+
+    await runCleanup(ctx, new FakeGateway(), TEST_CONFIG);
+
+    expect(stateStore.get(stale)).toBeUndefined();
+    expect(stateStore.get(fresh)).toBeDefined();
+    expect(stateStore.get(STATE_KEYS.relayedMentionIndex)).toEqual([fresh]);
+  });
+});

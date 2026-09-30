@@ -193,6 +193,13 @@ const manifest: PaperclipPluginManifestV1 = {
           "When on (the default), the first message of a new conversation also carries the thread the bot was mentioned in, fenced as background, so it can answer questions about messages posted above it. This means the agent reads messages from people who never addressed it: anyone who can post in a channel the bot is in can put text in front of it. Turn it off to send only the message addressed to the bot.",
         default: DEFAULT_CONFIG.seedThreadHistory,
       },
+      relayMentionsToIssue: {
+        type: "boolean",
+        title: "Record @mentions on the thread's issue",
+        description:
+          "When on (the default), a person's @mention inside a thread that belongs to a Paperclip issue — a thread the plugin posted for that issue, or one whose root message this bot posted with a link to it — is written onto that issue as a quoted comment by the plugin itself, immediately and before the agent replies, and the issue's assignee is woken. The agent is told which issue the thread is about and that the message is already on it. Off, nothing is written; the agent is still told which issue the thread is about. Either way the agent answers in the thread as before.",
+        default: DEFAULT_CONFIG.relayMentionsToIssue,
+      },
       allowedSlackUserIds: {
         type: "array",
         items: { type: "string" },

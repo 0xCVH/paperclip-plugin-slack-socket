@@ -414,3 +414,28 @@ describe("catch-all event ack", () => {
     expect(appInstances[0]!.eventRegistrations.some((r) => r.name instanceof RegExp)).toBe(true);
   });
 });
+
+describe("BoltGateway app_mention authorship", () => {
+  async function makeGateway() {
+    appInstances.length = 0;
+    const { BoltGateway } = await import("../src/bolt-gateway.js");
+    return new BoltGateway({ botToken: "xoxb", appToken: "xapp", logger: { warn: vi.fn() } });
+  }
+
+  it("marks a mention posted by a bot as fromBot, and a person's mention as not", async () => {
+    const gateway = await makeGateway();
+    const received: Array<{ user: string; fromBot?: boolean }> = [];
+    gateway.onMention(async (msg) => void received.push(msg));
+    await appInstances[0]!.handlers.get("app_mention")!({
+      event: { channel: "C0123456789", user: "UOTHERBOT", bot_id: "B0AAAAAAA", text: "<@UBOT> hi", ts: "1.1" },
+    });
+    await appInstances[0]!.handlers.get("app_mention")!({
+      event: { channel: "C0123456789", user: "U1", text: "<@UBOT> hi", ts: "1.2" },
+    });
+    await appInstances[0]!.handlers.get("app_mention")!({
+      event: { channel: "C0123456789", subtype: "bot_message", text: "<@UBOT> hi", ts: "1.3" },
+    });
+    expect(received.map((m) => m.fromBot === true)).toEqual([true, false, true]);
+    expect(received[2]!.user).toBe("");
+  });
+});

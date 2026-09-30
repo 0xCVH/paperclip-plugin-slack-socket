@@ -68,3 +68,14 @@ describe("slack-app-manifest drift", () => {
     expect([...REQUIRED_BOT_SCOPES].sort()).toEqual([...manifest.oauth_config.scopes.bot].sort());
   });
 });
+
+describe("manifest: mention relay setting", () => {
+  it("exposes relayMentionsToIssue as an optional boolean that defaults on", () => {
+    const schema = manifest.instanceConfigSchema as {
+      properties: Record<string, { type?: string; default?: unknown }>;
+      required: string[];
+    };
+    expect(schema.properties.relayMentionsToIssue).toMatchObject({ type: "boolean", default: true });
+    expect(schema.required).not.toContain("relayMentionsToIssue");
+  });
+});

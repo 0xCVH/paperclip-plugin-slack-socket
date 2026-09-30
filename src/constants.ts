@@ -21,7 +21,7 @@ export const REQUIRED_BOT_SCOPES = [
   "commands",
 ] as const;
 
-export const PLUGIN_VERSION = "0.12.0";
+export const PLUGIN_VERSION = "0.13.0";
 
 export const ACTION_IDS = {
   approvalApprove: "approval_approve",
@@ -77,6 +77,12 @@ export const STATE_KEYS = {
   chatRunIndex: "chat-run-index",
   chatRun: (runId: string) => `chat-run:${runId}`,
   chatRunWrites: (runId: string) => `chat-run-writes:${runId}`,
+  // A Slack @mention the relay has already written onto an issue (see
+  // mention-relay.ts). Socket Mode redelivers events at least once and a
+  // restart empties the in-memory deduper; this record is what keeps a
+  // redelivered mention from landing on the issue twice.
+  relayedMentionIndex: "relayed-mention-index",
+  relayedMention: (channel: string, ts: string) => `relayed-mention:${channel}:${ts}`,
 } as const;
 
 export function stateScope(stateKey: string): ScopeKey {
@@ -135,7 +141,10 @@ export const RECORD_ON_ISSUE_TOOL_DECLARATION: PluginToolDeclaration = {
   description:
     "Write a comment onto a Paperclip issue from a Slack conversation. This is the only way to put " +
     "something on an issue while you are answering in Slack — the issues REST API refuses writes from " +
-    "Slack chat runs. The target must be this thread's own issue (the issue the thread was posted for), " +
+    "Slack chat runs. When a person @mentions you in a thread that belongs to an issue, the plugin has " +
+    "already recorded their message on that issue before your turn began — your prompt says so — so use " +
+    "this only for something else: a note of your own, or an issue a human named. " +
+    "The target must be this thread's own issue (the issue the thread was posted for), " +
     "or an issue a human named in this thread. A footer saying it was relayed from Slack is added " +
     "automatically, and the issue's assignee is woken unless wakeAssignee is false. A refusal (a result " +
     "with a `code`) is final: do not retry it and do not try the REST API instead — tell the person in " +
@@ -246,6 +255,11 @@ export const DEFAULT_CONFIG: SlackSocketConfig = {
   // messages from people who never addressed it) and some operators will
   // decline it — see the Security section of the design doc.
   seedThreadHistory: true,
+  // Default on: a person's @mention in an issue's thread is meant for that
+  // issue's owner, and only the plugin can put it there (see
+  // mention-relay.ts). Off, the agent still learns which issue the thread
+  // is about; nothing is written.
+  relayMentionsToIssue: true,
   allowedSlackUserIds: [],
   agentPostMessageEnabled: false,
   agentPostToChannelsEnabled: false,
