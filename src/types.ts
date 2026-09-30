@@ -46,6 +46,12 @@ export interface SlackSocketConfig {
    * only ever reads text addressed to it, at the cost of that question.
    */
   seedThreadHistory: boolean;
+  /**
+   * Write a person's @mention onto the issue the thread belongs to, before
+   * the agent answers (see mention-relay.ts). Off, the agent is still told
+   * which issue the thread is about; nothing is written.
+   */
+  relayMentionsToIssue: boolean;
   allowedSlackUserIds: string[];
   // --- Agent-initiated posting (the slack_post_message tool) ---------
   //

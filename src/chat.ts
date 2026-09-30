@@ -40,6 +40,7 @@ export {
 };
 export type { ThreadContextEntry };
 import { bindChatRun, markChatRunSettled, recordAgentPost } from "./chat-run-binding.js";
+import type { MentionRelay, MentionRelayOutcome } from "./mention-relay.js";
 import { escapeMrkdwn } from "./formatters.js";
 import { markdownToMrkdwn } from "./mrkdwn.js";
 import { errString } from "./redact.js";
@@ -81,6 +82,12 @@ export interface ChatDeps {
    * (see the heartbeat in streamReply).
    */
   heartbeatIntervalMs?: number;
+  /**
+   * Writes a person's @mention onto the issue their thread belongs to before
+   * the agent is woken, and tells the prompt about it (see mention-relay.ts).
+   * Optional so the conversation works unchanged without one.
+   */
+  relay?: MentionRelay;
 }
 
 export interface Chat {
@@ -129,13 +136,53 @@ function truncateForStreaming(text: string): string {
 // nothing to seed), this must stay byte-for-byte what it produced before
 // seeding existed — nothing about the untrusted-block problem applies to a
 // prompt that never had one.
-export function buildChatPrompt(preamble: string, text: string, seed = ""): string {
+export function buildChatPrompt(preamble: string, text: string, seed = "", context = ""): string {
   const trimmedPreamble = preamble.trim();
+  // `context` is TRUSTED framing — the thread's issue as Paperclip itself
+  // describes it (see buildLinkedIssueContext) — so it belongs with the
+  // preamble, ahead of the untrusted seed block, never inside or after it.
+  // Empty context reproduces the pre-context output byte for byte.
+  const head = [trimmedPreamble ? preamble : "", context].filter((part) => part).join("\n\n");
   if (!seed) {
-    return trimmedPreamble ? `${preamble}\n\nSlack message:\n${text}` : text;
+    return head ? `${head}\n\nSlack message:\n${text}` : text;
   }
-  const framed = trimmedPreamble ? `${preamble}\n\n${seed}` : seed;
+  const framed = head ? `${head}\n\n${seed}` : seed;
   return `${framed}\n\nSlack message:\n${text}`;
+}
+
+// The linked-issue block the mention relay contributes to a prompt: which
+// issue the thread is about (so the agent can answer about it and read it
+// over the API), and whether the person's message already sits on it (so
+// the agent answers instead of trying to write it a second time). Empty when
+// the thread has no issue. The title is flattened to one line — it is
+// Paperclip data, but issue titles are often written from alert text, so it
+// must not be able to add a line of its own to the prompt.
+export function buildLinkedIssueContext(outcome: MentionRelayOutcome | null): string {
+  if (!outcome?.issue) return "";
+  const { issue, recorded, skipped } = outcome;
+  const label = issue.identifier ?? issue.id;
+  const title = issue.title.replace(/\s+/g, " ").trim().slice(0, 200);
+  const lines = [
+    `Linked Paperclip issue: ${label} — "${title}" (status: ${issue.status}, assignee: ${issue.assigneeAgentId ?? "none"})`,
+    issue.url,
+  ];
+  if (recorded) {
+    lines.push(
+      `This person's message has already been recorded on ${label} as comment ${recorded.commentId}. ` +
+        "Do not record it again — answer them, and read the issue over the API if you need more than the thread shows.",
+    );
+  } else {
+    const why =
+      skipped === "disabled"
+        ? "relaying is switched off"
+        : skipped === "low_trust_target"
+          ? "the issue is under a trust policy"
+          : skipped === "write_failed"
+            ? "the write failed"
+            : (skipped ?? "unknown reason");
+    lines.push(`This person's message was not recorded on the issue (${why}). Tell them if they ask.`);
+  }
+  return lines.join("\n");
 }
 
 // Floor for a single chat turn's watchdog timeout. The manifest schema's
@@ -386,6 +433,22 @@ export function createChat(deps: ChatDeps): Chat {
   function stripMention(text: string): string {
     const botId = gateway.botUserId();
     return (botId ? text.replaceAll(`<@${botId}>`, "") : text).trim();
+  }
+
+  // The relay decides for itself whether a turn qualifies (a thread in a
+  // channel whose issue it can establish); a DM or an unlinked thread comes
+  // back as a cheap skip. Whatever happens in it, the conversation goes on.
+  async function relayMention(msg: InboundMessage): Promise<MentionRelayOutcome | null> {
+    if (!deps.relay) return null;
+    try {
+      return await deps.relay.relayMention(msg);
+    } catch (err) {
+      ctx.logger.warn("Mention relay failed; continuing the conversation without it", {
+        err: errString(err),
+        channel: msg.channel,
+      });
+      return null;
+    }
   }
 
   // `@paperclip reset` — exact match only, after mention-stripping, trimming
@@ -1341,6 +1404,13 @@ export function createChat(deps: ChatDeps): Chat {
         });
       }
 
+      // Mention relay: the person's message goes onto the thread's issue
+      // NOW — after the placeholder, so they see the bot react at once, but
+      // before the (possibly slow) thread fetch and the agent turn, so the
+      // issue's owner has it whatever the agent does next. The outcome
+      // becomes trusted context in the prompt below.
+      const relayOutcome = await relayMention(msg);
+
       // `placeholder.ts` is threaded through so buildSeedBlock can exclude
       // the placeholder message itself from the transcript it reads back —
       // see the BLOCKER 1 note on buildSeedBlock.
@@ -1389,7 +1459,12 @@ export function createChat(deps: ChatDeps): Chat {
         if (delta) void ctx.metrics.write("slack.turns.thread_delta", 1).catch(() => {});
       }
 
-      const prompt = buildChatPrompt(cfg.chatPromptPreamble, text, seed || delta);
+      const prompt = buildChatPrompt(
+        cfg.chatPromptPreamble,
+        text,
+        seed || delta,
+        buildLinkedIssueContext(relayOutcome),
+      );
       const { delivered } = await streamReply(cfg, entry, scope.replyThreadTs, prompt, placeholder, {
         text: msg.text,
         user: msg.user,

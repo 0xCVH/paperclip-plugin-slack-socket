@@ -10,6 +10,10 @@ import type { PendingQuestion, SessionEntry, SlackGateway, SlackSocketConfig } f
 // Entity→message links exist only so a follow-up event can find the message
 // it should update. After a month, no such event is coming.
 const MESSAGE_LINK_MAX_AGE_MS = 30 * 24 * 3_600_000; // 30 days
+// A relayed-mention record exists only to stop a redelivered Slack event
+// from writing the same mention twice. Slack replays are minutes old, not
+// days; a week is already generous.
+const RELAYED_MENTION_MAX_AGE_MS = 7 * 24 * 3_600_000; // 7 days
 
 export async function runCleanup(
   ctx: PluginContext,
@@ -98,4 +102,5 @@ export async function runCleanup(
   await pruneMessageLinks(ctx, STATE_KEYS.issueThreadIndex, MESSAGE_LINK_MAX_AGE_MS, now);
   await pruneMessageLinks(ctx, STATE_KEYS.approvalMessageIndex, MESSAGE_LINK_MAX_AGE_MS, now);
   await pruneChatRunState(ctx, now);
+  await pruneMessageLinks(ctx, STATE_KEYS.relayedMentionIndex, RELAYED_MENTION_MAX_AGE_MS, now);
 }

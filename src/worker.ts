@@ -15,6 +15,7 @@ import { mergeConfig } from "./config.js";
 import { DEFAULT_CONFIG, JOB_KEYS, SLASH_COMMAND } from "./constants.js";
 import { createEventDeduper } from "./event-dedup.js";
 import { createGatewayProxy } from "./gateway-proxy.js";
+import { createMentionRelay } from "./mention-relay.js";
 import { registerNotifications } from "./notifications.js";
 import { createPostMessage, type PostMessage } from "./post-message.js";
 import { createRecordOnIssue } from "./record-on-issue.js";
@@ -447,7 +448,9 @@ function ensureCoreModules(ctx: PluginContext): CoreModules {
   const gatewayProxy = createGatewayProxy(() => currentGateway, ctx.logger);
   const getConfig = async (): Promise<SlackSocketConfig> => getLiveConfig();
 
-  const chat = createChat({ ctx, gateway: gatewayProxy, getConfig });
+  // Built ahead of chat: a mention's relay outcome feeds the chat prompt.
+  const relay = createMentionRelay({ ctx, gateway: gatewayProxy, getConfig });
+  const chat = createChat({ ctx, gateway: gatewayProxy, getConfig, relay });
   const askHuman = createAskHuman({ ctx, gateway: gatewayProxy, getConfig });
   const commands = createCommands({ ctx, gateway: gatewayProxy, getConfig });
   // Both tools register here, from setup()'s clean context, against the
