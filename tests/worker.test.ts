@@ -167,6 +167,7 @@ describe("applyConfig", () => {
     expect((ctx.tools.register as any).mock.calls.map((c: unknown[]) => c[0])).toEqual([
       TOOL_NAMES.askHuman,
       TOOL_NAMES.postMessage,
+      TOOL_NAMES.recordOnIssue,
     ]);
     // end-to-end through the wiring: a slash command reaches the commands module
     await gateway.emitCommand({ command: SLASH_COMMAND, text: "help", user: "U1", channel: "C1" });

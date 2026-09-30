@@ -1,5 +1,6 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { checkToolCompany } from "./access.js";
+import { recordAgentPost } from "./chat-run-binding.js";
 import { ASK_HUMAN_TOOL_DECLARATION, STATE_KEYS, TOOL_NAMES, stateScope } from "./constants.js";
 import { formatQuestion, formatQuestionResolved } from "./formatters.js";
 import { errString } from "./redact.js";
@@ -170,6 +171,10 @@ export function createAskHuman({ ctx, gateway, getConfig }: AskHumanDeps): AskHu
             return { error: "Question was posted to Slack but could not be tracked; ask again." };
           }
 
+          // The question is agent-worded and top-level (see STATE_KEYS.agentPost).
+          await recordAgentPost(ctx, posted).catch((err) => {
+            ctx.logger.warn("ask_human: failed to record the question as agent-worded", { err: errString(err) });
+          });
           try {
             await ctx.metrics.write("slack.questions.asked", 1, { mode });
           } catch (err) {

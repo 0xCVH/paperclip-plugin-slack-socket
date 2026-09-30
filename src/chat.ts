@@ -39,6 +39,7 @@ export {
   selectThreadMessages,
 };
 export type { ThreadContextEntry };
+import { bindChatRun, markChatRunSettled, recordAgentPost } from "./chat-run-binding.js";
 import { escapeMrkdwn } from "./formatters.js";
 import { markdownToMrkdwn } from "./mrkdwn.js";
 import { errString } from "./redact.js";
@@ -88,6 +89,7 @@ export interface Chat {
 }
 
 interface SessionEventLike {
+  runId?: string;
   eventType: "chunk" | "status" | "done" | "error";
   stream: "stdout" | "stderr" | "system" | null;
   message: string | null;
@@ -924,6 +926,9 @@ export function createChat(deps: ChatDeps): Chat {
     // here — see the placeholder-post call in converse for why. Also the
     // source of the channel every message in this turn posts to.
     placeholder: { channel: string; ts: string },
+    // The human message that started this turn, recorded on the run binding
+    // so record_on_issue can tell which issues the person named.
+    trigger: { text: string; user: string },
   ): Promise<{
     /**
      * False only when the host rejected the send itself — the prompt (and
@@ -941,6 +946,33 @@ export function createChat(deps: ChatDeps): Chat {
     // answer from spraying top-level messages down the DM. Same pattern as
     // src/post-message.ts:118.
     const followUpThreadTs = replyThreadTs ?? placeholder.ts;
+
+    // Bind the host run to this Slack conversation the moment its id is
+    // known — from the send result or the first event, whichever lands
+    // first — so record_on_issue can recognise the run as one this plugin
+    // started (see chat-run-binding.ts). Best-effort: a failed bind only
+    // means the tool refuses this turn.
+    let boundRunId: string | undefined;
+    let bindWrite: Promise<void> = Promise.resolve();
+    const bindRun = (runId: string | undefined) => {
+      if (boundRunId || !runId) return;
+      boundRunId = runId;
+      const startedAt = new Date().toISOString();
+      bindWrite = bindChatRun(ctx, {
+        runId,
+        agentId: cfg.defaultAgentId,
+        sessionId: entry.sessionId,
+        channel: placeholder.channel,
+        threadTs: replyThreadTs,
+        triggerText: trigger.text,
+        triggerUser: trigger.user,
+        startedAt,
+        createdAt: startedAt,
+      }).catch((err) => {
+        ctx.logger.warn("Failed to bind the chat run to its Slack thread", { err: errString(err), runId });
+      });
+    };
+
     let buffer = "";
     let timer: ReturnType<typeof setTimeout> | null = null;
     let updateChain: Promise<void> = Promise.resolve();
@@ -1108,6 +1140,7 @@ export function createChat(deps: ChatDeps): Chat {
           reason: "slack_chat_message",
           onEvent: (event) => {
             const e = event as SessionEventLike;
+            bindRun(e.runId);
             // Any event at all proves the stream is alive, so every one of
             // them pushes the watchdog out — not only the ones acted on
             // below (a long run can emit nothing but `status` for minutes).
@@ -1218,8 +1251,9 @@ export function createChat(deps: ChatDeps): Chat {
           },
         })
         .then(
-          () => {
+          (result) => {
             sendSettled = true;
+            bindRun((result as { runId?: string } | undefined)?.runId);
           },
           (err) => {
             sendSettled = true;
@@ -1241,6 +1275,13 @@ export function createChat(deps: ChatDeps): Chat {
         );
     });
     await updateChain;
+    if (boundRunId) {
+      const runId = boundRunId;
+      await bindWrite;
+      await markChatRunSettled(ctx, runId).catch((err) => {
+        ctx.logger.warn("Failed to mark the chat run binding settled", { err: errString(err), runId });
+      });
+    }
     return { delivered };
   }
 
@@ -1291,6 +1332,14 @@ export function createChat(deps: ChatDeps): Chat {
         threadTs: scope.replyThreadTs,
         text: "_Thinking…_",
       });
+      // A top-level reply (channel-scoped DM) is a bot message whose words
+      // the agent will choose; if someone threads under it, it must not be
+      // read as an issue-linking root. See STATE_KEYS.agentPost.
+      if (!scope.replyThreadTs) {
+        await recordAgentPost(ctx, placeholder).catch((err) => {
+          ctx.logger.warn("Failed to record a top-level chat reply as agent-worded", { err: errString(err) });
+        });
+      }
 
       // `placeholder.ts` is threaded through so buildSeedBlock can exclude
       // the placeholder message itself from the transcript it reads back —
@@ -1341,7 +1390,10 @@ export function createChat(deps: ChatDeps): Chat {
       }
 
       const prompt = buildChatPrompt(cfg.chatPromptPreamble, text, seed || delta);
-      const { delivered } = await streamReply(cfg, entry, scope.replyThreadTs, prompt, placeholder);
+      const { delivered } = await streamReply(cfg, entry, scope.replyThreadTs, prompt, placeholder, {
+        text: msg.text,
+        user: msg.user,
+      });
 
       // Watermark and seed bookkeeping run only after the prompt actually
       // REACHED the agent — `delivered` is false when the host rejected the

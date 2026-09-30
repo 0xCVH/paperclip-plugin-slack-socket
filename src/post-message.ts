@@ -1,5 +1,6 @@
 import type { PluginContext, ToolRunContext } from "@paperclipai/plugin-sdk";
 import { checkPostTarget, checkToolCompany } from "./access.js";
+import { recordAgentPost } from "./chat-run-binding.js";
 import { POST_MESSAGE_TOOL_DECLARATION, TOOL_NAMES } from "./constants.js";
 import { escapeMrkdwn } from "./formatters.js";
 import { markdownToMrkdwn } from "./mrkdwn.js";
@@ -88,6 +89,15 @@ export function createPostMessage({ ctx, gateway, getConfig }: PostMessageDeps):
             // Nothing was posted (openDm or the head post itself failed) —
             // this is a clean failure with no partial state to report.
             return { error: `Failed to post message to Slack: ${errString(err)}` };
+          }
+
+          // A top-level post is a thread root this bot authored with words an
+          // agent chose; record_on_issue must never read an issue link in it
+          // as that thread's issue. Best-effort — the post is already live.
+          if (!threadTs) {
+            await recordAgentPost(ctx, first).catch((err) => {
+              ctx.logger.warn("slack_post_message: failed to record the post as agent-worded", { err: errString(err) });
+            });
           }
 
           // Overflow goes into a thread rather than as more top-level

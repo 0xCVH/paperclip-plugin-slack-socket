@@ -7,6 +7,7 @@ import {
   PLUGIN_ID,
   PLUGIN_VERSION,
   POST_MESSAGE_TOOL_DECLARATION,
+  RECORD_ON_ISSUE_TOOL_DECLARATION,
 } from "./constants.js";
 
 const manifest: PaperclipPluginManifestV1 = {
@@ -20,6 +21,9 @@ const manifest: PaperclipPluginManifestV1 = {
   categories: ["connector", "automation"],
   capabilities: [
     "issues.create",
+    // record_on_issue resolves an identifier (POL-3267) to the issue's UUID
+    // and reads its assignee — createComment needs the UUID.
+    "issues.read",
     "issue.comments.create",
     "issues.wakeup",
     "agent.sessions.create",
@@ -252,7 +256,7 @@ const manifest: PaperclipPluginManifestV1 = {
       schedule: "*/15 * * * *",
     },
   ],
-  tools: [ASK_HUMAN_TOOL_DECLARATION, POST_MESSAGE_TOOL_DECLARATION],
+  tools: [ASK_HUMAN_TOOL_DECLARATION, POST_MESSAGE_TOOL_DECLARATION, RECORD_ON_ISSUE_TOOL_DECLARATION],
 };
 
 export default manifest;

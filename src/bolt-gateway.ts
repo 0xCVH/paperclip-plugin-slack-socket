@@ -33,6 +33,36 @@ const THREAD_REPLIES_MAX_PAGES = 5;
  * routing should see. Pure and exported so the filter is testable without
  * standing up a Bolt app.
  */
+/**
+ * Every link URL inside a message's Block Kit blocks: `url` fields (buttons,
+ * rich-text links) and `<url|label>` mrkdwn in text objects. Walks the raw
+ * JSON rather than modelling each block type, because a missed block type
+ * would silently drop a link. Bounded so a huge message can't blow up.
+ */
+export function collectBlockLinks(blocks: unknown): string[] {
+  if (!Array.isArray(blocks)) return [];
+  const found = new Set<string>();
+  const visit = (node: unknown, depth: number): void => {
+    if (depth > 12 || found.size >= 50 || node === null || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      for (const child of node) visit(child, depth + 1);
+      return;
+    }
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      if (typeof value === "string") {
+        if (key === "url" && /^https?:\/\//.test(value)) found.add(value);
+        else if (key === "text") {
+          for (const match of value.matchAll(/<(https?:\/\/[^|>\s]+)(?:\|[^>]*)?>/g)) found.add(match[1]!);
+        }
+      } else {
+        visit(value, depth + 1);
+      }
+    }
+  };
+  visit(blocks, 0);
+  return [...found];
+}
+
 export function shouldDispatchMessage(m: { subtype?: string; bot_id?: string; user?: string }): boolean {
   if (m.subtype && !PASSTHROUGH_SUBTYPES.has(m.subtype)) return false;
   if (m.bot_id) return false;
@@ -352,11 +382,15 @@ export class BoltGateway implements SlackGateway {
       const res = await this.app.client.conversations.replies(cursor ? { ...base, cursor } : base);
       const messages = res.messages;
       if (Array.isArray(messages)) {
-        for (const m of messages as Array<{ user?: string; text?: string; ts?: string }>) {
+        for (const m of messages as Array<{
+          user?: string; text?: string; ts?: string; bot_id?: string; subtype?: string; blocks?: unknown;
+        }>) {
           collected.push({
             user: m.user ?? "",
             text: m.text ?? "",
             ts: m.ts ?? "",
+            fromAnyBot: Boolean(m.bot_id) || m.subtype === "bot_message",
+            blockLinks: collectBlockLinks(m.blocks),
             // Strictly "this app's own bot user", not "any bot". A message
             // this app posts through chat.postMessage always comes back as
             // a plain message event with `user` set to this gateway's own
@@ -389,6 +423,15 @@ export class BoltGateway implements SlackGateway {
       messagesFetched: collected.length,
     });
     return collected;
+  }
+
+  async getPermalink(channel: string, ts: string): Promise<string | null> {
+    try {
+      const res = await this.app.client.chat.getPermalink({ channel, message_ts: ts });
+      return typeof res.permalink === "string" ? res.permalink : null;
+    } catch {
+      return null;
+    }
   }
 
   async getUserDisplayName(userId: string): Promise<string> {

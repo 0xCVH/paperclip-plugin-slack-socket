@@ -111,6 +111,15 @@ export function createGatewayProxy(
       return gateway.openDm(userId);
     },
 
+    async getPermalink(channel: string, ts: string) {
+      const gateway = getGateway();
+      if (!gateway) {
+        warnUnconfigured("getPermalink");
+        return null;
+      }
+      return gateway.getPermalink(channel, ts);
+    },
+
     async getUserDisplayName(userId: string) {
       const gateway = getGateway();
       if (!gateway) {
