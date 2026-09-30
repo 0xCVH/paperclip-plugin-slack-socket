@@ -17,6 +17,7 @@ import { createEventDeduper } from "./event-dedup.js";
 import { createGatewayProxy } from "./gateway-proxy.js";
 import { registerNotifications } from "./notifications.js";
 import { createPostMessage, type PostMessage } from "./post-message.js";
+import { createRecordOnIssue } from "./record-on-issue.js";
 import { errString } from "./redact.js";
 import { describeHostError } from "./host-errors.js";
 import type { SlackGateway, SlackSocketConfig } from "./types.js";
@@ -454,8 +455,10 @@ function ensureCoreModules(ctx: PluginContext): CoreModules {
   // Registration therefore cannot be gated on config: slack_post_message
   // enforces its switches per call instead (see checkPostTarget).
   const postMessage = createPostMessage({ ctx, gateway: gatewayProxy, getConfig });
+  const recordOnIssue = createRecordOnIssue({ ctx, gateway: gatewayProxy, getConfig });
   askHuman.registerTool();
   postMessage.registerTool();
+  recordOnIssue.registerTool();
 
   coreModules = { chat, askHuman, commands, postMessage, gatewayProxy };
   return coreModules;

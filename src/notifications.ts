@@ -1,4 +1,5 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
+import { linkThreadIssue } from "./chat-run-binding.js";
 import { STATE_KEYS } from "./constants.js";
 import { formatAgentRunFailed, formatIssueCreated, formatIssueDone, type SlackContent } from "./formatters.js";
 import { getMessageLink, linkMessage, unlinkMessage } from "./message-link.js";
@@ -58,6 +59,7 @@ export function registerNotifications({ ctx, gateway, getConfig, companyId }: No
     );
     if (posted && issueId) {
       await linkMessage(ctx, STATE_KEYS.issueThreadIndex, STATE_KEYS.issueThread(issueId), posted);
+      await linkThreadIssue(ctx, posted, issueId);
     }
   });
 

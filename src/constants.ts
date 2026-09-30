@@ -21,7 +21,7 @@ export const REQUIRED_BOT_SCOPES = [
   "commands",
 ] as const;
 
-export const PLUGIN_VERSION = "0.11.4";
+export const PLUGIN_VERSION = "0.12.0";
 
 export const ACTION_IDS = {
   approvalApprove: "approval_approve",
@@ -35,6 +35,7 @@ export const JOB_KEYS = {
 export const TOOL_NAMES = {
   askHuman: "ask_human",
   postMessage: "slack_post_message",
+  recordOnIssue: "record_on_issue",
 } as const;
 
 export const SLASH_COMMAND = "/paperclip";
@@ -61,6 +62,21 @@ export const STATE_KEYS = {
   issueThread: (issueId: string) => `issue-thread:${issueId}`,
   approvalMessageIndex: "approval-message-index",
   approvalMessage: (approvalId: string) => `approval-message:${approvalId}`,
+  // Reverse of issueThread: the Slack thread root -> the issue it was posted
+  // for. record_on_issue reads this to find a thread's own issue without
+  // scanning every issue-thread entry.
+  threadIssueIndex: "thread-issue-index",
+  threadIssue: (channel: string, ts: string) => `thread-issue:${channel}:${ts}`,
+  // Top-level messages this bot posted with agent-written text
+  // (slack_post_message, ask_human, a channel-scoped DM reply). The bot
+  // posts them, but an agent chose the words, so record_on_issue must never
+  // read an issue link in one of them as "this thread's issue".
+  agentPostIndex: "agent-post-index",
+  agentPost: (channel: string, ts: string) => `agent-post:${channel}:${ts}`,
+  // Heartbeat run -> the Slack thread it is serving (see chat-run-binding.ts).
+  chatRunIndex: "chat-run-index",
+  chatRun: (runId: string) => `chat-run:${runId}`,
+  chatRunWrites: (runId: string) => `chat-run-writes:${runId}`,
 } as const;
 
 export function stateScope(stateKey: string): ScopeKey {
@@ -110,6 +126,31 @@ export const POST_MESSAGE_TOOL_DECLARATION: PluginToolDeclaration = {
       },
     },
     required: ["target", "text"],
+  },
+};
+
+export const RECORD_ON_ISSUE_TOOL_DECLARATION: PluginToolDeclaration = {
+  name: TOOL_NAMES.recordOnIssue,
+  displayName: "Record a Slack conversation on an issue",
+  description:
+    "Write a comment onto a Paperclip issue from a Slack conversation. This is the only way to put " +
+    "something on an issue while you are answering in Slack — the issues REST API refuses writes from " +
+    "Slack chat runs. The target must be this thread's own issue (the issue the thread was posted for), " +
+    "or an issue a human named in this thread. A footer saying it was relayed from Slack is added " +
+    "automatically, and the issue's assignee is woken unless wakeAssignee is false. A refusal (a result " +
+    "with a `code`) is final: do not retry it and do not try the REST API instead — tell the person in " +
+    "Slack what was refused and why.",
+  parametersSchema: {
+    type: "object",
+    properties: {
+      issue: { type: "string", description: "Issue identifier (e.g. POL-3267) or issue UUID." },
+      body: { type: "string", description: "Comment body in Markdown, 1–8000 characters." },
+      wakeAssignee: {
+        type: "boolean",
+        description: "Wake the issue's assignee after writing (default true).",
+      },
+    },
+    required: ["issue", "body"],
   },
 };
 

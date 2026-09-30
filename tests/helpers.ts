@@ -91,6 +91,7 @@ export function makeCtx(configOverrides: Partial<SlackSocketConfig> = {}): MockC
     },
     issues: {
       create: vi.fn().mockResolvedValue({ id: "issue-1", title: "Test issue" }),
+      get: vi.fn().mockResolvedValue(null),
       createComment: vi.fn().mockResolvedValue({ id: "comment-1" }),
       requestWakeup: vi.fn().mockResolvedValue({ requested: true }),
     },
@@ -162,6 +163,10 @@ export class FakeGateway implements SlackGateway {
   async openDm(userId: string): Promise<string> {
     this.dmOpens.push(userId);
     return `D-${userId}`;
+  }
+
+  async getPermalink(channel: string, ts: string): Promise<string | null> {
+    return `https://slack.example/archives/${channel}/p${ts.replace(".", "")}`;
   }
 
   async getUserDisplayName(userId: string): Promise<string> {

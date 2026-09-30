@@ -196,8 +196,8 @@ describe("BoltGateway (against a mocked @slack/bolt App)", () => {
     });
 
     await expect(gateway.fetchThreadReplies("C1", "1.1", 50)).resolves.toEqual([
-      { user: "UBOT", text: "Action needed: claimable subdomain", ts: "1.1", isBot: true },
-      { user: "U1", text: "can you open a ticket for this?", ts: "1.2", isBot: false },
+      { user: "UBOT", text: "Action needed: claimable subdomain", ts: "1.1", isBot: true, fromAnyBot: true, blockLinks: [] },
+      { user: "U1", text: "can you open a ticket for this?", ts: "1.2", isBot: false, fromAnyBot: false, blockLinks: [] },
     ]);
     expect(appInstances[0]!.client.conversations.replies).toHaveBeenCalledWith({
       channel: "C1", ts: "1.1", limit: 50,
@@ -237,6 +237,28 @@ describe("BoltGateway (against a mocked @slack/bolt App)", () => {
     await expect(gateway.fetchThreadReplies("C1", "1.1", 50)).resolves.toEqual([]);
   });
 
+  it("flags any bot's message and collects the links in its blocks", async () => {
+    const gateway = await makeGateway();
+    await gateway.start();
+    appInstances[0]!.client.conversations.replies.mockResolvedValueOnce({
+      ok: true,
+      messages: [
+        {
+          user: "UBOT", text: "CONFIRM · POL-3267 · ask", ts: "1.1", bot_id: "B1",
+          blocks: [
+            { type: "section", text: { type: "mrkdwn", text: "*CONFIRM* · <https://pc.example/POL/issues/POL-3267|POL-3267>" } },
+            { type: "actions", elements: [{ type: "button", url: "https://pc.example/POL/issues/POL-3267" }] },
+          ],
+        },
+        { user: "UZAP", text: "a workflow post", ts: "1.2", subtype: "bot_message" },
+      ],
+    });
+    const replies = await gateway.fetchThreadReplies("C1", "1.1", 50);
+    expect(replies[0]).toMatchObject({ isBot: true, fromAnyBot: true, blockLinks: ["https://pc.example/POL/issues/POL-3267"] });
+    // A foreign bot is not this app, but it is still a bot.
+    expect(replies[1]).toMatchObject({ isBot: false, fromAnyBot: true, blockLinks: [] });
+  });
+
   it("defaults absent user/text to empty strings without mistaking them for the bot", async () => {
     // start() was not called, so botUserId() is undefined. A naive
     // `m.user === this.botId` would make undefined === undefined true and
@@ -247,7 +269,7 @@ describe("BoltGateway (against a mocked @slack/bolt App)", () => {
       messages: [{ ts: "1.3" }],
     });
     await expect(gateway.fetchThreadReplies("C1", "1.1", 50)).resolves.toEqual([
-      { user: "", text: "", ts: "1.3", isBot: false },
+      { user: "", text: "", ts: "1.3", isBot: false, fromAnyBot: false, blockLinks: [] },
     ]);
   });
 
@@ -275,9 +297,9 @@ describe("BoltGateway (against a mocked @slack/bolt App)", () => {
       });
 
     await expect(gateway.fetchThreadReplies("C1", "1.1", 200)).resolves.toEqual([
-      { user: "UBOT", text: "Action needed: claimable subdomain", ts: "1.1", isBot: true },
-      { user: "U1", text: "can you open a ticket for this?", ts: "1.2", isBot: false },
-      { user: "U2", text: "on it", ts: "1.3", isBot: false },
+      { user: "UBOT", text: "Action needed: claimable subdomain", ts: "1.1", isBot: true, fromAnyBot: true, blockLinks: [] },
+      { user: "U1", text: "can you open a ticket for this?", ts: "1.2", isBot: false, fromAnyBot: false, blockLinks: [] },
+      { user: "U2", text: "on it", ts: "1.3", isBot: false, fromAnyBot: false, blockLinks: [] },
     ]);
     expect(appInstances[0]!.client.conversations.replies).toHaveBeenCalledTimes(2);
     expect(appInstances[0]!.client.conversations.replies).toHaveBeenNthCalledWith(1, {

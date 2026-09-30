@@ -11,7 +11,7 @@ describe("manifest", () => {
   it("declares the exact least-privilege capability set", () => {
     expect([...manifest.capabilities].sort()).toEqual(
       [
-        "issues.create", "issue.comments.create", "issues.wakeup",
+        "issues.create", "issues.read", "issue.comments.create", "issues.wakeup",
         "agent.sessions.create", "agent.sessions.send", "agent.sessions.close",
         "agent.tools.register", "http.outbound", "events.subscribe",
         "plugin.state.read", "plugin.state.write", "secrets.read-ref", "instance.settings.register",
@@ -20,9 +20,13 @@ describe("manifest", () => {
     );
   });
 
-  it("declares the cleanup job and both agent tools", () => {
+  it("declares the cleanup job and the three agent tools", () => {
     expect(manifest.jobs?.map((j) => j.jobKey)).toEqual([JOB_KEYS.cleanup]);
-    expect(manifest.tools?.map((t) => t.name)).toEqual([TOOL_NAMES.askHuman, TOOL_NAMES.postMessage]);
+    expect(manifest.tools?.map((t) => t.name)).toEqual([
+      TOOL_NAMES.askHuman,
+      TOOL_NAMES.postMessage,
+      TOOL_NAMES.recordOnIssue,
+    ]);
   });
 
   it("requires tokens, company, agent, and default channel in config", () => {

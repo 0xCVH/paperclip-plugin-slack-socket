@@ -1,4 +1,5 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
+import { pruneChatRunState } from "./chat-run-binding.js";
 import { STATE_KEYS, stateScope } from "./constants.js";
 import { formatQuestionExpired } from "./formatters.js";
 import { pruneMessageLinks } from "./message-link.js";
@@ -96,4 +97,5 @@ export async function runCleanup(
 
   await pruneMessageLinks(ctx, STATE_KEYS.issueThreadIndex, MESSAGE_LINK_MAX_AGE_MS, now);
   await pruneMessageLinks(ctx, STATE_KEYS.approvalMessageIndex, MESSAGE_LINK_MAX_AGE_MS, now);
+  await pruneChatRunState(ctx, now);
 }

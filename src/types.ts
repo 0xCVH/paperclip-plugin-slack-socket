@@ -195,6 +195,51 @@ export interface ThreadMessage {
   text: string;
   ts: string;
   isBot: boolean;
+  /**
+   * True when Slack marks the message as posted by ANY bot (`bot_id` or the
+   * `bot_message` subtype) — this app or a third-party integration. Only
+   * record_on_issue reads it, to keep bot-written text from widening which
+   * issues a thread may write to. Optional so hand-built transcripts that
+   * predate it read as "not a bot".
+   */
+  fromAnyBot?: boolean;
+  /**
+   * Every link URL found in the message's Block Kit blocks. Slack's `text`
+   * is only a fallback for a blocks message and often omits the link (an
+   * escalation root carries its issue URL only in blocks), so
+   * record_on_issue needs these to find a thread root's issue.
+   */
+  blockLinks?: string[];
+}
+
+/**
+ * The Slack conversation one agent heartbeat run is serving, recorded when
+ * chat.ts starts the run (see chat-run-binding.ts). record_on_issue refuses
+ * any run without one: this is what keeps the tool out of runs the plugin
+ * did not start.
+ */
+export interface ChatRunBinding {
+  runId: string;
+  agentId: string;
+  sessionId: string;
+  channel: string;
+  /** The thread root ts, or undefined for a channel-scoped 1:1 DM. */
+  threadTs?: string;
+  /** The human message that started the turn, and who wrote it. */
+  triggerText: string;
+  triggerUser: string;
+  startedAt: string; // ISO 8601
+  /** Set when the plugin's side of the turn settled; starts the grace period. */
+  settledAt?: string;
+  /** Mirrors MessageLink so pruneMessageLinks can age these out too. */
+  createdAt: string;
+}
+
+/** One successful record_on_issue write, kept per run for the cap and dedupe. */
+export interface RecordedWrite {
+  issueId: string;
+  bodyHash: string;
+  commentId: string;
 }
 
 export interface SlackGateway {
@@ -216,6 +261,8 @@ export interface SlackGateway {
   postEphemeral(msg: { channel: string; user: string; text: string }): Promise<void>;
   openDm(userId: string): Promise<string>;
   getUserDisplayName(userId: string): Promise<string>;
+  /** A message's Slack permalink (chat.getPermalink, no extra scope); null on any failure. */
+  getPermalink(channel: string, ts: string): Promise<string | null>;
   /**
    * The messages of one thread, oldest first. `conversations.replies`
    * returns the parent plus only the oldest page of replies, so a single
