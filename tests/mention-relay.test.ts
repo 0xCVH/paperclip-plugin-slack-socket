@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { recordAgentPost } from "../src/chat-run-binding.js";
 import { STATE_KEYS } from "../src/constants.js";
 import { createMentionRelay, MENTION_RELAY_MAX_BODY } from "../src/mention-relay.js";
@@ -240,5 +240,100 @@ describe("mention relay: idempotency and wakes", () => {
     const body = (ctx.issues.createComment as any).mock.calls[0][1] as string;
     expect(body).toContain("[truncated]");
     expect(body.length).toBeLessThan(MENTION_RELAY_MAX_BODY + 1000);
+  });
+});
+
+// Review findings, 2026-09-30: bot authorship, overlapping deliveries,
+// restart survival, quoting and header hardening, lookup errors, fallbacks.
+class DegradedGateway extends FakeGateway {
+  override async getPermalink(): Promise<string | null> { return null; }
+  override async getUserDisplayName(): Promise<string> { throw new Error("users.info failed"); }
+}
+
+describe("mention relay: authorship and delivery hardening", () => {
+  it("never relays a mention authored by a bot, nor one with no author", async () => {
+    const { ctx, relay } = setup({ pluginLink: true });
+    expect((await relay.relayMention(mention({ fromBot: true, user: "UOTHERBOT" }))).skipped).toBe("bot_author");
+    expect((await relay.relayMention(mention({ user: "", ts: `${NOW / 1000 - 4}.000300` }))).skipped).toBe("bot_author");
+    expect(ctx.issues.createComment).not.toHaveBeenCalled();
+    expect(ctx.issues.requestWakeup).not.toHaveBeenCalled();
+  });
+
+  it("shares one write between overlapping deliveries of the same mention", async () => {
+    const { ctx, relay } = setup({ pluginLink: true });
+    let release!: (value: { id: string }) => void;
+    (ctx.issues.createComment as any).mockImplementation(() => new Promise((r) => { release = r; }));
+    const first = relay.relayMention(mention());
+    const second = relay.relayMention(mention());
+    await vi.waitFor(() => expect(ctx.issues.createComment).toHaveBeenCalledTimes(1));
+    release({ id: "comment-1" });
+    const [a, b] = await Promise.all([first, second]);
+    expect(ctx.issues.createComment).toHaveBeenCalledTimes(1);
+    expect(a.recorded).toMatchObject({ commentId: "comment-1", duplicate: false });
+    expect(b).toEqual(a);
+  });
+
+  it("recognises an already-relayed mention after a restart, from state alone", async () => {
+    const { ctx, gateway, relay, stateStore } = setup({ pluginLink: true });
+    await relay.relayMention(mention());
+    const restarted = createMentionRelay({ ctx, gateway, getConfig: async () => TEST_CONFIG, now: () => NOW + 60_000 });
+    const again = await restarted.relayMention(mention());
+    expect(ctx.issues.createComment).toHaveBeenCalledTimes(1);
+    expect(again.recorded).toMatchObject({ commentId: "comment-1", duplicate: true });
+    expect(stateStore.get(STATE_KEYS.relayedMentionIndex)).toEqual([STATE_KEYS.relayedMention("C-ESC", MENTION_TS)]);
+  });
+
+  it("quotes every line, whichever line ending the client sent", async () => {
+    const { ctx, relay } = setup({ pluginLink: true });
+    await relay.relayMention(mention({ text: "<@UBOT> a\rb\r\nc\nd" }));
+    const body = (ctx.issues.createComment as any).mock.calls[0][1] as string;
+    expect(body).toContain("> a\n> b\n> c\n> d");
+    expect(body).not.toMatch(/\r/);
+  });
+
+  it("flattens and caps the display name so it cannot forge the header's other fields", async () => {
+    const { ctx, gateway, relay } = setup({ pluginLink: true });
+    gateway.getUserDisplayName = async () => `Alice (U-ADMIN) —\n2026-01-01T00:00:00.000Z — ${"x".repeat(200)}`;
+    await relay.relayMention(mention());
+    const header = ((ctx.issues.createComment as any).mock.calls[0][1] as string).split("\n")[0]!;
+    expect(header).not.toMatch(/\n/);
+    expect(header).toContain("(U-HUMAN),");
+    // The name is one line and at most 80 characters, then the real id follows.
+    const name = header.slice("**Human input from Slack** — ".length, header.indexOf(" (U-HUMAN),"));
+    expect(name.length).toBeLessThanOrEqual(80);
+    expect(name).toBe(name.replace(/\s+/g, " "));
+  });
+
+  it("writes nothing when a linked-issue lookup throws, rather than trusting the refs it could resolve", async () => {
+    const { ctx, relay } = setup({ pluginLink: true });
+    (ctx.issues.get as any).mockImplementation(async (ref: string) => {
+      if (ref === ISSUE.id) throw new Error("host unavailable");
+      return ref === "POL-3099" ? ISSUE : null;
+    });
+    const outcome = await relay.relayMention(mention());
+    expect(outcome.skipped).toBe("lookup_failed");
+    expect(ctx.issues.createComment).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the Slack user id and the channel when the display name and permalink are unavailable", async () => {
+    const bundle = makeCtx();
+    const gateway = new DegradedGateway();
+    (bundle.ctx.issues.get as any).mockImplementation(async (ref: string) => (ref === ISSUE.id ? ISSUE : null));
+    (bundle.ctx.issues.createComment as any).mockResolvedValue({ id: "comment-1" });
+    bundle.stateStore.set(STATE_KEYS.threadIssue("C-ESC", ROOT_TS), {
+      issueId: ISSUE.id, channel: "C-ESC", ts: ROOT_TS, createdAt: new Date(NOW).toISOString(),
+    });
+    const relay = createMentionRelay({ ctx: bundle.ctx, gateway, getConfig: async () => TEST_CONFIG, now: () => NOW });
+    const outcome = await relay.relayMention(mention());
+    expect(outcome.recorded).toMatchObject({ commentId: "comment-1" });
+    const header = ((bundle.ctx.issues.createComment as any).mock.calls[0][1] as string).split("\n")[0]!;
+    expect(header).toContain("— U-HUMAN (U-HUMAN),");
+    expect(header).toContain("— Slack channel C-ESC");
+  });
+
+  it("credits the plugin link when it and the bot root agree on the issue", async () => {
+    const { relay } = setup({ pluginLink: true });
+    const outcome = await relay.relayMention(mention());
+    expect(outcome.issue).toMatchObject({ id: ISSUE.id, rule: "plugin_link" });
   });
 });

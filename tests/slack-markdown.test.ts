@@ -38,3 +38,18 @@ describe("slackTextToMarkdown", () => {
     expect(slackTextToMarkdown(text, {})).toBe(text);
   });
 });
+
+describe("slackTextToMarkdown: link honesty", () => {
+  it("escapes brackets in a label so the label cannot close the link early and point elsewhere", () => {
+    expect(slackTextToMarkdown("<https://real.example/|a](https://evil.example) b>", {})).toBe(
+      "[a\\](https://evil.example) b](https://real.example/)",
+    );
+  });
+
+  it("shows the real destination beside a label that itself looks like a URL", () => {
+    expect(slackTextToMarkdown("<https://evil.example/x|https://github.com/0xPolygon/pull/53>", {})).toBe(
+      "https://github.com/0xPolygon/pull/53 (https://evil.example/x)",
+    );
+    expect(slackTextToMarkdown("<https://evil.example/x|www.github.com>", {})).toBe("www.github.com (https://evil.example/x)");
+  });
+});

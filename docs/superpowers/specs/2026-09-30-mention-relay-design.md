@@ -119,7 +119,9 @@ a marker, not refused.
 | `ambiguous_linked_issue` | plugin link and root link disagree | no | no |
 | `issue_not_found` | linked ref no longer resolves | no | no |
 | `disabled` | `relayMentionsToIssue: false` | no | **yes** |
-| `low_trust_target` | issue under `trustPreset`/`trustBoundary` | no | **yes** |
+| `low_trust_target` | issue under `trustPreset`/`reviewPreset`/`trustBoundary` | no | **yes** |
+| `bot_author` | the mention was posted by a bot, or has no author | no | no |
+| `lookup_failed` | an issue lookup threw; refs that resolved are not trusted alone | no | no |
 | `write_failed` | `createComment` rejected | no | **yes** |
 
 The trust-policy refusal mirrors `record_on_issue`: the host's comment route
@@ -159,7 +161,13 @@ from alert text; it must not be able to contribute a line of its own.
   assignee of a `done`/`cancelled` issue.
 - Block the conversation: every failure is logged and the turn proceeds
   without a context block. `createChat` without a `relay` is unchanged.
-- Run for DMs, top-level mentions, `reset`, or an empty mention.
+- Run for DMs, top-level mentions, `reset`, an empty mention, or a mention
+  posted by a bot (`bot_id` / `bot_message`): another integration's or
+  another agent's words are never written as human input.
+- Hold the turn: the relay stage is bounded at 20 s (`relayTimeoutMs`);
+  past it the turn proceeds without issue context while the relay finishes
+  in the background. It is started before the session lookup so its calls
+  overlap that wait and the write lands even if the session cannot be created.
 
 ## Trust boundary moved
 

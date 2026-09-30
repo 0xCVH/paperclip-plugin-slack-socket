@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { buildChatPrompt, createChat } from "../src/chat.js";
 import { STATE_KEYS } from "../src/constants.js";
 import { createMentionRelay, type MentionRelay } from "../src/mention-relay.js";
@@ -137,5 +137,44 @@ describe("chat turn with the mention relay", () => {
     await chat.handleMention(mention());
     expect(bundle.ctx.issues.createComment).not.toHaveBeenCalled();
     expect(bundle.ctx.agents.sessions.sendMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Review findings, 2026-09-30.
+describe("chat turn with the mention relay: bounds and ordering", () => {
+  it("gives up waiting on a stalled relay and continues the turn without issue context", async () => {
+    const stalled: MentionRelay = { relayMention: () => new Promise(() => {}) };
+    const bundle = makeCtx();
+    const gateway = new FakeGateway();
+    const chat = createChat({
+      ctx: bundle.ctx, gateway, getConfig: async () => TEST_CONFIG, updateIntervalMs: 0, relay: stalled, relayTimeoutMs: 5,
+    });
+    await chat.handleMention(mention());
+    expect(bundle.ctx.agents.sessions.sendMessage).toHaveBeenCalledTimes(1);
+    expect((bundle.ctx.agents.sessions.sendMessage as any).mock.calls[0][2].prompt).not.toContain("Linked Paperclip issue");
+    expect(bundle.ctx.metrics.write).toHaveBeenCalledWith("slack.mention_relay.timed_out", 1);
+    expect(gateway.updates.at(-1)!.text).toBe("Hello there!");
+  });
+
+  it("still records the mention when the agent session cannot be created", async () => {
+    const { ctx, chat } = setup();
+    (ctx.agents.sessions.create as any).mockRejectedValue(new Error("sessions down"));
+    await chat.handleMention(mention());
+    await vi.waitFor(() => expect(ctx.issues.createComment).toHaveBeenCalledTimes(1));
+    expect(ctx.agents.sessions.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("omits the issue URL from the prompt when paperclipBaseUrl is empty", async () => {
+    const { chat, promptSent } = setup({ config: { paperclipBaseUrl: "" } });
+    await chat.handleMention(mention());
+    expect(promptSent()).toContain("Linked Paperclip issue: POL-3099");
+    expect(promptSent()).not.toContain("/POL/issues/POL-3099");
+  });
+
+  it("tells the agent to say so when the write failed", async () => {
+    const { ctx, chat, promptSent } = setup();
+    (ctx.issues.createComment as any).mockRejectedValue(new Error("boom"));
+    await chat.handleMention(mention());
+    expect(promptSent()).toContain("was not recorded on the issue (the write failed). Tell them it was not recorded.");
   });
 });

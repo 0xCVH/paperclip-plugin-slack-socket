@@ -93,7 +93,7 @@ export function makeCtx(configOverrides: Partial<SlackSocketConfig> = {}): MockC
       create: vi.fn().mockResolvedValue({ id: "issue-1", title: "Test issue" }),
       get: vi.fn().mockResolvedValue(null),
       createComment: vi.fn().mockResolvedValue({ id: "comment-1" }),
-      requestWakeup: vi.fn().mockResolvedValue({ requested: true }),
+      requestWakeup: vi.fn().mockResolvedValue({ queued: true, runId: "wake-run" }),
     },
     http: {
       fetch: vi.fn().mockResolvedValue({ status: 200, json: async () => ({}) }),

@@ -32,9 +32,15 @@ export function slackTextToMarkdown(text: string, options: SlackTextOptions): st
   out = out.replace(DATE_RE, (_m, fallback: string) => fallback);
   out = out.replace(CHANNEL_RE, (_m, id: string, name?: string) => (name ? `#${name}` : `#${id}`));
   out = out.replace(USER_MENTION_RE, (_m, id: string, name?: string) => (name ? `@${name}` : `@${id}`));
-  out = out.replace(LINK_RE, (_m, url: string, label?: string) =>
-    label && label !== url ? `[${label}](${url})` : url,
-  );
+  out = out.replace(LINK_RE, (_m, url: string, label?: string) => {
+    if (!label || label === url) return url;
+    // A label that looks like a URL but isn't the destination is the classic
+    // disguised link; show both rather than let the label pass for the target.
+    if (/^(?:https?:\/\/|www\.)/i.test(label)) return `${label} (${url})`;
+    // Brackets in a label could otherwise close the Markdown link early and
+    // hand the visible link a destination Slack's never had.
+    return `[${label.replace(/[[\]]/g, "\\$&")}](${url})`;
+  });
   // Last, so an unescaped `<` or `&` can never be re-read as an entity above.
   out = out.replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&amp;", "&");
   return out.trim();

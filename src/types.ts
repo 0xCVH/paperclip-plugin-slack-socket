@@ -149,6 +149,14 @@ export interface InboundMessage {
   text: string;
   ts: string;
   threadTs?: string;
+  /**
+   * True when Slack marks the message as posted by a bot (`bot_id`, or the
+   * `bot_message` subtype). The `message` path drops such messages before
+   * dispatch (see shouldDispatchMessage); `app_mention` has no such filter,
+   * so the mention relay reads this to refuse a bot's words as "human
+   * input". Optional so hand-built messages read as a person's.
+   */
+  fromBot?: boolean;
 }
 
 export interface InboundReaction {

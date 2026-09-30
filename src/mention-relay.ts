@@ -32,6 +32,7 @@ export const MENTION_RELAY_MAX_BODY = 8_000;
 
 export type RelaySkipCode =
   | "dm"
+  | "bot_author"
   | "not_a_thread"
   | "empty"
   | "control_keyword"
@@ -39,6 +40,7 @@ export type RelaySkipCode =
   | "no_linked_issue"
   | "ambiguous_linked_issue"
   | "issue_not_found"
+  | "lookup_failed"
   | "disabled"
   | "low_trust_target"
   | "write_failed"
@@ -51,7 +53,8 @@ export interface LinkedIssueSummary {
   title: string;
   status: string;
   assigneeAgentId: string | null;
-  url: string;
+  /** Null when paperclipBaseUrl is not configured — better no link than a wrong one in trusted context. */
+  url: string | null;
   rule: ThreadLinkSource;
 }
 
@@ -95,8 +98,9 @@ export interface RelayedMentionRecord {
 type IssueRecord = NonNullable<Awaited<ReturnType<PluginContext["issues"]["get"]>>>;
 
 /** `<base>/<PREFIX>/issues/<IDENT>` — the same shape the host's own links and paperclip-escalate use. */
-export function issueUrl(paperclipBaseUrl: string, issue: { id: string; identifier: string | null }): string {
+export function issueUrl(paperclipBaseUrl: string, issue: { id: string; identifier: string | null }): string | null {
   const base = paperclipBaseUrl.trim().replace(/\/+$/, "");
+  if (!base) return null;
   if (issue.identifier) {
     const prefix = issue.identifier.split("-", 1)[0];
     return `${base}/${prefix}/issues/${issue.identifier}`;
@@ -109,11 +113,22 @@ function slackTsToIso(ts: string): string {
   return Number.isFinite(ms) ? new Date(ms).toISOString() : "unknown time";
 }
 
+// Every line ending CommonMark recognises — a lone `\r` included — gets its
+// own `> `, so no line of the person's text can step outside the quote.
 function quote(text: string): string {
   return text
-    .split("\n")
+    .split(/\r\n?|\n/)
     .map((line) => `> ${line}`)
     .join("\n");
+}
+
+// One line, at most 80 characters: a display name is user-chosen text
+// sitting in the header beside the fields a reader trusts (the Slack id,
+// the time, the permalink), so it must not be able to imitate them.
+const NAME_MAX_CHARS = 80;
+function headerName(raw: string, fallback: string): string {
+  const flat = raw.replace(/\s+/g, " ").trim();
+  return (flat || fallback).slice(0, NAME_MAX_CHARS);
 }
 
 // Skips that only happen once a thread has (or should have) an issue are
@@ -122,6 +137,7 @@ function quote(text: string): string {
 const METRIC_SKIPS: ReadonlySet<RelaySkipCode> = new Set<RelaySkipCode>([
   "ambiguous_linked_issue",
   "issue_not_found",
+  "lookup_failed",
   "disabled",
   "low_trust_target",
   "write_failed",
@@ -160,7 +176,10 @@ export function createMentionRelay({ ctx, gateway, getConfig, now = Date.now }: 
       try {
         issue = await ctx.issues.get(ref, cfg.companyId);
       } catch (err) {
+        // A ref that could not be checked is not a ref that agrees. Fail
+        // closed rather than decide from the refs that happened to resolve.
         ctx.logger.warn("mention relay: issue lookup failed", { err: errString(err) });
+        return "lookup_failed";
       }
       if (!issue) continue;
       const rule = scope.linkSources.get(ref) ?? "bot_root_link";
@@ -175,6 +194,11 @@ export function createMentionRelay({ ctx, gateway, getConfig, now = Date.now }: 
 
   async function relay(msg: InboundMessage): Promise<MentionRelayOutcome> {
     if (msg.channelType === "im") return skip("dm");
+    // A bot's words are never "human input": another integration, or
+    // another agent's Slack bot, mentioning this bot inside an issue thread
+    // would otherwise reach the issue's owning agent through the one path
+    // that bypasses the host's cross-issue guard, labelled as a person.
+    if (msg.fromBot || !msg.user) return skip("bot_author");
     if (!msg.threadTs || msg.threadTs === msg.ts) return skip("not_a_thread");
     const text = slackTextToMarkdown(msg.text, { botUserId: gateway.botUserId() });
     if (!text) return skip("empty");
@@ -214,7 +238,7 @@ export function createMentionRelay({ ctx, gateway, getConfig, now = Date.now }: 
       return { issue: summary, recorded: { commentId: already.commentId, duplicate: true, woke: false }, skipped: null };
     }
 
-    const name = await gateway.getUserDisplayName(msg.user).catch(() => msg.user);
+    const name = headerName(await gateway.getUserDisplayName(msg.user).catch(() => msg.user), msg.user);
     const permalink = await gateway.getPermalink(msg.channel, msg.ts);
     const cut = text.length > MENTION_RELAY_MAX_BODY ? `${text.slice(0, MENTION_RELAY_MAX_BODY)}… [truncated]` : text;
     const origin =
