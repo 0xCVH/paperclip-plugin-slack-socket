@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { EventEmitter } from "node:events";
 import { shouldDispatchMessage } from "../src/bolt-gateway.js";
 import { isDmChannelId } from "../src/slack-ids.js";
 
@@ -401,6 +402,45 @@ describe("connect-time token diagnostics", () => {
     await gateway.start();
     expect(gateway.diagnostics().missingScopes).toEqual([]);
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+describe("socket liveness tracking", () => {
+  async function startWithSocketClient() {
+    appInstances.length = 0;
+    const { BoltGateway } = await import("../src/bolt-gateway.js");
+    const gateway = new BoltGateway({ botToken: "xoxb", appToken: "xapp", logger: { warn: vi.fn() } });
+    const socketClient = new EventEmitter();
+    (appInstances[0] as unknown as { receiver: unknown }).receiver = { client: socketClient };
+    await gateway.start();
+    return { gateway, socketClient };
+  }
+
+  it("reads as not connected once a reconnect starts, even if \"disconnected\" never follows", async () => {
+    // socket-mode 3.0.x: a fetch failure on apps.connections.open during a
+    // reconnect is thrown as unrecoverable after "reconnecting" — no
+    // "disconnected" is ever emitted, so the socket is dead but was reported live.
+    const { gateway, socketClient } = await startWithSocketClient();
+    expect(gateway.isConnected()).toBe(true);
+    socketClient.emit("reconnecting");
+    expect(gateway.isConnected()).toBe(false);
+  });
+
+  it("reads as connected again when the reconnect completes", async () => {
+    const { gateway, socketClient } = await startWithSocketClient();
+    socketClient.emit("reconnecting");
+    socketClient.emit("connecting");
+    socketClient.emit("connected");
+    expect(gateway.isConnected()).toBe(true);
+  });
+
+  it("reads as not connected on disconnecting and disconnected", async () => {
+    const { gateway, socketClient } = await startWithSocketClient();
+    socketClient.emit("disconnecting");
+    expect(gateway.isConnected()).toBe(false);
+    socketClient.emit("connected");
+    socketClient.emit("disconnected");
+    expect(gateway.isConnected()).toBe(false);
   });
 });
 
