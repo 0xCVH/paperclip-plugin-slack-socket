@@ -279,8 +279,23 @@ export class BoltGateway implements SlackGateway {
     const receiver = (this.app as unknown as {
       receiver?: { client?: { on?: (event: string, fn: () => void) => void } };
     }).receiver;
+    // `connected` is true only between a "connected" event and the next
+    // state change away from it — not merely until "disconnected". The
+    // socket-mode client (3.0.x) treats a network-level failure of
+    // apps.connections.open (WebAPIRequestError, e.g. "fetch failed") during
+    // a reconnect as unrecoverable: it rethrows inside its reconnect timer
+    // (an unhandled rejection), never retries, and never emits
+    // "disconnected" — the last state it emits is "reconnecting". Clearing
+    // only on "disconnected" left isConnected() true on a dead socket, and
+    // since probe() is plain HTTP and still succeeds, the watchdog read the
+    // gateway as alive forever (2026-10-03: inbound events stopped for ~33h
+    // while outbound posting kept working). A genuine transient reconnect
+    // flips back to "connected" within seconds, well inside the watchdog's
+    // two-tick confirmation window.
     receiver?.client?.on?.("connected", () => { this.connected = true; });
-    receiver?.client?.on?.("disconnected", () => { this.connected = false; });
+    for (const state of ["connecting", "reconnecting", "disconnecting", "disconnected"]) {
+      receiver?.client?.on?.(state, () => { this.connected = false; });
+    }
 
     await this.app.start();
     this.connected = true;
