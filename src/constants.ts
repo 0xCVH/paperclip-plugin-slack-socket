@@ -21,7 +21,7 @@ export const REQUIRED_BOT_SCOPES = [
   "commands",
 ] as const;
 
-export const PLUGIN_VERSION = "0.13.0";
+export const PLUGIN_VERSION = "0.13.1";
 
 export const ACTION_IDS = {
   approvalApprove: "approval_approve",
