@@ -375,7 +375,7 @@ export async function resetSession(
   key: string,
   surface: "command" | "mention",
 ): Promise<boolean> {
-  const entry = (await ctx.state.get(stateScope(key))) as SessionEntry | null;
+  const entry = (await ctx.state.get(stateScope(cfg.companyId, key))) as SessionEntry | null;
   if (!entry) return false;
   try {
     await ctx.agents.sessions.close(entry.sessionId, cfg.companyId);
@@ -385,8 +385,8 @@ export async function resetSession(
       sessionId: entry.sessionId,
     });
   }
-  await ctx.state.delete(stateScope(key));
-  await updateIndex(ctx, STATE_KEYS.sessionIndex, (current) => current.filter((k) => k !== key));
+  await ctx.state.delete(stateScope(cfg.companyId, key));
+  await updateIndex(ctx, cfg.companyId, STATE_KEYS.sessionIndex, (current) => current.filter((k) => k !== key));
   await ctx.metrics.write("slack.sessions.reset", 1, { surface }).catch(() => {});
   return true;
 }
@@ -550,7 +550,7 @@ export function createChat(deps: ChatDeps): Chat {
     if (inFlight) return inFlight;
 
     const promise = (async (): Promise<SessionEntry> => {
-      const existing = (await ctx.state.get(stateScope(key))) as SessionEntry | null;
+      const existing = (await ctx.state.get(stateScope(cfg.companyId, key))) as SessionEntry | null;
       // Reuse-time idle check, mirroring the cleanup cron's rule exactly
       // (see cleanup.ts): an entry idle past sessionIdleHours is one the
       // operator considers closed — the cron just hasn't swept it yet. A
@@ -566,7 +566,7 @@ export function createChat(deps: ChatDeps): Chat {
         // Spread preserves seedPending: a session created but not yet
         // seeded (a failed first turn) stays pending until a turn delivers.
         const updated = { ...existing, lastActivityAt: new Date().toISOString() };
-        await ctx.state.set(stateScope(key), updated);
+        await ctx.state.set(stateScope(cfg.companyId, key), updated);
         return updated;
       }
       if (existing) {
@@ -611,8 +611,8 @@ export function createChat(deps: ChatDeps): Chat {
         // retried rather than leaving the thread unseeded forever.
         seedPending: true,
       };
-      await ctx.state.set(stateScope(key), entry);
-      await updateIndex(ctx, STATE_KEYS.sessionIndex, (current) =>
+      await ctx.state.set(stateScope(cfg.companyId, key), entry);
+      await updateIndex(ctx, cfg.companyId, STATE_KEYS.sessionIndex, (current) =>
         current.includes(key) ? current : [...current, key],
       );
       return entry;
@@ -651,10 +651,10 @@ export function createChat(deps: ChatDeps): Chat {
   // hold a DIFFERENT session by the time this write lands (a reset plus a
   // new mention during a slow turn), and stamping the replacement with the
   // old turn's bookkeeping would leave it permanently unseeded.
-  async function markSeedDelivered(key: string, sessionId: string, seededUpTo: string | undefined): Promise<void> {
-    const current = (await ctx.state.get(stateScope(key))) as SessionEntry | null;
+  async function markSeedDelivered(companyId: string, key: string, sessionId: string, seededUpTo: string | undefined): Promise<void> {
+    const current = (await ctx.state.get(stateScope(companyId, key))) as SessionEntry | null;
     if (current && current.sessionId === sessionId && current.seedPending) {
-      await ctx.state.set(stateScope(key), {
+      await ctx.state.set(stateScope(companyId, key), {
         ...current,
         seedPending: false,
         seededUpTo: latestTs(current.seededUpTo, seededUpTo),
@@ -666,13 +666,13 @@ export function createChat(deps: ChatDeps): Chat {
   // max-merge on a re-read entry, so two overlapping turns can only move it
   // forward, never back, whatever order their writes land in. Same
   // session-identity guard as markSeedDelivered, same reason.
-  async function advanceWatermark(key: string, sessionId: string, ts: string | undefined): Promise<void> {
+  async function advanceWatermark(companyId: string, key: string, sessionId: string, ts: string | undefined): Promise<void> {
     if (ts === undefined) return;
-    const current = (await ctx.state.get(stateScope(key))) as SessionEntry | null;
+    const current = (await ctx.state.get(stateScope(companyId, key))) as SessionEntry | null;
     if (!current || current.sessionId !== sessionId) return;
     const merged = latestTs(current.seededUpTo, ts);
     if (merged !== current.seededUpTo) {
-      await ctx.state.set(stateScope(key), { ...current, seededUpTo: merged });
+      await ctx.state.set(stateScope(companyId, key), { ...current, seededUpTo: merged });
     }
   }
 
@@ -1057,7 +1057,7 @@ export function createChat(deps: ChatDeps): Chat {
       if (boundRunId || !runId) return;
       boundRunId = runId;
       const startedAt = new Date().toISOString();
-      bindWrite = bindChatRun(ctx, {
+      bindWrite = bindChatRun(ctx, cfg.companyId, {
         runId,
         agentId: cfg.defaultAgentId,
         sessionId: entry.sessionId,
@@ -1377,7 +1377,7 @@ export function createChat(deps: ChatDeps): Chat {
     if (boundRunId) {
       const runId = boundRunId;
       await bindWrite;
-      await markChatRunSettled(ctx, runId).catch((err) => {
+      await markChatRunSettled(ctx, cfg.companyId, runId).catch((err) => {
         ctx.logger.warn("Failed to mark the chat run binding settled", { err: errString(err), runId });
       });
     }
@@ -1441,7 +1441,7 @@ export function createChat(deps: ChatDeps): Chat {
       // the agent will choose; if someone threads under it, it must not be
       // read as an issue-linking root. See STATE_KEYS.agentPost.
       if (!scope.replyThreadTs) {
-        await recordAgentPost(ctx, placeholder).catch((err) => {
+        await recordAgentPost(ctx, cfg.companyId, placeholder).catch((err) => {
           ctx.logger.warn("Failed to record a top-level chat reply as agent-worded", { err: errString(err) });
         });
       }
@@ -1520,7 +1520,7 @@ export function createChat(deps: ChatDeps): Chat {
       // thus "once delivered", not "once attempted".
       if (delivered) {
         if (wantSeed && seedComplete) {
-          await markSeedDelivered(scope.key, entry.sessionId, latestTs(seedMaxTs, msg.ts));
+          await markSeedDelivered(cfg.companyId, scope.key, entry.sessionId, latestTs(seedMaxTs, msg.ts));
         }
         if (wantDelta && (deltaFetchOk || initializeWatermark)) {
           // On a failed delta fetch the watermark deliberately stays put —
@@ -1528,7 +1528,7 @@ export function createChat(deps: ChatDeps): Chat {
           // by the next turn instead of being skipped forever. The cost is
           // benign: that retry re-delivers this turn's trigger as one line
           // of background, which the agent already saw as a prompt.
-          await advanceWatermark(scope.key, entry.sessionId, latestTs(deltaMaxTs, msg.ts));
+          await advanceWatermark(cfg.companyId, scope.key, entry.sessionId, latestTs(deltaMaxTs, msg.ts));
         }
       }
     } catch (err) {

@@ -58,8 +58,8 @@ export function registerNotifications({ ctx, gateway, getConfig, companyId }: No
       "issue_created",
     );
     if (posted && issueId) {
-      await linkMessage(ctx, STATE_KEYS.issueThreadIndex, STATE_KEYS.issueThread(issueId), posted);
-      await linkThreadIssue(ctx, posted, issueId);
+      await linkMessage(ctx, companyId, STATE_KEYS.issueThreadIndex, STATE_KEYS.issueThread(issueId), posted);
+      await linkThreadIssue(ctx, companyId, posted, issueId);
     }
   });
 
@@ -74,14 +74,14 @@ export function registerNotifications({ ctx, gateway, getConfig, companyId }: No
 
     const issueId = e.entityId ?? "";
     const key = issueId ? STATE_KEYS.issueThread(issueId) : null;
-    const entry = key ? await getMessageLink(ctx, key) : null;
+    const entry = key ? await getMessageLink(ctx, companyId, key) : null;
 
     if (entry && key && entry.channel === channel) {
       // Post the completion notice as a threaded reply on the original
       // "issue created" message, then the link is no longer needed — the
       // issue is finished.
       await post(channel, formatIssueDone(payload, issueId, cfg.paperclipBaseUrl), "issue_done", entry.ts);
-      await unlinkMessage(ctx, STATE_KEYS.issueThreadIndex, key);
+      await unlinkMessage(ctx, companyId, STATE_KEYS.issueThreadIndex, key);
     } else {
       await post(channel, formatIssueDone(payload, issueId, cfg.paperclipBaseUrl), "issue_done");
     }

@@ -32,17 +32,17 @@ export const CHAT_RUN_MAX_AGE_MS = 24 * 3_600_000;
  */
 export const THREAD_LINK_MAX_AGE_MS = 90 * 24 * 3_600_000;
 
-export async function bindChatRun(ctx: PluginContext, binding: ChatRunBinding): Promise<void> {
+export async function bindChatRun(ctx: PluginContext, companyId: string, binding: ChatRunBinding): Promise<void> {
   const key = STATE_KEYS.chatRun(binding.runId);
-  await ctx.state.set(stateScope(key), binding);
-  await updateIndex(ctx, STATE_KEYS.chatRunIndex, (current) => (current.includes(key) ? current : [...current, key]));
+  await ctx.state.set(stateScope(companyId, key), binding);
+  await updateIndex(ctx, companyId, STATE_KEYS.chatRunIndex, (current) => (current.includes(key) ? current : [...current, key]));
 }
 
-export async function markChatRunSettled(ctx: PluginContext, runId: string, now = Date.now()): Promise<void> {
+export async function markChatRunSettled(ctx: PluginContext, companyId: string, runId: string, now = Date.now()): Promise<void> {
   const key = STATE_KEYS.chatRun(runId);
-  const binding = (await ctx.state.get(stateScope(key))) as ChatRunBinding | null;
+  const binding = (await ctx.state.get(stateScope(companyId, key))) as ChatRunBinding | null;
   if (!binding || binding.settledAt) return;
-  await ctx.state.set(stateScope(key), { ...binding, settledAt: new Date(now).toISOString() });
+  await ctx.state.set(stateScope(companyId, key), { ...binding, settledAt: new Date(now).toISOString() });
 }
 
 export function isChatRunLive(binding: ChatRunBinding, now: number): boolean {
@@ -54,21 +54,22 @@ export function isChatRunLive(binding: ChatRunBinding, now: number): boolean {
 /** The run's binding, or null when there is none or it has expired. */
 export async function getLiveChatRun(
   ctx: PluginContext,
+  companyId: string,
   runId: string,
   now = Date.now(),
 ): Promise<ChatRunBinding | null> {
-  const binding = (await ctx.state.get(stateScope(STATE_KEYS.chatRun(runId)))) as ChatRunBinding | null;
+  const binding = (await ctx.state.get(stateScope(companyId, STATE_KEYS.chatRun(runId)))) as ChatRunBinding | null;
   if (!binding || !isChatRunLive(binding, now)) return null;
   return binding;
 }
 
 /** Remembers that `posted` is a top-level message whose words an agent chose. */
-export async function recordAgentPost(ctx: PluginContext, posted: { channel: string; ts: string }): Promise<void> {
-  await linkMessage(ctx, STATE_KEYS.agentPostIndex, STATE_KEYS.agentPost(posted.channel, posted.ts), posted);
+export async function recordAgentPost(ctx: PluginContext, companyId: string, posted: { channel: string; ts: string }): Promise<void> {
+  await linkMessage(ctx, companyId, STATE_KEYS.agentPostIndex, STATE_KEYS.agentPost(posted.channel, posted.ts), posted);
 }
 
-export async function isAgentPost(ctx: PluginContext, channel: string, ts: string): Promise<boolean> {
-  return (await ctx.state.get(stateScope(STATE_KEYS.agentPost(channel, ts)))) != null;
+export async function isAgentPost(ctx: PluginContext, companyId: string, channel: string, ts: string): Promise<boolean> {
+  return (await ctx.state.get(stateScope(companyId, STATE_KEYS.agentPost(channel, ts)))) != null;
 }
 
 export interface ThreadIssueLink {
@@ -81,38 +82,39 @@ export interface ThreadIssueLink {
 /** Records that the thread rooted at `posted` was posted for `issueId`. */
 export async function linkThreadIssue(
   ctx: PluginContext,
+  companyId: string,
   posted: { channel: string; ts: string },
   issueId: string,
 ): Promise<void> {
   const key = STATE_KEYS.threadIssue(posted.channel, posted.ts);
   const entry: ThreadIssueLink = { issueId, channel: posted.channel, ts: posted.ts, createdAt: new Date().toISOString() };
-  await ctx.state.set(stateScope(key), entry);
-  await updateIndex(ctx, STATE_KEYS.threadIssueIndex, (current) => (current.includes(key) ? current : [...current, key]));
+  await ctx.state.set(stateScope(companyId, key), entry);
+  await updateIndex(ctx, companyId, STATE_KEYS.threadIssueIndex, (current) => (current.includes(key) ? current : [...current, key]));
 }
 
-export async function getThreadIssue(ctx: PluginContext, channel: string, ts: string): Promise<string | null> {
-  const entry = (await ctx.state.get(stateScope(STATE_KEYS.threadIssue(channel, ts)))) as ThreadIssueLink | null;
+export async function getThreadIssue(ctx: PluginContext, companyId: string, channel: string, ts: string): Promise<string | null> {
+  const entry = (await ctx.state.get(stateScope(companyId, STATE_KEYS.threadIssue(channel, ts)))) as ThreadIssueLink | null;
   return entry?.issueId ?? null;
 }
 
 /** Cleanup-job pass: drops expired run bindings (and their write logs) and old links. */
-export async function pruneChatRunState(ctx: PluginContext, now: number): Promise<void> {
-  const index = ((await ctx.state.get(stateScope(STATE_KEYS.chatRunIndex))) as string[] | null) ?? [];
+export async function pruneChatRunState(ctx: PluginContext, companyId: string, now: number): Promise<void> {
+  const index = ((await ctx.state.get(stateScope(companyId, STATE_KEYS.chatRunIndex))) as string[] | null) ?? [];
   const removed: string[] = [];
   for (const key of index) {
-    const binding = (await ctx.state.get(stateScope(key))) as ChatRunBinding | null;
+    const binding = (await ctx.state.get(stateScope(companyId, key))) as ChatRunBinding | null;
     if (!binding) {
       removed.push(key);
       continue;
     }
     if (!isChatRunLive(binding, now)) {
-      await ctx.state.delete(stateScope(key));
-      await ctx.state.delete(stateScope(STATE_KEYS.chatRunWrites(binding.runId)));
+      await ctx.state.delete(stateScope(companyId, key));
+      await ctx.state.delete(stateScope(companyId, STATE_KEYS.chatRunWrites(binding.runId)));
       removed.push(key);
     }
   }
-  await updateIndex(ctx, STATE_KEYS.chatRunIndex, (current) => current.filter((k) => !removed.includes(k)));
+  await updateIndex(ctx, companyId, STATE_KEYS.chatRunIndex, (current) => current.filter((k) => !removed.includes(k)));
 
-  await pruneMessageLinks(ctx, STATE_KEYS.agentPostIndex, THREAD_LINK_MAX_AGE_MS, now);
-  await pruneMessageLinks(ctx, STATE_KEYS.threadIssueIndex, THREAD_LINK_MAX_AGE_MS, now);
+  await pruneMessageLinks(ctx, companyId, STATE_KEYS.agentPostIndex, THREAD_LINK_MAX_AGE_MS, now);
+  await pruneMessageLinks(ctx, companyId, STATE_KEYS.threadIssueIndex, THREAD_LINK_MAX_AGE_MS, now);
 }

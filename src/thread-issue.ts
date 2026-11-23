@@ -106,7 +106,7 @@ export async function resolveThreadScope(
   const named = extractIssueRefs(input.triggerText);
   if (!input.threadTs) return { linked, linkSources, named };
 
-  const linkedId = await getThreadIssue(ctx, input.channel, input.threadTs);
+  const linkedId = await getThreadIssue(ctx, cfg.companyId, input.channel, input.threadTs);
   if (linkedId) {
     linked.add(linkedId.toLowerCase());
     linkSources.set(linkedId.toLowerCase(), "plugin_link");
@@ -131,7 +131,7 @@ export async function resolveThreadScope(
         authoredByThisBot &&
         Number.isFinite(ageMs) &&
         ageMs <= THREAD_LINK_MAX_AGE_MS &&
-        !(await isAgentPost(ctx, input.channel, message.ts))
+        !(await isAgentPost(ctx, cfg.companyId, input.channel, message.ts))
       ) {
         for (const ref of extractIssueLinkRefs(message, cfg.paperclipBaseUrl)) {
           linked.add(ref);

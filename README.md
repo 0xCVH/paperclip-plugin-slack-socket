@@ -157,6 +157,24 @@ After installing and configuring the plugin, walk through this checklist end-to-
 
 ## Upgrade notes
 
+### Upgrading to 0.14.0 with existing Slack state
+
+0.14.0 scopes thread links, sessions, pending questions and relay receipts to the configured Paperclip company. Fresh installations start with an empty company namespace. On an existing installation, migrate the rows before starting the new worker so a reply to an old thread reaches its issue and redelivery finds its original receipt.
+
+1. Confirm which company historically owned the Slack integration. Legacy instance rows have no owner field on most records. If the installation served multiple companies over time, reconcile those rows before proceeding.
+2. Disable the Slack plugin, let in-flight handlers finish, and take the normal database and plugin configuration backup. Keep the previous plugin package available.
+3. From the new package directory, connect an operator psql session to the instance database. Set the confirmed company UUID in the transaction below. The migration requires one matching saved configuration and stops on conflicting ownership or duplicate keys.
+
+```sql
+\set ON_ERROR_STOP on
+BEGIN;
+SET LOCAL slack_socket.company_id = '<confirmed-company-uuid>';
+\i migrations/company-state.sql
+COMMIT;
+```
+
+4. Start 0.14.0 and verify that a reply in an existing linked test thread creates one issue comment and one agent turn. For rollback, stop the worker, run the same transaction with `SET LOCAL slack_socket.rollback = 'on';` before `\i`, and restore the prior plugin package. This moves current records back, including receipts written since the upgrade.
+
 - **Pending `ask_human` questions created before 0.10.0 are not covered by the cross-tenant guard.** The guard checks company scope at the moment a question is asked, so it stops another company's agent from asking a question through this plugin from that point on. A question that was already posted to Slack and sitting in plugin state before you upgrade carries the company id it recorded when it was asked, and answering it (by reaction or threaded reply) or letting it expire resolves onto that recorded company without re-checking it against the current config. On a multi-company instance, any question in flight across the upgrade should be treated as trusted from before the guard existed, not as covered by it.
 - **1:1 DM sessions from before 0.10.0 are not migrated.** Pre-0.10.0 (and `dmSessionMode: "thread"`) DM sessions are keyed per-thread; the new `"channel"` default keys the whole DM as one session under a different key. Upgrading does not move old sessions onto the new key — they are simply left to idle out on the normal `sessionIdleHours` schedule, and a reply landing in one of those old DM threads starts a new conversation rather than resuming it.
 - **Rapid consecutive DM messages now run concurrent turns against one shared session.** Under the new `"channel"` default, every message in a 1:1 DM shares one continuous agent session; before this branch, each top-level DM message got its own session, so sending several messages in quick succession was harmless. The agent SDK documents no per-session ordering guarantee for overlapping turns — the host may interleave the prompts, or it may serialize them, in which case a queued turn's wait time counts against `turnTimeoutMinutes` and it can time out while it was merely waiting, not stalled. If you message the bot faster than it replies, expect occasional interleaved or timed-out responses. This isn't fixed by this branch — a per-thread turn queue is planned separately.

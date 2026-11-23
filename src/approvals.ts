@@ -47,7 +47,7 @@ export function createApprovals({ ctx, gateway, getConfig, companyId }: Approval
       // reported as a failed notification.
       await linkMessage(
         ctx,
-        STATE_KEYS.approvalMessageIndex,
+        companyId, STATE_KEYS.approvalMessageIndex,
         STATE_KEYS.approvalMessage(approvalId),
         posted,
       ).catch((err: unknown) => {
@@ -69,7 +69,7 @@ export function createApprovals({ ctx, gateway, getConfig, companyId }: Approval
     if (!e.entityId) return;
     const approvalId = e.entityId;
     const key = STATE_KEYS.approvalMessage(approvalId);
-    const link = await getMessageLink(ctx, key);
+    const link = await getMessageLink(ctx, companyId, key);
     if (!link) return;
     try {
       await gateway.updateMessage({
@@ -89,7 +89,7 @@ export function createApprovals({ ctx, gateway, getConfig, companyId }: Approval
     // Dropped either way. The approval is decided, so nothing will ever
     // legitimately rewrite this message again, and a link kept alive after a
     // failed update would only sit there until the 30-day prune.
-    await unlinkMessage(ctx, STATE_KEYS.approvalMessageIndex, key);
+    await unlinkMessage(ctx, companyId, STATE_KEYS.approvalMessageIndex, key);
   });
 
   async function postFailureEphemeral(
@@ -167,7 +167,7 @@ export function createApprovals({ ctx, gateway, getConfig, companyId }: Approval
       // succeeded report to the user as failed.
       await unlinkMessage(
         ctx,
-        STATE_KEYS.approvalMessageIndex,
+        companyId, STATE_KEYS.approvalMessageIndex,
         STATE_KEYS.approvalMessage(approvalId),
       ).catch((err: unknown) => {
         ctx.logger.warn("Failed to unlink an approval message decided in Slack", {
