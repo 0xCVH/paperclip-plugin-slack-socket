@@ -19,6 +19,7 @@ export type { MessageLink };
  */
 export async function linkMessage(
   ctx: PluginContext,
+  companyId: string,
   indexKey: string,
   key: string,
   posted: { channel: string; ts: string },
@@ -28,19 +29,19 @@ export async function linkMessage(
     ts: posted.ts,
     createdAt: new Date().toISOString(),
   };
-  await ctx.state.set(stateScope(key), entry);
-  await updateIndex(ctx, indexKey, (current) => (current.includes(key) ? current : [...current, key]));
+  await ctx.state.set(stateScope(companyId, key), entry);
+  await updateIndex(ctx, companyId, indexKey, (current) => (current.includes(key) ? current : [...current, key]));
 }
 
 /** The Slack message linked to `key`, or null when nothing is linked. */
-export async function getMessageLink(ctx: PluginContext, key: string): Promise<MessageLink | null> {
-  return ((await ctx.state.get(stateScope(key))) as MessageLink | null) ?? null;
+export async function getMessageLink(ctx: PluginContext, companyId: string, key: string): Promise<MessageLink | null> {
+  return ((await ctx.state.get(stateScope(companyId, key))) as MessageLink | null) ?? null;
 }
 
 /** Drops the link for `key` and its index membership. */
-export async function unlinkMessage(ctx: PluginContext, indexKey: string, key: string): Promise<void> {
-  await ctx.state.delete(stateScope(key));
-  await updateIndex(ctx, indexKey, (current) => current.filter((k) => k !== key));
+export async function unlinkMessage(ctx: PluginContext, companyId: string, indexKey: string, key: string): Promise<void> {
+  await ctx.state.delete(stateScope(companyId, key));
+  await updateIndex(ctx, companyId, indexKey, (current) => current.filter((k) => k !== key));
 }
 
 /**
@@ -50,24 +51,25 @@ export async function unlinkMessage(ctx: PluginContext, indexKey: string, key: s
  */
 export async function pruneMessageLinks(
   ctx: PluginContext,
+  companyId: string,
   indexKey: string,
   maxAgeMs: number,
   now: number,
 ): Promise<void> {
-  const index = ((await ctx.state.get(stateScope(indexKey))) as string[] | null) ?? [];
+  const index = ((await ctx.state.get(stateScope(companyId, indexKey))) as string[] | null) ?? [];
   const removed: string[] = [];
   for (const key of index) {
-    const entry = (await ctx.state.get(stateScope(key))) as MessageLink | null;
+    const entry = (await ctx.state.get(stateScope(companyId, key))) as MessageLink | null;
     if (!entry) {
       removed.push(key);
       continue;
     }
     if (now - Date.parse(entry.createdAt) > maxAgeMs) {
-      await ctx.state.delete(stateScope(key));
+      await ctx.state.delete(stateScope(companyId, key));
       removed.push(key);
     }
   }
   // Filter the freshly-read index rather than writing `index` back, so a key
   // appended while we were iterating survives.
-  await updateIndex(ctx, indexKey, (current) => current.filter((k) => !removed.includes(k)));
+  await updateIndex(ctx, companyId, indexKey, (current) => current.filter((k) => !removed.includes(k)));
 }

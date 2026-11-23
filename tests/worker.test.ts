@@ -828,14 +828,14 @@ describe("describeHostError", () => {
 });
 
 describe("describeHostError — background authorization", () => {
-  it("explains that a first-time configuration needs a worker restart", async () => {
+  it("reports a rejected scope without assuming first-time configuration", async () => {
     const { describeHostError } = await import("../src/host-errors.js");
     const message = describeHostError(
       new Error(
         'Plugin "abc" is not allowed to perform "agents.sessions.create": the worker referenced a missing, expired, or unknown invocation scope',
       ),
     );
-    expect(message).toContain("Disable and re-enable");
+    expect(message).toContain("rejected the scope");
     expect(message).not.toContain("invocation scope");
   });
 });
@@ -1452,9 +1452,18 @@ describe("stale-drop observability", () => {
 });
 
 describe("worker: mention relay wiring", () => {
-  it("records an @mention in an issue-linked thread on the issue before the agent turn", async () => {
+  it.each([true, false])("handles a mention during a company event (existing issue link: %s)", async (linked) => {
     const { applyConfig } = await loadWorker();
     const { ctx, stateStore } = makeCtx();
+    // A concurrent company notification leaves the host with an active invocation.
+    // The canary admits a proactive state read only for the configured company.
+    vi.mocked(ctx.state.get).mockImplementation(async (key) => {
+      if (key.scopeKind !== "company" || key.scopeId !== TEST_CONFIG.companyId) {
+        throw new Error("Missing or unknown invocation scope");
+      }
+      return stateStore.get(key.stateKey) ?? null;
+    });
+    vi.mocked(ctx.metrics.write).mockRejectedValue(new Error("Missing or unknown invocation scope"));
     const gateway = new FakeGateway();
     const ROOT_TS = `${Date.now() / 1000 - 600}.000100`;
     const MENTION_TS = `${Date.now() / 1000 - 5}.000200`;
@@ -1465,7 +1474,7 @@ describe("worker: mention relay wiring", () => {
     (ctx.issues.get as any).mockImplementation(async (ref: string) =>
       ref === issue.id || ref === issue.identifier ? issue : null,
     );
-    stateStore.set(STATE_KEYS.threadIssue("C-ESC", ROOT_TS), {
+    if (linked) stateStore.set(STATE_KEYS.threadIssue("C-ESC", ROOT_TS), {
       issueId: issue.id, channel: "C-ESC", ts: ROOT_TS, createdAt: new Date().toISOString(),
     });
 
@@ -1475,10 +1484,13 @@ describe("worker: mention relay wiring", () => {
       text: "<@UBOT> the fix is merged", ts: MENTION_TS, threadTs: ROOT_TS,
     });
 
-    expect(ctx.issues.createComment).toHaveBeenCalledTimes(1);
-    expect((ctx.issues.createComment as any).mock.calls[0][0]).toBe(issue.id);
+    expect(ctx.issues.createComment).toHaveBeenCalledTimes(linked ? 1 : 0);
+    if (linked) expect(vi.mocked(ctx.issues.createComment).mock.calls[0][0]).toBe(issue.id);
     expect(ctx.agents.sessions.sendMessage).toHaveBeenCalledTimes(1);
     const prompt = (ctx.agents.sessions.sendMessage as any).mock.calls[0][2].prompt as string;
-    expect(prompt).toContain("Linked Paperclip issue: POL-3099");
+    expect(prompt.includes("Linked Paperclip issue: POL-3099")).toBe(linked);
+    for (const [key] of vi.mocked(ctx.state.set).mock.calls) {
+      expect(key).toMatchObject({ scopeKind: "company", scopeId: TEST_CONFIG.companyId });
+    }
   });
 });

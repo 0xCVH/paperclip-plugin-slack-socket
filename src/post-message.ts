@@ -95,7 +95,7 @@ export function createPostMessage({ ctx, gateway, getConfig }: PostMessageDeps):
           // agent chose; record_on_issue must never read an issue link in it
           // as that thread's issue. Best-effort — the post is already live.
           if (!threadTs) {
-            await recordAgentPost(ctx, first).catch((err) => {
+            await recordAgentPost(ctx, config.companyId, first).catch((err) => {
               ctx.logger.warn("slack_post_message: failed to record the post as agent-worded", { err: errString(err) });
             });
           }

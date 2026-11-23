@@ -17,6 +17,7 @@ const chains = new Map<string, Promise<void>>();
  */
 export async function updateIndex(
   ctx: PluginContext,
+  companyId: string,
   indexKey: string,
   updater: (current: string[]) => string[],
 ): Promise<string[]> {
@@ -24,9 +25,9 @@ export async function updateIndex(
   let result!: string[];
 
   const next = previous.catch(() => {}).then(async () => {
-    const current = ((await ctx.state.get(stateScope(indexKey))) as string[] | null) ?? [];
+    const current = ((await ctx.state.get(stateScope(companyId, indexKey))) as string[] | null) ?? [];
     result = updater(current);
-    await ctx.state.set(stateScope(indexKey), result);
+    await ctx.state.set(stateScope(companyId, indexKey), result);
   });
 
   chains.set(indexKey, next);

@@ -121,7 +121,7 @@ describe("mention relay: which mentions are recorded", () => {
 
   it("does not read an agent-worded bot root (slack_post_message, ask_human) as linking an issue", async () => {
     const { ctx, relay } = setup();
-    await recordAgentPost(ctx, { channel: "C-ESC", ts: ROOT_TS });
+    await recordAgentPost(ctx, "co-1", { channel: "C-ESC", ts: ROOT_TS });
     const outcome = await relay.relayMention(mention());
     expect(outcome.skipped).toBe("no_linked_issue");
     expect(ctx.issues.createComment).not.toHaveBeenCalled();
