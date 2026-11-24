@@ -27,6 +27,7 @@ opts in.
 | `agentPostMessageEnabled` | boolean | `false` | Master switch. Off → every call refused. |
 | `agentPostToChannelsEnabled` | boolean | `false` | Channel posting on/off without clearing the list. |
 | `agentPostChannelIds` | string[] | `[]` | Channel IDs the tool may post to. |
+| `agentPostAnyChannel` | boolean | `false` | When on, any channel the bot is in may be posted to and `agentPostChannelIds` is ignored. Still requires `agentPostMessageEnabled` and `agentPostToChannelsEnabled`. |
 | `agentDmEnabled` | boolean | `false` | DM sending on/off without clearing the list. |
 | `agentDmUserIds` | string[] | `[]` | User IDs the tool may DM. |
 | `agentDmAnyUser` | boolean | `false` | When on, any workspace member may be DM'd and `agentDmUserIds` is ignored. |
@@ -109,8 +110,9 @@ Order of evaluation:
    else → channel.
 4. DM path: refuse unless `agentDmEnabled`. Then allow if `agentDmAnyUser`,
    otherwise allow only if the id is in `agentDmUserIds`.
-5. Channel path: refuse unless `agentPostToChannelsEnabled`, then allow only if
-   the id is in `agentPostChannelIds`.
+5. Channel path: refuse unless `agentPostToChannelsEnabled`. Then allow if
+   `agentPostAnyChannel` (takes precedence, the list is ignored), otherwise
+   allow only if the id is in `agentPostChannelIds`.
 
 List matching reuses the normalization `isUserAllowed` already applies: entries
 and target are trimmed and compared case-insensitively, and blank entries are

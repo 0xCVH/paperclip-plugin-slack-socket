@@ -264,6 +264,7 @@ export const DEFAULT_CONFIG: SlackSocketConfig = {
   agentPostMessageEnabled: false,
   agentPostToChannelsEnabled: false,
   agentPostChannelIds: [],
+  agentPostAnyChannel: false,
   agentDmEnabled: false,
   agentDmUserIds: [],
   agentDmAnyUser: false,

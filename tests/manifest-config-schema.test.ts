@@ -195,6 +195,7 @@ describe("instanceConfigSchema vs the host settings form", () => {
       agentPostMessageEnabled: true,
       agentPostToChannelsEnabled: true,
       agentPostChannelIds: ["C01ABC2DEF3", "C09XYZ8GHI7"],
+      agentPostAnyChannel: false,
       agentDmEnabled: true,
       agentDmUserIds: ["U01ABC2DEF3"],
       agentDmAnyUser: false,
@@ -220,6 +221,7 @@ describe("instanceConfigSchema vs the host settings form", () => {
     expect(schema.properties.agentPostMessageEnabled?.default).toBe(false);
     expect(schema.properties.agentPostToChannelsEnabled?.default).toBe(false);
     expect(schema.properties.agentPostChannelIds?.default).toEqual([]);
+    expect(schema.properties.agentPostAnyChannel?.default).toBe(false);
     expect(schema.properties.agentDmEnabled?.default).toBe(false);
     expect(schema.properties.agentDmUserIds?.default).toEqual([]);
     expect(schema.properties.agentDmAnyUser?.default).toBe(false);

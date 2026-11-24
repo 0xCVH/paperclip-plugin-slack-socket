@@ -104,6 +104,10 @@ const DM_PREFIXES = ["u", "w"];
  * configured". See the note on these fields in types.ts for why an outbound
  * capability must not default to unrestricted.
  *
+ * `agentPostAnyChannel` takes precedence over `agentPostChannelIds` (the list
+ * is ignored when it is on), mirroring `agentDmAnyUser`. It is itself still
+ * subject to `agentPostMessageEnabled` and `agentPostToChannelsEnabled`.
+ *
  * `reason` is returned to the calling agent verbatim, so it names the setting
  * that refused and echoes the agent's own target — never a config value.
  */
@@ -128,7 +132,7 @@ export function checkPostTarget(config: SlackSocketConfig, target: string): Post
   if (!config.agentPostToChannelsEnabled) {
     return { allowed: false, reason: "Posting to channels is disabled for agents (agentPostToChannelsEnabled is off)." };
   }
-  if (!normalizeList(config.agentPostChannelIds).includes(trimmed.toLowerCase())) {
+  if (!config.agentPostAnyChannel && !normalizeList(config.agentPostChannelIds).includes(trimmed.toLowerCase())) {
     return { allowed: false, reason: `Channel "${trimmed}" is not in agentPostChannelIds.` };
   }
   return { allowed: true, kind: "channel", target: trimmed };
