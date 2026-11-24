@@ -111,6 +111,33 @@ describe("checkPostTarget", () => {
     expect(checkPostTarget(cfg, "U-STRANGER").allowed).toBe(false);
   });
 
+  it("allows an unlisted channel when agentPostAnyChannel is on", () => {
+    const cfg = postConfig({ agentPostChannelIds: [], agentPostAnyChannel: true });
+    expect(checkPostTarget(cfg, "C-STRANGER")).toEqual({
+      allowed: true, kind: "channel", target: "C-STRANGER",
+    });
+  });
+
+  it("agentPostAnyChannel overrides a non-matching channel list", () => {
+    const cfg = postConfig({ agentPostChannelIds: ["C-OK"], agentPostAnyChannel: true });
+    expect(checkPostTarget(cfg, "C-OTHER").allowed).toBe(true);
+  });
+
+  it("still refuses channels when agentPostAnyChannel is on but channel posting is off", () => {
+    const cfg = postConfig({ agentPostAnyChannel: true, agentPostToChannelsEnabled: false });
+    expect(checkPostTarget(cfg, "C-STRANGER").allowed).toBe(false);
+  });
+
+  it("still refuses channels when agentPostAnyChannel is on but the master switch is off", () => {
+    const cfg = postConfig({ agentPostAnyChannel: true, agentPostMessageEnabled: false });
+    expect(checkPostTarget(cfg, "C-STRANGER").allowed).toBe(false);
+  });
+
+  it("agentPostAnyChannel does not widen dm access", () => {
+    const cfg = postConfig({ agentPostAnyChannel: true, agentDmUserIds: [] });
+    expect(checkPostTarget(cfg, "U-STRANGER").allowed).toBe(false);
+  });
+
   it("matches trimmed and case-insensitively, and returns the trimmed target", () => {
     const cfg = postConfig({ agentPostChannelIds: ["  c-ok  "] });
     expect(checkPostTarget(cfg, "  C-OK  ")).toEqual({

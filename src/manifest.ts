@@ -230,6 +230,13 @@ const manifest: PaperclipPluginManifestV1 = {
           "Channel IDs (e.g. C01ABC2DEF3) that agents may post to. Empty means no channel may be posted to — unlike the inbound allowlist above, an empty list here authorizes nothing rather than removing the restriction. The bot must also be a member of the channel.",
         default: DEFAULT_CONFIG.agentPostChannelIds,
       },
+      agentPostAnyChannel: {
+        type: "boolean",
+        title: "Allow agent posts to every channel the app is in",
+        description:
+          "When on, agents may post to any channel the bot is a member of and the channel list above is ignored. Takes precedence over the list. Still requires \"Allow agent posts to channels\" to be on.",
+        default: DEFAULT_CONFIG.agentPostAnyChannel,
+      },
       agentDmEnabled: {
         type: "boolean",
         title: "Allow agent DMs",

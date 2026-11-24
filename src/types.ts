@@ -64,6 +64,7 @@ export interface SlackSocketConfig {
   agentPostMessageEnabled: boolean;
   agentPostToChannelsEnabled: boolean;
   agentPostChannelIds: string[];
+  agentPostAnyChannel: boolean;
   agentDmEnabled: boolean;
   agentDmUserIds: string[];
   agentDmAnyUser: boolean;
