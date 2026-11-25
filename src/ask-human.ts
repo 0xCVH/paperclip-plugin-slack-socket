@@ -57,8 +57,8 @@ export function createAskHuman({ ctx, gateway, getConfig }: AskHumanDeps): AskHu
       ts: pending.ts,
       ...formatQuestionResolved(pending.question, response, responderName),
     });
-    await ctx.state.delete(stateScope(key));
-    await updateIndex(ctx, STATE_KEYS.questionIndex, (current) => current.filter((k) => k !== key));
+    await ctx.state.delete(stateScope(pending.companyId, key));
+    await updateIndex(ctx, pending.companyId, STATE_KEYS.questionIndex, (current) => current.filter((k) => k !== key));
     await ctx.metrics.write("slack.questions.answered", 1, { mode: pending.mode });
   }
 
@@ -141,8 +141,8 @@ export function createAskHuman({ ctx, gateway, getConfig }: AskHumanDeps): AskHu
               askedAt: new Date().toISOString(),
               timeoutMinutes,
             };
-            await ctx.state.set(stateScope(key), pending);
-            await updateIndex(ctx, STATE_KEYS.questionIndex, (current) => [...current, key]);
+            await ctx.state.set(stateScope(config.companyId, key), pending);
+            await updateIndex(ctx, config.companyId, STATE_KEYS.questionIndex, (current) => [...current, key]);
           } catch (err) {
             // The question is now a live, unanswerable message in Slack: it
             // posted successfully but we failed to record enough state to
@@ -172,7 +172,7 @@ export function createAskHuman({ ctx, gateway, getConfig }: AskHumanDeps): AskHu
           }
 
           // The question is agent-worded and top-level (see STATE_KEYS.agentPost).
-          await recordAgentPost(ctx, posted).catch((err) => {
+          await recordAgentPost(ctx, config.companyId, posted).catch((err) => {
             ctx.logger.warn("ask_human: failed to record the question as agent-worded", { err: errString(err) });
           });
           try {
@@ -191,7 +191,8 @@ export function createAskHuman({ ctx, gateway, getConfig }: AskHumanDeps): AskHu
     async tryHandleAnswer(msg) {
       if (!msg.threadTs || msg.threadTs === msg.ts) return false;
       const key = STATE_KEYS.question(msg.channel, msg.threadTs);
-      const pending = (await ctx.state.get(stateScope(key))) as PendingQuestion | null;
+      const { companyId } = await getConfig();
+      const pending = (await ctx.state.get(stateScope(companyId, key))) as PendingQuestion | null;
       if (!pending || pending.mode !== "answer") return false;
       // An attachment-only message (Slack's file_share subtype, passed
       // through to routing so a captioned upload isn't swallowed — see
@@ -219,7 +220,8 @@ export function createAskHuman({ ctx, gateway, getConfig }: AskHumanDeps): AskHu
 
     async handleReaction(reaction) {
       const key = STATE_KEYS.question(reaction.channel, reaction.messageTs);
-      const pending = (await ctx.state.get(stateScope(key))) as PendingQuestion | null;
+      const { companyId } = await getConfig();
+      const pending = (await ctx.state.get(stateScope(companyId, key))) as PendingQuestion | null;
       if (!pending || pending.mode !== "reaction") return;
       if (claimed.has(key)) return;
       claimed.add(key);

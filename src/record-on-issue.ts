@@ -101,7 +101,7 @@ export function createRecordOnIssue({ ctx, gateway, getConfig, now = Date.now }:
           // issue-bound heartbeat run has the normal API and must use it.
           let binding: ChatRunBinding | null = null;
           try {
-            binding = await getLiveChatRun(ctx, runCtx.runId, now());
+            binding = await getLiveChatRun(ctx, cfg.companyId, runCtx.runId, now());
           } catch (err) {
             ctx.logger.warn("record_on_issue: failed to read the run binding", { err: errString(err) });
           }
@@ -161,7 +161,7 @@ export function createRecordOnIssue({ ctx, gateway, getConfig, now = Date.now }:
           const target = issue;
           const activeBinding = binding;
           return serializeRun(runCtx.runId, async () => {
-            const writesKey = stateScope(STATE_KEYS.chatRunWrites(runCtx.runId));
+            const writesKey = stateScope(cfg.companyId, STATE_KEYS.chatRunWrites(runCtx.runId));
             const writes = ((await ctx.state.get(writesKey)) as RecordedWrite[] | null) ?? [];
             const bodyHash = hashBody(body);
 

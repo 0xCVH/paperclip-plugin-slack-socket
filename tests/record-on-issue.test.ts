@@ -168,7 +168,7 @@ describe("record_on_issue tool", () => {
 
   it("refuses a bot-authored root whose words an agent chose (slack_post_message)", async () => {
     const { ctx, handler, gateway } = setup();
-    await recordAgentPost(ctx, { channel: "C-ESC", ts: ROOT_TS });
+    await recordAgentPost(ctx, "co-1", { channel: "C-ESC", ts: ROOT_TS });
     gateway.threadReplies = [botRoot()];
     const result = await handler({ issue: "POL-3267", body: "x" }, RUN_CTX);
     expect(result.code).toBe("issue_not_in_thread_scope");
@@ -356,7 +356,7 @@ describe("cleanup of chat-run state", () => {
     for (const b of [live, old]) bundle.stateStore.set(STATE_KEYS.chatRun(b.runId), b);
     bundle.stateStore.set(STATE_KEYS.chatRunWrites("run-old"), [{ issueId: "i", bodyHash: "h", commentId: "c" }]);
     bundle.stateStore.set(STATE_KEYS.chatRunIndex, [STATE_KEYS.chatRun("run-live"), STATE_KEYS.chatRun("run-old")]);
-    await pruneChatRunState(bundle.ctx, NOW);
+    await pruneChatRunState(bundle.ctx, "co-1", NOW);
     expect(bundle.stateStore.get(STATE_KEYS.chatRun("run-old"))).toBeUndefined();
     expect(bundle.stateStore.get(STATE_KEYS.chatRunWrites("run-old"))).toBeUndefined();
     expect(bundle.stateStore.get(STATE_KEYS.chatRunIndex)).toEqual([STATE_KEYS.chatRun("run-live")]);

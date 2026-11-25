@@ -23,10 +23,10 @@ export async function runCleanup(
   const now = Date.now();
 
   const sessionIndex =
-    ((await ctx.state.get(stateScope(STATE_KEYS.sessionIndex))) as string[] | null) ?? [];
+    ((await ctx.state.get(stateScope(cfg.companyId, STATE_KEYS.sessionIndex))) as string[] | null) ?? [];
   const removedSessions: string[] = [];
   for (const key of sessionIndex) {
-    const entry = (await ctx.state.get(stateScope(key))) as SessionEntry | null;
+    const entry = (await ctx.state.get(stateScope(cfg.companyId, key))) as SessionEntry | null;
     if (!entry) {
       removedSessions.push(key);
       continue;
@@ -38,17 +38,17 @@ export async function runCleanup(
       } catch (err) {
         ctx.logger.warn("Failed to close idle session", { err: errString(err), sessionId: entry.sessionId });
       }
-      await ctx.state.delete(stateScope(key));
+      await ctx.state.delete(stateScope(cfg.companyId, key));
       removedSessions.push(key);
     }
   }
-  await updateIndex(ctx, STATE_KEYS.sessionIndex, (current) => current.filter((k) => !removedSessions.includes(k)));
+  await updateIndex(ctx, cfg.companyId, STATE_KEYS.sessionIndex, (current) => current.filter((k) => !removedSessions.includes(k)));
 
   const questionIndex =
-    ((await ctx.state.get(stateScope(STATE_KEYS.questionIndex))) as string[] | null) ?? [];
+    ((await ctx.state.get(stateScope(cfg.companyId, STATE_KEYS.questionIndex))) as string[] | null) ?? [];
   const removedQuestions: string[] = [];
   for (const key of questionIndex) {
-    const pending = (await ctx.state.get(stateScope(key))) as PendingQuestion | null;
+    const pending = (await ctx.state.get(stateScope(cfg.companyId, key))) as PendingQuestion | null;
     if (!pending) {
       removedQuestions.push(key);
       continue;
@@ -93,14 +93,14 @@ export async function runCleanup(
           ts: pending.ts,
         });
       }
-      await ctx.state.delete(stateScope(key));
+      await ctx.state.delete(stateScope(cfg.companyId, key));
       removedQuestions.push(key);
     }
   }
-  await updateIndex(ctx, STATE_KEYS.questionIndex, (current) => current.filter((k) => !removedQuestions.includes(k)));
+  await updateIndex(ctx, cfg.companyId, STATE_KEYS.questionIndex, (current) => current.filter((k) => !removedQuestions.includes(k)));
 
-  await pruneMessageLinks(ctx, STATE_KEYS.issueThreadIndex, MESSAGE_LINK_MAX_AGE_MS, now);
-  await pruneMessageLinks(ctx, STATE_KEYS.approvalMessageIndex, MESSAGE_LINK_MAX_AGE_MS, now);
-  await pruneChatRunState(ctx, now);
-  await pruneMessageLinks(ctx, STATE_KEYS.relayedMentionIndex, RELAYED_MENTION_MAX_AGE_MS, now);
+  await pruneMessageLinks(ctx, cfg.companyId, STATE_KEYS.issueThreadIndex, MESSAGE_LINK_MAX_AGE_MS, now);
+  await pruneMessageLinks(ctx, cfg.companyId, STATE_KEYS.approvalMessageIndex, MESSAGE_LINK_MAX_AGE_MS, now);
+  await pruneChatRunState(ctx, cfg.companyId, now);
+  await pruneMessageLinks(ctx, cfg.companyId, STATE_KEYS.relayedMentionIndex, RELAYED_MENTION_MAX_AGE_MS, now);
 }

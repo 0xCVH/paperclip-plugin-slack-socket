@@ -233,7 +233,7 @@ export function createMentionRelay({ ctx, gateway, getConfig, now = Date.now }: 
     }
 
     const recordKey = STATE_KEYS.relayedMention(msg.channel, msg.ts);
-    const already = (await ctx.state.get(stateScope(recordKey))) as RelayedMentionRecord | null;
+    const already = (await ctx.state.get(stateScope(cfg.companyId, recordKey))) as RelayedMentionRecord | null;
     if (already) {
       return { issue: summary, recorded: { commentId: already.commentId, duplicate: true, woke: false }, skipped: null };
     }
@@ -271,8 +271,8 @@ export function createMentionRelay({ ctx, gateway, getConfig, now = Date.now }: 
         issueId: issue.id,
         commentId,
       };
-      await ctx.state.set(stateScope(recordKey), record);
-      await updateIndex(ctx, STATE_KEYS.relayedMentionIndex, (current) =>
+      await ctx.state.set(stateScope(cfg.companyId, recordKey), record);
+      await updateIndex(ctx, cfg.companyId, STATE_KEYS.relayedMentionIndex, (current) =>
         current.includes(recordKey) ? current : [...current, recordKey],
       );
     } catch (err) {

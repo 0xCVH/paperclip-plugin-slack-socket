@@ -9,7 +9,7 @@ describe("message-link", () => {
   it("linkMessage stores the link and adds its key to the index", async () => {
     const { ctx, stateStore } = makeCtx();
 
-    await linkMessage(ctx, "link-index-a", "link:e-1", { channel: "C1", ts: "1.1" });
+    await linkMessage(ctx, "co-1", "link-index-a", "link:e-1", { channel: "C1", ts: "1.1" });
 
     expect(stateStore.get("link:e-1")).toMatchObject({ channel: "C1", ts: "1.1" });
     expect(stateStore.get("link-index-a")).toEqual(["link:e-1"]);
@@ -19,7 +19,7 @@ describe("message-link", () => {
     const { ctx, stateStore } = makeCtx();
     const before = Date.now();
 
-    await linkMessage(ctx, "link-index-b", "link:e-1", { channel: "C1", ts: "1.1" });
+    await linkMessage(ctx, "co-1", "link-index-b", "link:e-1", { channel: "C1", ts: "1.1" });
 
     const entry = stateStore.get("link:e-1") as MessageLink;
     expect(entry.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T.*Z$/);
@@ -30,8 +30,8 @@ describe("message-link", () => {
   it("linkMessage does not duplicate a key already in the index", async () => {
     const { ctx, stateStore } = makeCtx();
 
-    await linkMessage(ctx, "link-index-c", "link:e-1", { channel: "C1", ts: "1.1" });
-    await linkMessage(ctx, "link-index-c", "link:e-1", { channel: "C1", ts: "2.2" });
+    await linkMessage(ctx, "co-1", "link-index-c", "link:e-1", { channel: "C1", ts: "1.1" });
+    await linkMessage(ctx, "co-1", "link-index-c", "link:e-1", { channel: "C1", ts: "2.2" });
 
     expect(stateStore.get("link-index-c")).toEqual(["link:e-1"]);
     // The newer post wins — the entity now lives at a different message.
@@ -42,8 +42,8 @@ describe("message-link", () => {
     const { ctx, stateStore } = makeCtx();
 
     await Promise.all([
-      linkMessage(ctx, "link-index-d", "link:e-1", { channel: "C1", ts: "1.1" }),
-      linkMessage(ctx, "link-index-d", "link:e-2", { channel: "C1", ts: "2.1" }),
+      linkMessage(ctx, "co-1", "link-index-d", "link:e-1", { channel: "C1", ts: "1.1" }),
+      linkMessage(ctx, "co-1", "link-index-d", "link:e-2", { channel: "C1", ts: "2.1" }),
     ]);
 
     // A naive read-modify-write would lose one of the two appends; going
@@ -55,23 +55,23 @@ describe("message-link", () => {
   it("getMessageLink returns null when nothing is linked", async () => {
     const { ctx } = makeCtx();
 
-    expect(await getMessageLink(ctx, "link:missing")).toBeNull();
+    expect(await getMessageLink(ctx, "co-1", "link:missing")).toBeNull();
   });
 
   it("getMessageLink round-trips what linkMessage wrote", async () => {
     const { ctx } = makeCtx();
 
-    await linkMessage(ctx, "link-index-e", "link:e-1", { channel: "C-APPR", ts: "77.1" });
+    await linkMessage(ctx, "co-1", "link-index-e", "link:e-1", { channel: "C-APPR", ts: "77.1" });
 
-    expect(await getMessageLink(ctx, "link:e-1")).toMatchObject({ channel: "C-APPR", ts: "77.1" });
+    expect(await getMessageLink(ctx, "co-1", "link:e-1")).toMatchObject({ channel: "C-APPR", ts: "77.1" });
   });
 
   it("unlinkMessage deletes the link and removes only its own index key", async () => {
     const { ctx, stateStore } = makeCtx();
-    await linkMessage(ctx, "link-index-f", "link:e-1", { channel: "C1", ts: "1.1" });
-    await linkMessage(ctx, "link-index-f", "link:e-2", { channel: "C1", ts: "2.1" });
+    await linkMessage(ctx, "co-1", "link-index-f", "link:e-1", { channel: "C1", ts: "1.1" });
+    await linkMessage(ctx, "co-1", "link-index-f", "link:e-2", { channel: "C1", ts: "2.1" });
 
-    await unlinkMessage(ctx, "link-index-f", "link:e-1");
+    await unlinkMessage(ctx, "co-1", "link-index-f", "link:e-1");
 
     expect(stateStore.get("link:e-1")).toBeUndefined();
     expect(stateStore.get("link:e-2")).toBeTruthy();
@@ -80,9 +80,9 @@ describe("message-link", () => {
 
   it("unlinkMessage on an unknown key leaves the index intact", async () => {
     const { ctx, stateStore } = makeCtx();
-    await linkMessage(ctx, "link-index-g", "link:e-1", { channel: "C1", ts: "1.1" });
+    await linkMessage(ctx, "co-1", "link-index-g", "link:e-1", { channel: "C1", ts: "1.1" });
 
-    await unlinkMessage(ctx, "link-index-g", "link:e-gone");
+    await unlinkMessage(ctx, "co-1", "link-index-g", "link:e-gone");
 
     expect(stateStore.get("link-index-g")).toEqual(["link:e-1"]);
   });
@@ -96,7 +96,7 @@ describe("message-link", () => {
     stateStore.set("link:fresh", fresh);
     stateStore.set("link-index-h", ["link:stale", "link:fresh"]);
 
-    await pruneMessageLinks(ctx, "link-index-h", 30 * DAYS, now);
+    await pruneMessageLinks(ctx, "co-1", "link-index-h", 30 * DAYS, now);
 
     expect(stateStore.get("link:stale")).toBeUndefined();
     expect(stateStore.get("link:fresh")).toEqual(fresh);
@@ -107,7 +107,7 @@ describe("message-link", () => {
     const { ctx, stateStore } = makeCtx();
     stateStore.set("link-index-i", ["link:gone"]);
 
-    await pruneMessageLinks(ctx, "link-index-i", 30 * DAYS, Date.now());
+    await pruneMessageLinks(ctx, "co-1", "link-index-i", 30 * DAYS, Date.now());
 
     expect(stateStore.get("link-index-i")).toEqual([]);
   });
@@ -119,7 +119,7 @@ describe("message-link", () => {
     stateStore.set("link-index-j", ["link:e-1"]);
 
     // A link created "now" is 31 days old when `now` is 31 days ahead.
-    await pruneMessageLinks(ctx, "link-index-j", 30 * DAYS, Date.parse(createdAt) + 31 * DAYS);
+    await pruneMessageLinks(ctx, "co-1", "link-index-j", 30 * DAYS, Date.parse(createdAt) + 31 * DAYS);
 
     expect(stateStore.get("link:e-1")).toBeUndefined();
     expect(stateStore.get("link-index-j")).toEqual([]);

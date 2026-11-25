@@ -21,7 +21,7 @@ export const REQUIRED_BOT_SCOPES = [
   "commands",
 ] as const;
 
-export const PLUGIN_VERSION = "0.13.1";
+export const PLUGIN_VERSION = "0.14.1";
 
 export const ACTION_IDS = {
   approvalApprove: "approval_approve",
@@ -85,8 +85,9 @@ export const STATE_KEYS = {
   relayedMention: (channel: string, ts: string) => `relayed-mention:${channel}:${ts}`,
 } as const;
 
-export function stateScope(stateKey: string): ScopeKey {
-  return { scopeKind: "instance", namespace: STATE_NAMESPACE, stateKey };
+export function stateScope(companyId: string, stateKey: string): ScopeKey {
+  if (!companyId.trim()) throw new Error("Slack state requires a configured company");
+  return { scopeKind: "company", scopeId: companyId, namespace: STATE_NAMESPACE, stateKey };
 }
 
 export const ASK_HUMAN_TOOL_DECLARATION: PluginToolDeclaration = {
@@ -260,6 +261,7 @@ export const DEFAULT_CONFIG: SlackSocketConfig = {
   // mention-relay.ts). Off, the agent still learns which issue the thread
   // is about; nothing is written.
   relayMentionsToIssue: true,
+  trustedRootBotUserIds: [],
   allowedSlackUserIds: [],
   agentPostMessageEnabled: false,
   agentPostToChannelsEnabled: false,

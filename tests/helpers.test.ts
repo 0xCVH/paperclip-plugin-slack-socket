@@ -13,8 +13,8 @@ describe("helpers", () => {
 
   it("makeCtx state round-trips through stateScope keys", async () => {
     const { ctx, stateStore } = makeCtx();
-    await ctx.state.set(stateScope("k1"), { v: 1 });
-    expect(await ctx.state.get(stateScope("k1"))).toEqual({ v: 1 });
+    await ctx.state.set(stateScope("co-1", "k1"), { v: 1 });
+    expect(await ctx.state.get(stateScope("co-1", "k1"))).toEqual({ v: 1 });
     expect(stateStore.get("k1")).toEqual({ v: 1 });
   });
 
