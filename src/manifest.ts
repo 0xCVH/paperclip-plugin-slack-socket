@@ -200,6 +200,14 @@ const manifest: PaperclipPluginManifestV1 = {
           "When on (the default), a person's @mention inside a thread that belongs to a Paperclip issue — a thread the plugin posted for that issue, or one whose root message this bot posted with a link to it — is written onto that issue as a quoted comment by the plugin itself, immediately and before the agent replies, and the issue's assignee is woken. The agent is told which issue the thread is about and that the message is already on it. Off, nothing is written; the agent is still told which issue the thread is about. Either way the agent answers in the thread as before.",
         default: DEFAULT_CONFIG.relayMentionsToIssue,
       },
+      trustedRootBotUserIds: {
+        type: "array",
+        items: { type: "string" },
+        title: "Trusted thread-root bots (Slack user IDs)",
+        description:
+          "Slack user IDs of other apps' bots whose thread roots count like this bot's own. When one of them posts a thread root that links to an issue on the Paperclip Base URL, that issue becomes the thread's issue: @mentions in the thread are recorded on it and record_on_issue may write to it. Empty (the default) trusts only this bot's own roots. List only bots whose posts are not worded by agents or outside input.",
+        default: DEFAULT_CONFIG.trustedRootBotUserIds,
+      },
       allowedSlackUserIds: {
         type: "array",
         items: { type: "string" },

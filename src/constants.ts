@@ -21,7 +21,7 @@ export const REQUIRED_BOT_SCOPES = [
   "commands",
 ] as const;
 
-export const PLUGIN_VERSION = "0.14.0";
+export const PLUGIN_VERSION = "0.14.1";
 
 export const ACTION_IDS = {
   approvalApprove: "approval_approve",
@@ -261,6 +261,7 @@ export const DEFAULT_CONFIG: SlackSocketConfig = {
   // mention-relay.ts). Off, the agent still learns which issue the thread
   // is about; nothing is written.
   relayMentionsToIssue: true,
+  trustedRootBotUserIds: [],
   allowedSlackUserIds: [],
   agentPostMessageEnabled: false,
   agentPostToChannelsEnabled: false,

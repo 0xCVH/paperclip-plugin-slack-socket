@@ -126,9 +126,17 @@ export async function resolveThreadScope(
   for (const message of messages) {
     if (message.ts === input.threadTs) {
       const authoredByThisBot = message.isBot && botId !== undefined && message.user === botId;
+      // Another app's bot the operator named in `trustedRootBotUserIds`
+      // (e.g. DAP, which posts the escalation cards). It must really be a
+      // bot message: a person whose id is on the list links nothing.
+      const authoredByTrustedBot =
+        !authoredByThisBot &&
+        message.fromAnyBot &&
+        message.user !== "" &&
+        (cfg.trustedRootBotUserIds ?? []).includes(message.user);
       const ageMs = now() - Number.parseFloat(message.ts) * 1000;
       if (
-        authoredByThisBot &&
+        (authoredByThisBot || authoredByTrustedBot) &&
         Number.isFinite(ageMs) &&
         ageMs <= THREAD_LINK_MAX_AGE_MS &&
         !(await isAgentPost(ctx, cfg.companyId, input.channel, message.ts))

@@ -52,6 +52,13 @@ export interface SlackSocketConfig {
    * which issue the thread is about; nothing is written.
    */
   relayMentionsToIssue: boolean;
+  /**
+   * Slack user ids of other apps' bots whose thread-root links count like
+   * this bot's own: a root one of them posted with a link to an issue on
+   * `paperclipBaseUrl` makes that issue the thread's issue. Empty (the
+   * default) trusts this bot's roots only.
+   */
+  trustedRootBotUserIds: string[];
   allowedSlackUserIds: string[];
   // --- Agent-initiated posting (the slack_post_message tool) ---------
   //

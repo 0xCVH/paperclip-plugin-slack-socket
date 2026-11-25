@@ -112,6 +112,34 @@ describe("mention relay: which mentions are recorded", () => {
     expect(ctx.issues.createComment).toHaveBeenCalledTimes(1);
   });
 
+  it("finds the issue from a root posted by a bot on trustedRootBotUserIds (e.g. a DAP escalation card)", async () => {
+    const { ctx, relay } = setup({
+      config: { trustedRootBotUserIds: ["U-DAP"] },
+      replies: [botRoot({ user: "U-DAP", isBot: false })],
+    });
+    const outcome = await relay.relayMention(mention());
+    expect(outcome.issue).toMatchObject({ id: ISSUE.id, identifier: "POL-3099", rule: "bot_root_link" });
+    expect(outcome.recorded).toMatchObject({ commentId: "comment-1" });
+    expect(ctx.issues.createComment).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not link from another bot's root when that bot is not on trustedRootBotUserIds", async () => {
+    const { ctx, relay } = setup({ replies: [botRoot({ user: "U-DAP", isBot: false })] });
+    const outcome = await relay.relayMention(mention());
+    expect(outcome).toMatchObject({ issue: null, recorded: null, skipped: "no_linked_issue" });
+    expect(ctx.issues.createComment).not.toHaveBeenCalled();
+  });
+
+  it("does not link from a non-bot message even when its user id is on trustedRootBotUserIds", async () => {
+    const { ctx, relay } = setup({
+      config: { trustedRootBotUserIds: ["U-HUMAN"] },
+      replies: [botRoot({ user: "U-HUMAN", isBot: false, fromAnyBot: false })],
+    });
+    const outcome = await relay.relayMention(mention());
+    expect(outcome).toMatchObject({ issue: null, recorded: null, skipped: "no_linked_issue" });
+    expect(ctx.issues.createComment).not.toHaveBeenCalled();
+  });
+
   it("does not let a human-posted root with an issue link make that issue the thread's issue", async () => {
     const { ctx, relay } = setup({ replies: [botRoot({ user: "U-HUMAN", isBot: false, fromAnyBot: false })] });
     const outcome = await relay.relayMention(mention());
